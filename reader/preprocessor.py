@@ -101,7 +101,7 @@ class TransactionPreprocessor:
         Groups MCCs by order of magnitude of typical transaction amounts.
         Uses parallel composition - each group gets full privacy budget.
         """
-        from ..core.mcc_groups import compute_mcc_groups_spark
+        from core.mcc_groups import compute_mcc_groups_spark
         
         logger.info("Computing MCC groups for stratified sensitivity...")
         
@@ -147,8 +147,8 @@ class TransactionPreprocessor:
         Uses IQR method by default to compute K, then clips contributions.
         Also computes D_max (max cells per card) for user-level sensitivity.
         """
-        from ..core.bounded_contribution import BoundedContributionCalculator
-        from ..core.sensitivity import GlobalSensitivityCalculator
+        from core.bounded_contribution import BoundedContributionCalculator
+        from core.sensitivity import GlobalSensitivityCalculator
         
         logger.info("Applying bounded contribution...")
         

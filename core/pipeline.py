@@ -215,7 +215,7 @@ class DPPipeline:
     
     def _init_geography(self):
         """Load geography mapping."""
-        from ..schema.geography import Geography
+        from schema.geography import Geography
         
         logger.info(f"Loading geography from: {self.config.data.city_province_path}")
         
@@ -228,7 +228,7 @@ class DPPipeline:
     
     def _init_budget(self):
         """Initialize privacy budget."""
-        from .budget import Budget
+        from core.budget import Budget
         
         logger.info("Initializing privacy budget...")
         
@@ -259,9 +259,21 @@ class DPPipeline:
         
         try:
             # Initialize components
+            # Use existing Spark session if available (e.g., from notebook), otherwise create new
             spark = self._init_spark()
             if spark is None:
-                raise RuntimeError("Failed to initialize Spark session")
+                # Try one more time to get existing session
+                from pyspark.sql import SparkSession
+                spark = SparkSession.getActiveSession()
+                if spark:
+                    self._spark = spark
+                    self._spark_created_by_pipeline = False
+                    logger.info("Recovered existing Spark session on retry")
+                else:
+                    raise RuntimeError(
+                        "Failed to initialize Spark session. "
+                        "If running in a notebook, ensure SparkSession is created before running the pipeline."
+                    )
             
             geography = self._init_geography()
             if geography is None:
@@ -272,10 +284,10 @@ class DPPipeline:
                 raise RuntimeError("Failed to initialize Budget")
             
             # Import components (after Spark init)
-            from ..reader.spark_reader import SparkTransactionReader
-            from ..reader.preprocessor import TransactionPreprocessor
-            from ..engine.topdown import TopDownEngine
-            from ..writer.parquet_writer import ParquetWriter
+            from reader.spark_reader import SparkTransactionReader
+            from reader.preprocessor import TransactionPreprocessor
+            from engine.topdown import TopDownEngine
+            from writer.parquet_writer import ParquetWriter
             
             # Step 1: Read data
             logger.info("=" * 60)

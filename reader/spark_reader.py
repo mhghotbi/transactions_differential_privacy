@@ -175,15 +175,26 @@ class SparkTransactionReader:
         city_province_df = self.spark.createDataFrame(city_province_data, schema=city_province_schema)
         
         # Join to add province info (instead of UDF)
+        # Use LEFT join to keep unknown cities, assign them to "Unknown" province
         df = df.join(
             city_province_df,
             df.acceptor_city == city_province_df.city_name,
-            "inner"  # This filters out unknown cities
+            "left"  # Keep all cities, even if not in city_province file
         ).drop("city_name")
         
-        after_city_filter = df.count()
-        logger.info(f"After city validation: {after_city_filter:,} "
-                   f"(dropped {after_null_filter - after_city_filter:,} with unknown cities)")
+        # Count unknown cities before filling
+        unknown_count = df.filter(F.col('province_code').isNull()).count()
+        
+        # Assign unknown cities to "Unknown" province
+        df = df.fillna({
+            'province_code': Geography.UNKNOWN_PROVINCE_CODE,
+            'province_name': Geography.UNKNOWN_PROVINCE_NAME
+        })
+        
+        after_city_join = df.count()
+        logger.info(f"After city mapping: {after_city_join:,} records")
+        if unknown_count > 0:
+            logger.warning(f"Found {unknown_count:,} transactions with unknown cities - assigned to 'Unknown' province")
         
         # Filter positive amounts
         df = df.filter(F.col('amount') > 0)

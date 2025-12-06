@@ -56,11 +56,16 @@ class Geography:
     - CityName: City name (str)
     """
     
+    # Special code for unknown province (cities not in city_province file)
+    UNKNOWN_PROVINCE_CODE = 999
+    UNKNOWN_PROVINCE_NAME = "Unknown"
+    
     def __init__(self):
         self._provinces: Dict[int, Province] = {}
         self._cities: Dict[str, City] = {}
         self._city_to_province: Dict[str, int] = {}
         self._province_to_cities: Dict[int, List[str]] = {}
+        self._has_unknown_province = False
     
     @classmethod
     def from_csv(cls, filepath: str, encoding: str = 'utf-8-sig') -> 'Geography':
@@ -113,7 +118,25 @@ class Geography:
                     geo._province_to_cities[province_code].append(city_name)
         
         logger.info(f"Loaded {len(geo._provinces)} provinces, {len(geo._cities)} cities")
+        
+        # Add "Unknown" province for cities not in the mapping file
+        geo.add_unknown_province()
+        
         return geo
+    
+    def add_unknown_province(self) -> None:
+        """Add an 'Unknown' province for handling unmapped cities."""
+        if self._has_unknown_province:
+            return
+        
+        self._provinces[self.UNKNOWN_PROVINCE_CODE] = Province(
+            code=self.UNKNOWN_PROVINCE_CODE,
+            name=self.UNKNOWN_PROVINCE_NAME,
+            cities=[]
+        )
+        self._province_to_cities[self.UNKNOWN_PROVINCE_CODE] = []
+        self._has_unknown_province = True
+        logger.info(f"Added '{self.UNKNOWN_PROVINCE_NAME}' province (code={self.UNKNOWN_PROVINCE_CODE}) for unmapped cities")
     
     @property
     def num_provinces(self) -> int:

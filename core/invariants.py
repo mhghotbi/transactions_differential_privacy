@@ -322,8 +322,8 @@ class InvariantEnforcer:
         self.manager = invariant_manager
         
         # Import post-processor and rounder
-        from .postprocessing import NNLSPostProcessor
-        from .rounder import CensusControlledRounder
+        from core.postprocessing import NNLSPostProcessor
+        from core.rounder import CensusControlledRounder
         
         self.postprocessor = NNLSPostProcessor()
         self.rounder = CensusControlledRounder()
