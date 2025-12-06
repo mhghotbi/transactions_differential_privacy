@@ -25,10 +25,9 @@ class PrivacyConfig:
         "city": 0.8
     })
     query_split: Dict[str, float] = field(default_factory=lambda: {
-        "transaction_count": 0.25,
-        "unique_cards": 0.25,
-        "unique_acceptors": 0.25,
-        "total_amount": 0.25
+        "transaction_count": 0.34,
+        "unique_cards": 0.33,
+        "total_amount": 0.33
     })
     
     # Bounded contribution settings
@@ -151,14 +150,13 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     spark: SparkConfig = field(default_factory=SparkConfig)
     
-    # Column mappings
+    # Column mappings (maps internal names to source column names)
     columns: Dict[str, str] = field(default_factory=lambda: {
-        "transaction_id": "transaction_id",
-        "amount": "amount",
+        "amount": "transaction_amount",
         "transaction_date": "transaction_date",
         "card_number": "card_number",
-        "acceptor_id": "acceptor_id",
-        "acceptor_city": "acceptor_city",
+        "acceptor_id": "acceptorid",
+        "acceptor_city": "city",
         "mcc": "mcc"
     })
     
@@ -192,7 +190,7 @@ class Config:
                 config.privacy.geographic_split['city'] = float(sec['geographic_split_city'])
             
             # Parse query split
-            for query in ['transaction_count', 'unique_cards', 'unique_acceptors', 'total_amount']:
+            for query in ['transaction_count', 'unique_cards', 'total_amount']:
                 key = f'query_split_{query}'
                 if key in sec:
                     config.privacy.query_split[query] = float(sec[key])

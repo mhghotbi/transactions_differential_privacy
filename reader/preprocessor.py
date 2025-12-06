@@ -402,13 +402,12 @@ class TransactionPreprocessor:
     
     def _aggregate_to_histogram(self, df: DataFrame) -> TransactionHistogram:
         """Aggregate data to histogram structure."""
-        # Compute aggregations
+        # Compute aggregations (3 queries: transaction_count, unique_cards, total_amount)
         agg_df = df.groupBy(
             'province_code', 'city_idx', 'mcc_idx', 'day_idx'
         ).agg(
             F.count('*').alias('transaction_count'),
             F.countDistinct('card_number').alias('unique_cards'),
-            F.countDistinct('acceptor_id').alias('unique_acceptors'),
             F.sum('amount_winsorized').alias('total_amount')
         )
         
@@ -463,8 +462,6 @@ class TransactionPreprocessor:
                                        'transaction_count', int(row.transaction_count))
                     histogram.set_value(p_idx, c_idx, m_idx, d_idx,
                                        'unique_cards', int(row.unique_cards))
-                    histogram.set_value(p_idx, c_idx, m_idx, d_idx,
-                                       'unique_acceptors', int(row.unique_acceptors))
                     histogram.set_value(p_idx, c_idx, m_idx, d_idx,
                                        'total_amount', int(row.total_amount))
         

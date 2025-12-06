@@ -26,19 +26,20 @@ class SparkTransactionReader:
     """
     Reads transaction data using Spark.
     
-    Expected columns:
-    - transaction_id: Unique transaction identifier
-    - amount: Transaction amount
-    - transaction_date: Date of transaction
+    Expected source columns (user's data):
+    - pspiin: PSP identifier (optional, not used in DP)
+    - acceptorid: Acceptor/merchant identifier
     - card_number: Card identifier
-    - acceptor_id: Acceptor/merchant identifier
-    - acceptor_city: City of the acceptor
+    - transaction_date: Date of transaction
+    - transaction_amount: Transaction amount
+    - city: City of the acceptor
     - mcc: Merchant Category Code
+    
+    Columns are renamed to internal names via config.columns mapping.
     """
     
-    # Default schema
+    # Default schema (internal names after column mapping)
     DEFAULT_SCHEMA = StructType([
-        StructField("transaction_id", StringType(), False),
         StructField("amount", DoubleType(), False),
         StructField("transaction_date", DateType(), False),
         StructField("card_number", StringType(), False),
@@ -125,9 +126,9 @@ class SparkTransactionReader:
         - Validates cities against geography
         - Adds province information
         """
-        # Check required columns
+        # Check required columns (internal names after column mapping)
         required_columns = [
-            'transaction_id', 'amount', 'transaction_date',
+            'amount', 'transaction_date',
             'card_number', 'acceptor_id', 'acceptor_city', 'mcc'
         ]
         
@@ -215,7 +216,6 @@ class SparkTransactionReader:
         stats = df.agg(
             F.count('*').alias('total_transactions'),
             F.countDistinct('card_number').alias('unique_cards'),
-            F.countDistinct('acceptor_id').alias('unique_acceptors'),
             F.countDistinct('acceptor_city').alias('unique_cities'),
             F.countDistinct('mcc').alias('unique_mccs'),
             F.sum('amount').alias('total_amount'),
@@ -229,7 +229,6 @@ class SparkTransactionReader:
         return {
             'total_transactions': stats.total_transactions,
             'unique_cards': stats.unique_cards,
-            'unique_acceptors': stats.unique_acceptors,
             'unique_cities': stats.unique_cities,
             'unique_mccs': stats.unique_mccs,
             'total_amount': stats.total_amount,

@@ -133,14 +133,6 @@ class TopDownEngine:
                 l1_sensitivity=float(d_max),
                 sensitivity_type="unique"
             ),
-            "unique_acceptors": UserLevelSensitivity(
-                query_name="unique_acceptors",
-                max_cells_per_user=d_max,
-                per_cell_contribution=1.0,
-                l2_sensitivity=sqrt_d,
-                l1_sensitivity=float(d_max),
-                sensitivity_type="unique"
-            ),
             "total_amount": UserLevelSensitivity(
                 query_name="total_amount",
                 max_cells_per_user=d_max,
@@ -474,7 +466,7 @@ class TopDownEngine:
             logger.debug(f"total_amount sensitivity: sqrt({d_max}) * {cap} = {sensitivity:.4f}")
             return sensitivity
             
-        elif query in ('unique_cards', 'unique_acceptors'):
+        elif query == 'unique_cards':
             # Unique queries: each cell changes by at most 1
             sensitivity = sqrt_d * 1.0
             logger.debug(f"{query} sensitivity: sqrt({d_max}) * 1 = {sensitivity:.4f}")

@@ -112,10 +112,9 @@ class Budget:
         }
         
         self.query_split = query_split or {
-            "transaction_count": 0.25,
-            "unique_cards": 0.25,
-            "unique_acceptors": 0.25,
-            "total_amount": 0.25
+            "transaction_count": 0.34,
+            "unique_cards": 0.33,
+            "total_amount": 0.33
         }
         
         self._validate_splits()
