@@ -65,7 +65,7 @@ Before approving any changes to DP mechanisms:
 - Optional imports (SDMetrics, matplotlib) should use try/except blocks
 
 ### Paths & File I/O
-- Use relative paths from project root: `'data/city_province.csv'`, `'output/demo_dp_results'`
+- Use relative paths from project root: `'data/city_province.csv'`, `'data/demo_dp_results'`
 - Input/output paths should be configurable via `Config` class
 - Always use Parquet format for large datasets (not CSV)
 - Check if directories exist before writing: `os.makedirs(path, exist_ok=True)`

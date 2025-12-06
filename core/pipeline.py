@@ -259,21 +259,29 @@ class DPPipeline:
         
         try:
             # Initialize components
-            # Use existing Spark session if available (e.g., from notebook), otherwise create new
-            spark = self._init_spark()
-            if spark is None:
-                # Try one more time to get existing session
-                from pyspark.sql import SparkSession
-                spark = SparkSession.getActiveSession()
-                if spark:
-                    self._spark = spark
-                    self._spark_created_by_pipeline = False
-                    logger.info("Recovered existing Spark session on retry")
-                else:
-                    raise RuntimeError(
-                        "Failed to initialize Spark session. "
-                        "If running in a notebook, ensure SparkSession is created before running the pipeline."
-                    )
+            # FIRST: Check if there's already an existing Spark session (e.g., from notebook)
+            from pyspark.sql import SparkSession
+            existing_spark = SparkSession.getActiveSession()
+            if existing_spark:
+                logger.info(f"✅ Found existing Spark session - reusing it (master={existing_spark.sparkContext.master})")
+                self._spark = existing_spark
+                self._spark_created_by_pipeline = False
+                spark = existing_spark
+            else:
+                # No existing session, create new one
+                spark = self._init_spark()
+                if spark is None:
+                    # Try one more time to get existing session
+                    spark = SparkSession.getActiveSession()
+                    if spark:
+                        self._spark = spark
+                        self._spark_created_by_pipeline = False
+                        logger.info("Recovered existing Spark session on retry")
+                    else:
+                        raise RuntimeError(
+                            "Failed to initialize Spark session. "
+                            "If running in a notebook, ensure SparkSession is created before running the pipeline."
+                        )
             
             geography = self._init_geography()
             if geography is None:
