@@ -109,7 +109,7 @@ class DPPipeline:
             logger.info(f"  Master: {actual_master}")
             logger.info(f"  Default Parallelism: {actual_parallelism}")
             logger.info(f"  Spark Version: {self._spark.version}")
-            return  # Exit early - reuse existing session
+            return self._spark  # Exit early - reuse existing session
         
         builder = SparkSession.builder.appName(self.config.spark.app_name)
         
@@ -215,7 +215,7 @@ class DPPipeline:
     
     def _init_geography(self):
         """Load geography mapping."""
-        from ..schema.geography import Geography
+        from schema.geography import Geography
         
         logger.info(f"Loading geography from: {self.config.data.city_province_path}")
         
@@ -272,10 +272,10 @@ class DPPipeline:
                 raise RuntimeError("Failed to initialize Budget")
             
             # Import components (after Spark init)
-            from ..reader.spark_reader import SparkTransactionReader
-            from ..reader.preprocessor import TransactionPreprocessor
-            from ..engine.topdown import TopDownEngine
-            from ..writer.parquet_writer import ParquetWriter
+            from reader.spark_reader import SparkTransactionReader
+            from reader.preprocessor import TransactionPreprocessor
+            from engine.topdown import TopDownEngine
+            from writer.parquet_writer import ParquetWriter
             
             # Step 1: Read data
             logger.info("=" * 60)

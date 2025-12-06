@@ -281,7 +281,10 @@ class TopDownEngine:
         """
         Apply noise at city level and update protected histogram.
         
-        Adds Discrete Gaussian noise at the finest granularity.
+        Adds Discrete Gaussian noise ONLY to cells with actual data.
+        This is critical: adding noise to ALL cells (including zeros) would
+        create massive positive bias after non-negativity post-processing.
+        
         Uses fast NumPy-based sampling for performance.
         
         For total_amount with MCC grouping enabled, uses stratified noise
@@ -290,33 +293,51 @@ class TopDownEngine:
         queries = TransactionHistogram.QUERIES
         total_queries = len(queries)
         
+        # Get the mask of cells with actual data
+        has_data_mask = original._has_data
+        num_data_cells = np.sum(has_data_mask)
+        total_cells = int(np.prod(original.shape))
+        
+        logger.info(f"  Applying noise to {num_data_cells:,} cells with data (out of {total_cells:,} total)")
+        
         for idx, query in enumerate(queries):
             # Get budget for this query at city level
             rho = self.budget.get_query_budget(query, 'city')
             
             # Get original data
             original_data = original.get_query_array(query)
-            array_size = int(np.prod(original_data.shape))
             
             # Use stratified noise for total_amount if MCC grouping enabled
             if query == 'total_amount' and self._mcc_grouping_enabled:
                 logger.info(f"  [{idx+1}/{total_queries}] {query}: Using stratified noise by MCC group")
                 noisy_data = self._apply_stratified_amount_noise(
-                    original, original_data, rho
+                    original, original_data, rho, has_data_mask
                 )
             else:
-                # Standard noise for counting queries
+                # Standard noise for counting queries - ONLY for cells with data
                 sensitivity = self._get_sensitivity(query)
                 sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
                 
-                logger.info(f"  [{idx+1}/{total_queries}] {query}: rho={float(rho):.6f}, sensitivity={sensitivity:.2f}, sigma={sigma:.2f}, cells={array_size:,}")
+                logger.info(f"  [{idx+1}/{total_queries}] {query}: rho={float(rho):.6f}, sensitivity={sensitivity:.2f}, sigma={sigma:.2f}, data_cells={num_data_cells:,}")
                 
-                noisy_data = add_discrete_gaussian_noise(
-                    original_data.astype(np.int64),
-                    rho=rho,
-                    sensitivity=sensitivity,
-                    use_fast_sampling=True
-                )
+                # Create output array (copy of original)
+                noisy_data = original_data.astype(np.int64).copy()
+                
+                # Only add noise to cells with actual data
+                if num_data_cells > 0:
+                    # Get values for cells with data
+                    data_values = original_data[has_data_mask].astype(np.int64)
+                    
+                    # Add noise only to these cells
+                    noisy_values = add_discrete_gaussian_noise(
+                        data_values,
+                        rho=rho,
+                        sensitivity=sensitivity,
+                        use_fast_sampling=True
+                    )
+                    
+                    # Put noisy values back
+                    noisy_data[has_data_mask] = noisy_values
             
             # Update protected histogram
             protected.set_query_array(query, noisy_data)
@@ -329,7 +350,8 @@ class TopDownEngine:
         self,
         histogram: TransactionHistogram,
         original_data: np.ndarray,
-        rho: Fraction
+        rho: Fraction,
+        has_data_mask: np.ndarray
     ) -> np.ndarray:
         """
         Apply stratified noise to total_amount by MCC group with USER-LEVEL DP.
@@ -338,6 +360,9 @@ class TopDownEngine:
         Uses parallel composition - each group uses the full budget rho
         since MCC groups are disjoint.
         
+        IMPORTANT: Only adds noise to cells with actual data to avoid
+        positive bias from clipping noise on zero cells.
+        
         USER-LEVEL SENSITIVITY for each group:
         L2 = sqrt(D_max) * group_cap
         
@@ -345,6 +370,7 @@ class TopDownEngine:
             histogram: Original histogram for MCC label lookup
             original_data: Original amount data array (shape: province, city, mcc, day)
             rho: Privacy budget (same for all groups under parallel composition)
+            has_data_mask: Boolean mask indicating which cells have actual data
             
         Returns:
             Noisy data array
@@ -383,24 +409,35 @@ class TopDownEngine:
             sensitivity = sqrt_d * group_cap
             sigma = math.sqrt(sensitivity**2 / (2 * float(rho)))
             
+            # Count cells with data for this group
+            group_data_cells = 0
+            for mcc_idx in group_mcc_indices:
+                group_data_cells += np.sum(has_data_mask[:, :, mcc_idx, :])
+            
             logger.info(
                 f"    Group {group_id}: {len(group_mcc_indices)} MCCs, "
                 f"cap={group_cap:,.0f}, L2=sqrt({d_max})*{group_cap:,.0f}={sensitivity:,.0f}, "
-                f"sigma={sigma:,.0f}"
+                f"sigma={sigma:,.0f}, data_cells={group_data_cells:,}"
             )
             
-            # Extract data for this group's MCCs
+            # Extract data for this group's MCCs - ONLY add noise to cells with data
             # Data shape: (province, city, mcc, day)
             for mcc_idx in group_mcc_indices:
-                # Get slice for this MCC
-                group_data = original_data[:, :, mcc_idx, :].copy()
+                # Get mask for this MCC slice
+                mcc_mask = has_data_mask[:, :, mcc_idx, :]
+                
+                if np.sum(mcc_mask) == 0:
+                    continue  # No data cells in this MCC
+                
+                # Get values for cells with data
+                data_values = original_data[:, :, mcc_idx, :][mcc_mask]
                 
                 # Add noise with group-specific sigma (user-level)
-                noise = np.random.normal(0, sigma, group_data.shape)
-                noisy_group = group_data + noise
+                noise = np.random.normal(0, sigma, data_values.shape)
+                noisy_values = data_values + noise
                 
-                # Store back
-                noisy_data[:, :, mcc_idx, :] = noisy_group
+                # Put noisy values back only in data cells
+                noisy_data[:, :, mcc_idx, :][mcc_mask] = noisy_values
         
         return noisy_data.astype(np.int64)
     

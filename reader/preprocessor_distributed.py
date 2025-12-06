@@ -154,7 +154,7 @@ class DistributedPreprocessor:
         
         This bounds the sensitivity for transaction_count query.
         """
-        from ..core.bounded_contribution import BoundedContributionCalculator
+        from core.bounded_contribution import BoundedContributionCalculator
         
         calculator = BoundedContributionCalculator(
             method=self.config.privacy.contribution_bound_method,
@@ -548,9 +548,9 @@ class CensusDASEngine(DistributedDPEngine):
         self.use_controlled_rounding = use_controlled_rounding
         
         # Initialize Census DAS components
-        from ..core.invariants import InvariantManager
-        from ..core.postprocessing import NNLSPostProcessor
-        from ..core.rounder import CensusControlledRounder
+        from core.invariants import InvariantManager
+        from core.postprocessing import NNLSPostProcessor
+        from core.rounder import CensusControlledRounder
         
         self.invariant_manager = InvariantManager()
         self.postprocessor = NNLSPostProcessor() if use_nnls else None
@@ -1026,7 +1026,7 @@ class ProductionPipeline:
         
         # Step 2.5: Compute global sensitivity
         logger.info("\n[2.5/4] Computing global sensitivity...")
-        from ..core.sensitivity import GlobalSensitivityCalculator
+        from core.sensitivity import GlobalSensitivityCalculator
         
         sensitivity_calc = GlobalSensitivityCalculator(
             self.spark,
@@ -1107,7 +1107,7 @@ class ProductionPipeline:
         # Add confidence intervals if enabled
         if sigmas and self.config.privacy.confidence_levels:
             logger.info("Adding confidence intervals...")
-            from ..core.confidence import ConfidenceCalculator
+            from core.confidence import ConfidenceCalculator
             
             ci_calc = ConfidenceCalculator()
             df = ci_calc.add_intervals_to_dataframe(
@@ -1126,7 +1126,7 @@ class ProductionPipeline:
         # Apply suppression if enabled
         if self.config.privacy.suppression_threshold > 0:
             logger.info(f"Applying suppression (threshold={self.config.privacy.suppression_threshold})...")
-            from ..core.suppression import SuppressionManager
+            from core.suppression import SuppressionManager
             
             suppression_mgr = SuppressionManager(
                 threshold=self.config.privacy.suppression_threshold,
