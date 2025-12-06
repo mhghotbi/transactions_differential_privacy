@@ -74,10 +74,11 @@ class DistributedPreprocessor:
     def _broadcast_geography(self) -> None:
         """Create and broadcast geography lookup table."""
         # Geography is small (~500 cities) - safe to broadcast
-        geo_data = []
-        for province in self.geography.provinces.values():
-            for city in province.cities:
-                geo_data.append((city, province.code, province.name))
+        # Use the existing method that returns city -> (province_code, province_name)
+        geo_data = [
+            (city, info[0], info[1])  # city_name, province_code, province_name
+            for city, info in self.geography.city_to_province_broadcast().items()
+        ]
         
         geo_schema = StructType([
             StructField("city_name", StringType(), False),

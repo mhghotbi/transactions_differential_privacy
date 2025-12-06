@@ -109,7 +109,7 @@ class DPPipeline:
             logger.info(f"  Master: {actual_master}")
             logger.info(f"  Default Parallelism: {actual_parallelism}")
             logger.info(f"  Spark Version: {self._spark.version}")
-            return  # Exit early - reuse existing session
+            return self._spark  # Exit early - reuse existing session
         
         builder = SparkSession.builder.appName(self.config.spark.app_name)
         
