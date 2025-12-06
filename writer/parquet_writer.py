@@ -30,7 +30,7 @@ class ParquetWriter:
     Output structure:
     - One Parquet file with all protected data
     - Columns: province, city, mcc, day, transaction_count, unique_cards, 
-               unique_acceptors, total_amount
+               transaction_amount_sum
     - Partitioned by province for efficient queries
     """
     
@@ -45,8 +45,7 @@ class ParquetWriter:
         StructField("day_idx", IntegerType(), False),
         StructField("transaction_count", LongType(), False),
         StructField("unique_cards", LongType(), False),
-        StructField("unique_acceptors", LongType(), False),
-        StructField("total_amount", LongType(), False),
+        StructField("transaction_amount_sum", LongType(), False),
     ])
     
     def __init__(
@@ -156,8 +155,7 @@ class ParquetWriter:
                 'day_idx': r['day_idx'],
                 'transaction_count': int(r['transaction_count']),
                 'unique_cards': int(r['unique_cards']),
-                'unique_acceptors': int(r['unique_acceptors']),
-                'total_amount': int(r['total_amount']),
+                'transaction_amount_sum': int(r['total_amount']),
             }
             for r in records
         ]
@@ -187,8 +185,7 @@ class ParquetWriter:
                 'day_idx': r['day_idx'],
                 'transaction_count': int(r['transaction_count']),
                 'unique_cards': int(r['unique_cards']),
-                'unique_acceptors': int(r['unique_acceptors']),
-                'total_amount': int(r['total_amount']),
+                'transaction_amount_sum': int(r['total_amount']),
             }
             for r in records
         ]
@@ -267,7 +264,7 @@ class CSVWriter:
         fieldnames = [
             'province_idx', 'province', 'city_idx', 'city',
             'mcc_idx', 'mcc', 'day_idx', 'day',
-            'transaction_count', 'unique_cards', 'unique_acceptors', 'total_amount'
+            'transaction_count', 'unique_cards', 'transaction_amount_sum'
         ]
         
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:

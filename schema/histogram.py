@@ -39,14 +39,13 @@ class TransactionHistogram:
     - mcc: MCC code index
     - day: Day index (0-29 for 30 days)
     
-    Each cell contains 4 values (one per query):
+    Each cell contains 3 values (one per query):
     - transaction_count: Number of transactions
     - unique_cards: Number of unique card numbers
-    - unique_acceptors: Number of unique acceptors
     - total_amount: Sum of transaction amounts (winsorized)
     """
     
-    QUERIES = ['transaction_count', 'unique_cards', 'unique_acceptors', 'total_amount']
+    QUERIES = ['transaction_count', 'unique_cards', 'total_amount']
     
     def __init__(
         self,
