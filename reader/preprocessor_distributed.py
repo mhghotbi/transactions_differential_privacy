@@ -330,10 +330,10 @@ class DistributedPreprocessor:
             'day_idx'
         ).agg(
             F.count('*').alias('transaction_count'),
-            F.countDistinct('card_number').alias('unique_cards'),
-            F.countDistinct('acceptor_id').alias('unique_acceptors'),
-            F.sum('amount_capped').alias('total_amount'),           # Capped (for DP sensitivity)
-            F.sum('amount').alias('total_amount_original')          # Original (for invariants)
+            F.countDistinct(F.col('card_number')).alias('unique_cards'),
+            F.countDistinct(F.col('acceptor_id')).alias('unique_acceptors'),
+            F.sum(F.col('amount_capped')).alias('total_amount'),           # Capped (for DP sensitivity)
+            F.sum(F.col('amount')).alias('total_amount_original')          # Original (for invariants)
         )
         
         # Log stats without collecting
@@ -652,10 +652,10 @@ class CensusDASEngine(DistributedDPEngine):
         # National monthly (sum of all data)
         # CRITICAL: For total_amount, use ORIGINAL amounts to match public data
         national_monthly = df.agg(
-            F.sum('transaction_count').alias('transaction_count_national_monthly'),
-            F.sum('unique_cards').alias('unique_cards_national_monthly'),
-            F.sum('unique_acceptors').alias('unique_acceptors_national_monthly'),
-            F.sum('total_amount_original').alias('total_amount_national_monthly')  # ORIGINAL, not winsorized
+            F.sum(F.col('transaction_count')).alias('transaction_count_national_monthly'),
+            F.sum(F.col('unique_cards')).alias('unique_cards_national_monthly'),
+            F.sum(F.col('unique_acceptors')).alias('unique_acceptors_national_monthly'),
+            F.sum(F.col('total_amount_original')).alias('total_amount_national_monthly')  # ORIGINAL, not winsorized
         ).first()
         
         logger.info("  National monthly invariants (from ORIGINAL amounts):")
@@ -665,19 +665,19 @@ class CensusDASEngine(DistributedDPEngine):
         # Province monthly (sum per province, all days)
         # CRITICAL: For total_amount, use ORIGINAL amounts to match public data
         province_monthly_df = df.groupBy('province_code', 'province_name').agg(
-            F.sum('transaction_count').alias('transaction_count_province_monthly'),
-            F.sum('unique_cards').alias('unique_cards_province_monthly'),
-            F.sum('unique_acceptors').alias('unique_acceptors_province_monthly'),
-            F.sum('total_amount_original').alias('total_amount_province_monthly')  # ORIGINAL, not winsorized
+            F.sum(F.col('transaction_count')).alias('transaction_count_province_monthly'),
+            F.sum(F.col('unique_cards')).alias('unique_cards_province_monthly'),
+            F.sum(F.col('unique_acceptors')).alias('unique_acceptors_province_monthly'),
+            F.sum(F.col('total_amount_original')).alias('total_amount_province_monthly')  # ORIGINAL, not winsorized
         )
         
         # Province daily (for consistency enforcement)
         # CRITICAL: For total_amount, use ORIGINAL amounts
         province_daily_df = df.groupBy('province_code', 'province_name', 'day_idx').agg(
-            F.sum('transaction_count').alias('transaction_count_province_daily'),
-            F.sum('unique_cards').alias('unique_cards_province_daily'),
-            F.sum('unique_acceptors').alias('unique_acceptors_province_daily'),
-            F.sum('total_amount_original').alias('total_amount_province_daily')  # ORIGINAL, not winsorized
+            F.sum(F.col('transaction_count')).alias('transaction_count_province_daily'),
+            F.sum(F.col('unique_cards')).alias('unique_cards_province_daily'),
+            F.sum(F.col('unique_acceptors')).alias('unique_acceptors_province_daily'),
+            F.sum(F.col('total_amount_original')).alias('total_amount_province_daily')  # ORIGINAL, not winsorized
         )
         
         logger.info(f"  Province invariants computed for {province_monthly_df.count()} provinces")
@@ -756,7 +756,7 @@ class CensusDASEngine(DistributedDPEngine):
                 
                 city_df = city_df.withColumn(
                     f'{query}_city_sum',
-                    F.sum(city_col).over(window)
+                    F.sum(F.col(city_col)).over(window)
                 )
                 
                 # Scale factor = province_total / city_sum
@@ -793,7 +793,7 @@ class CensusDASEngine(DistributedDPEngine):
                 
                 city_df = city_df.withColumn(
                     f'{query}_city_sum',
-                    F.sum(city_col).over(window)
+                    F.sum(F.col(city_col)).over(window)
                 )
                 
                 city_df = city_df.withColumn(
@@ -840,7 +840,7 @@ class CensusDASEngine(DistributedDPEngine):
             
             df = df.withColumn(
                 f'{query}_current_sum',
-                F.sum(protected_col).over(window)
+                F.sum(F.col(protected_col)).over(window)
             )
             
             # Scale to match monthly invariant
