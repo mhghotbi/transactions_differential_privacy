@@ -255,15 +255,29 @@ class CSVWriter:
             return output_path
         
         # Write CSV
+        # Map internal field names to output column names
+        mapped_records = [
+            {
+                'province_idx': r['province_idx'],
+                'city_code': r['city_code'],
+                'mcc': r['mcc'],
+                'day_idx': r['day_idx'],
+                'transaction_count': r['transaction_count'],
+                'unique_cards': r['unique_cards'],
+                'transaction_amount_sum': r['total_amount']  # Map total_amount to transaction_amount_sum
+            }
+            for r in records
+        ]
+        
         fieldnames = [
             'province_idx', 'city_code', 'mcc', 'day_idx',
             'transaction_count', 'unique_cards', 'transaction_amount_sum'
         ]
         
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(records)
+            writer.writerows(mapped_records)
         
         logger.info(f"CSV written to: {csv_path} ({len(records):,} records)")
         

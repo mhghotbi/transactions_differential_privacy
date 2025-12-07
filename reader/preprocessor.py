@@ -435,7 +435,7 @@ class TransactionPreprocessor:
             city_labels[idx] = city
             # Get city code from geography
             city_code = self.geography.get_city_code(city)
-            city_codes[idx] = city_code if city_code is not None else idx
+            city_codes[idx] = city_code if city_code is not None else Geography.UNKNOWN_CITY_CODE
         
         mcc_labels = [''] * num_mccs
         for mcc, idx in self._mcc_to_idx.items():

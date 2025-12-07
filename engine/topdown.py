@@ -377,6 +377,8 @@ class TopDownEngine:
                     noisy_data[has_data_mask] = noisy_values
             
             # Update protected histogram (keep as float for NNLS)
+            # Note: We store float64 temporarily for NNLS processing
+            # This will be converted to int64 after controlled rounding
             protected.data[query] = noisy_data.astype(np.float64)
             
             original_total = np.sum(original_data)
@@ -437,9 +439,14 @@ class TopDownEngine:
                 if np.sum(mcc_mask) == 0:
                     continue
                 
-                data_values = original_data[:, :, mcc_idx, :][mcc_mask]
+                # Get the slice first to avoid chained indexing issues
+                data_slice = original_data[:, :, mcc_idx, :]
+                noisy_slice = noisy_data[:, :, mcc_idx, :]
+                
+                # Apply noise only to cells with data
+                data_values = data_slice[mcc_mask]
                 noise = np.random.normal(0, sigma, data_values.shape)
-                noisy_data[:, :, mcc_idx, :][mcc_mask] = data_values + noise
+                noisy_slice[mcc_mask] = data_values + noise
         
         return noisy_data
     
@@ -524,8 +531,19 @@ class TopDownEngine:
                 
                 # Step 4: Re-adjust if clipping changed the sum
                 adjusted_sum = np.sum(x_adjusted)
-                if abs(adjusted_sum - target_sum) > 1e-6 and adjusted_sum > 0:
-                    x_adjusted = x_adjusted * (target_sum / adjusted_sum)
+                if abs(adjusted_sum - target_sum) > 1e-6:
+                    if adjusted_sum > 0:
+                        # Rescale to match target sum
+                        x_adjusted = x_adjusted * (target_sum / adjusted_sum)
+                    else:
+                        # All values clipped to zero, but we need positive sum
+                        # Distribute target across cells with original noisy data
+                        nonzero_mask = province_slice > 0
+                        if np.sum(nonzero_mask) > 0:
+                            x_adjusted[nonzero_mask] = target_sum / np.sum(nonzero_mask)
+                        else:
+                            # Distribute uniformly as last resort
+                            x_adjusted = np.full(n, target_sum / n)
                 
                 # Count adjustments made
                 diff = np.sum(np.abs(x_adjusted - province_slice))
@@ -535,7 +553,8 @@ class TopDownEngine:
                 # Reshape and store
                 noisy_data[p_idx] = x_adjusted.reshape((num_cities, num_mccs, num_days))
             
-            protected.data[query] = noisy_data
+            # Store float64 data (will be rounded to int64 in next step)
+            protected.data[query] = noisy_data.astype(np.float64)
             logger.info(
                 f"  {query}: {total_adjusted}/{num_provinces} provinces adjusted via NNLS"
             )
