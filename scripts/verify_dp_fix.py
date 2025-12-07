@@ -94,7 +94,7 @@ def verify_dp_output(
         F.sum('unique_cards').alias('unique_cards'),
         F.sum('unique_acceptors').alias('unique_acceptors'),
         F.sum('total_amount').alias('total_amount')
-    ).collect()[0]
+    ).first()
     
     # DP totals
     dp_totals = dp_df.agg(
@@ -102,7 +102,7 @@ def verify_dp_output(
         F.sum('unique_cards').alias('unique_cards'),
         F.sum('unique_acceptors').alias('unique_acceptors'),
         F.sum('total_amount').alias('total_amount')
-    ).collect()[0]
+    ).first()
     
     # Calculate errors
     metrics = ['transaction_count', 'unique_cards', 'unique_acceptors', 'total_amount']

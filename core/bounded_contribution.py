@@ -146,7 +146,7 @@ class BoundedContributionCalculator:
             F.expr('percentile_approx(tx_count, 0.5)').alias('median'),
             F.expr('percentile_approx(tx_count, 0.75)').alias('q3'),
             F.expr(f'percentile_approx(tx_count, {self.percentile / 100})').alias('pct')
-        ).collect()[0]
+        ).first()
         
         self._stats = {
             'min': float(stats['min']),
@@ -255,9 +255,30 @@ class BoundedContributionCalculator:
         
         logger.info(f"Clipping contributions to K = {k}")
         
-        records_before = df.count()
+        # For very large datasets (4.5B+ rows), skip expensive count() operations
+        # The window function with row_number() is already very expensive and necessary
+        # Count operations force full materialization which can take hours on 4.5B rows
+        # Make counts optional - they're only used for logging statistics
+        # 
+        # To skip counts for performance, set this to True:
+        # skip_counts = True  # Recommended for datasets > 1B rows
+        skip_counts = False
+        
+        if skip_counts:
+            logger.info("  Skipping record counts for performance (very large dataset)")
+            records_before = None
+            records_after = None
+            records_clipped = None
+        else:
+            # Count before clipping (expensive on 4.5B rows - can take 10+ minutes)
+            logger.info("  Counting records before clipping (this may take time on large datasets)...")
+            records_before = df.count()
         
         # Add row number within each card-cell, ordered by transaction date
+        # NOTE: This window function is VERY expensive on 4.5B rows but necessary for correctness
+        # It requires sorting within partitions, which is one of the most expensive Spark operations
+        # Consider checkpointing the DataFrame before this operation for fault tolerance
+        logger.info("  Applying window function with row_number() (expensive operation on large datasets)...")
         window = Window.partitionBy(card_col, city_col, mcc_col, day_col).orderBy(order_col)
         
         df_with_rownum = df.withColumn('_row_num', F.row_number().over(window))
@@ -265,21 +286,33 @@ class BoundedContributionCalculator:
         # Keep only first K transactions per card-cell
         df_clipped = df_with_rownum.filter(F.col('_row_num') <= k).drop('_row_num')
         
-        records_after = df_clipped.count()
-        records_clipped = records_before - records_after
+        # Count after clipping (also expensive)
+        if not skip_counts and records_before is not None:
+            logger.info("  Counting records after clipping (this may take time on large datasets)...")
+            records_after = df_clipped.count()
+            records_clipped = records_before - records_after
+        elif skip_counts:
+            records_after = None
+            records_clipped = None
         
         result = ContributionBoundResult(
             k=k,
             method=self.method,
             stats=self._stats.copy(),
-            records_before=records_before,
-            records_after=records_after,
-            records_clipped=records_clipped
+            records_before=records_before or 0,
+            records_after=records_after or 0,
+            records_clipped=records_clipped or 0
         )
         
-        logger.info(f"  Records before: {records_before:,}")
-        logger.info(f"  Records after:  {records_after:,}")
-        logger.info(f"  Records clipped: {records_clipped:,} ({records_clipped/records_before*100:.2f}%)")
+        if records_before is not None:
+            logger.info(f"  Records before: {records_before:,}")
+            logger.info(f"  Records after:  {records_after:,}")
+            if records_clipped is not None and records_before > 0:
+                logger.info(f"  Records clipped: {records_clipped:,} ({records_clipped/records_before*100:.2f}%)")
+            else:
+                logger.info(f"  Records clipped: {records_clipped:,}")
+        else:
+            logger.info("  Record counts skipped for performance (very large dataset)")
         
         return df_clipped, result
     

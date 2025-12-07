@@ -215,7 +215,7 @@ class SparkTransactionReader:
         stats = df.agg(
             F.min('transaction_date').alias('min_date'),
             F.max('transaction_date').alias('max_date')
-        ).collect()[0]
+        ).first()
         
         return stats.min_date, stats.max_date
     
@@ -237,7 +237,7 @@ class SparkTransactionReader:
             F.max('amount').alias('max_amount'),
             F.min('transaction_date').alias('min_date'),
             F.max('transaction_date').alias('max_date')
-        ).collect()[0]
+        ).first()
         
         return {
             'total_transactions': stats.total_transactions,

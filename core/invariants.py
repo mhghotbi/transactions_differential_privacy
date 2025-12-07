@@ -169,7 +169,7 @@ class InvariantManager:
         # National monthly totals (sum across all provinces and days)
         national_agg = df.agg(
             *[F.sum(q).alias(q) for q in self.QUERIES]
-        ).collect()[0]
+        ).first()
         
         for query in self.QUERIES:
             self._invariants.national_monthly[query] = float(national_agg[query] or 0)

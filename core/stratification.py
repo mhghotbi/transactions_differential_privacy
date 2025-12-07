@@ -533,13 +533,13 @@ class StratumManager:
                 F.countDistinct(card_col).alias("num_cards"),
                 F.mean(amount_col).alias("typical_amount"),
                 F.expr(f"percentile_approx({amount_col}, {amount_percentile/100})").alias("amount_cap")
-            ).collect()[0]
+            ).first()
             
             # Compute max cells per card in this stratum
             cells_per_card = stratum_df.groupBy(card_col).agg(
                 F.countDistinct(city_col, mcc_col, day_idx_col).alias("num_cells")
             )
-            max_cells = cells_per_card.agg(F.max("num_cells")).collect()[0][0] or 1
+            max_cells = cells_per_card.agg(F.max("num_cells")).first()[0] or 1
             
             # Create stratum
             stratum = Stratum(

@@ -221,7 +221,7 @@ class GlobalSensitivityCalculator:
             F.expr("percentile_approx(num_cells, 0.99)").alias("p99"),
             F.mean("num_cells").alias("mean"),
             F.count("*").alias("num_cards")
-        ).collect()[0]
+        ).first()
         
         self._max_cells_per_card = int(stats["max"]) if stats["max"] else 1
         self._percentile_cells = {
@@ -278,7 +278,15 @@ class GlobalSensitivityCalculator:
             F.countDistinct(*cell_columns).alias("num_cells")
         )
         
+        # Cache intermediate result to avoid recomputation during groupBy shuffle
+        cells_per_individual.cache()
+        
+        # Group by num_cells and count - final result is small (distinct num_cells values)
+        # Use toLocalIterator() for memory efficiency, though result should be small anyway
         distribution = cells_per_individual.groupBy("num_cells").count().collect()
+        
+        # Uncache to free memory
+        cells_per_individual.unpersist()
         
         self._cells_distribution = {row["num_cells"]: row["count"] for row in distribution}
         
@@ -753,13 +761,13 @@ class StratumSensitivityCalculator:
                 F.countDistinct(card_col).alias("num_cards"),
                 F.mean(amount_col).alias("typical_amount"),
                 F.expr(f"percentile_approx({amount_col}, {amount_percentile/100})").alias("amount_cap")
-            ).collect()[0]
+            ).first()
             
             # Compute max cells per card within this stratum
             cells_per_card = stratum_df.groupBy(card_col).agg(
                 F.countDistinct(*cell_columns).alias("num_cells")
             )
-            max_cells = cells_per_card.agg(F.max("num_cells")).collect()[0][0] or 1
+            max_cells = cells_per_card.agg(F.max("num_cells")).first()[0] or 1
             
             # Create stratum sensitivity
             stratum_sens = StratumSensitivity(

@@ -166,7 +166,7 @@ class DistributedPreprocessor:
         )
         
         # Need day_idx for cell definition - compute temporarily
-        date_stats = df.agg(F.min('transaction_date').alias('min_date')).collect()[0]
+        date_stats = df.agg(F.min('transaction_date').alias('min_date')).first()
         min_date = date_stats.min_date
         
         df = df.withColumn(
@@ -238,7 +238,7 @@ class DistributedPreprocessor:
     def _create_time_index(self, df: DataFrame) -> DataFrame:
         """Create day index from transaction date."""
         # Get min date (single aggregation)
-        min_date = df.agg(F.min('transaction_date')).collect()[0][0]
+        min_date = df.agg(F.min('transaction_date')).first()[0]
         
         # Create day index using datediff (pure Spark SQL)
         df = df.withColumn(
@@ -592,7 +592,7 @@ class CensusDASEngine(DistributedDPEngine):
         # National monthly (sum of all data)
         national_monthly = df.agg(
             *[F.sum(q).alias(f'{q}_national_monthly') for q in queries]
-        ).collect()[0]
+        ).first()
         
         logger.info("  National monthly invariants:")
         for q in queries:

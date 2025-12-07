@@ -160,7 +160,7 @@ class TransactionPreprocessor:
         )
         
         # Need day_idx for cell definition, compute it temporarily
-        date_stats = df.agg(F.min('transaction_date').alias('min_date')).collect()[0]
+        date_stats = df.agg(F.min('transaction_date').alias('min_date')).first()
         min_date = date_stats.min_date
         
         df_with_day = df.withColumn(
@@ -272,7 +272,7 @@ class TransactionPreprocessor:
             F.count(F.when(F.col('amount') > self._winsorize_cap, 1)).alias('capped_count'),
             F.sum('amount').alias('original_sum'),
             F.sum('amount_winsorized').alias('winsorized_sum')
-        ).collect()[0]
+        ).first()
         
         logger.info(f"Global Winsorization: {stats.capped_count:,} transactions capped")
         logger.info(f"Amount sum: {stats.original_sum:,.2f} -> {stats.winsorized_sum:,.2f}")
@@ -334,7 +334,7 @@ class TransactionPreprocessor:
         date_stats = df.agg(
             F.min('transaction_date').alias('min_date'),
             F.max('transaction_date').alias('max_date')
-        ).collect()[0]
+        ).first()
         
         self._min_date = date_stats.min_date
         max_date = date_stats.max_date
@@ -411,10 +411,9 @@ class TransactionPreprocessor:
             F.sum('amount_winsorized').alias('total_amount')
         )
         
-        # Collect aggregated data
-        agg_data = agg_df.collect()
-        
-        logger.info(f"Aggregated to {len(agg_data):,} non-zero cells")
+        # Get count first (for logging) - use count() instead of collect()
+        num_cells = agg_df.count()
+        logger.info(f"Aggregated to {num_cells:,} non-zero cells")
         
         # Create histogram
         num_provinces = max(self.geography.province_codes) + 1
@@ -452,8 +451,15 @@ class TransactionPreprocessor:
             city_codes=city_codes  # NEW: pass city codes
         )
         
-        # Fill histogram
-        for row in agg_data:
+        # Fill histogram using toLocalIterator() to stream rows instead of collecting all
+        # This is critical for large datasets (e.g., 30 days × 1500 cities × 300 MCCs)
+        cell_count = 0
+        for row in agg_df.toLocalIterator():
+            cell_count += 1
+            # Log progress every 100k cells for large datasets
+            if cell_count % 100000 == 0:
+                logger.info(f"  Processed {cell_count:,} / {num_cells:,} cells ({100*cell_count/num_cells:.1f}%)")
+            
             p_idx = row.province_code
             c_idx = row.city_idx
             m_idx = row.mcc_idx
