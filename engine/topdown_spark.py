@@ -242,7 +242,8 @@ class TopDownSparkEngine:
             self._province_invariants[query] = inv_df
             
             # Log total (triggers cache materialization, but only 32 rows)
-            total = inv_df.agg(F.sum('invariant').alias('total')).first()['total']
+            total_row = inv_df.agg(F.sum('invariant').alias('total')).first()
+            total = total_row['total'] if total_row and total_row['total'] is not None else 0
             num_provinces = inv_df.count()
             
             logger.info(f"  {query}: total={total:,}, provinces={num_provinces}")
@@ -265,7 +266,15 @@ class TopDownSparkEngine:
             query_weight = self.config.privacy.query_split.get(query, 1.0 / len(queries))
             rho = Fraction(total_rho * query_weight).limit_denominator(10000)
             sensitivity = self._get_sensitivity(query)
+            
+            # Validate rho > 0
+            if float(rho) <= 0:
+                raise ValueError(f"Invalid privacy budget for {query}: rho={float(rho)} must be > 0")
+            
             sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
+            
+            if sigma <= 0 or not np.isfinite(sigma):
+                raise ValueError(f"Invalid sigma for {query}: sigma={sigma} (rho={float(rho)}, sensitivity={sensitivity})")
             
             logger.info(f"  {query}: ρ={float(rho):.4f}, Δ₂={sensitivity:.2f}, σ={sigma:.2f}")
             
@@ -407,7 +416,11 @@ class TopDownSparkEngine:
                 invariant_col = f'{query}_invariant'
                 
                 if adjusted_col not in pdf.columns:
-                    pdf[query] = pdf.get(query, 0).astype('int64')
+                    # If no adjusted column, use original value or 0
+                    if query in pdf.columns:
+                        pdf[query] = pdf[query].astype('int64')
+                    else:
+                        pdf[query] = np.zeros(len(pdf), dtype='int64')
                     continue
                 
                 if invariant_col in pdf.columns:
@@ -423,7 +436,7 @@ class TopDownSparkEngine:
                 n = len(values)
                 
                 if target_sum <= 0:
-                    pdf[query] = 0
+                    pdf[query] = np.zeros(n, dtype='int64')
                     continue
                 
                 # Floor all values
@@ -463,9 +476,15 @@ class TopDownSparkEngine:
                         round_up_idx = np.random.choice(n, size=int(num_round_up), replace=False, p=probs)
                         rounded = floors.copy()
                         rounded[round_up_idx] += 1
-                    except:
-                        # Fallback to simple rounding
+                    except (ValueError, Exception):
+                        # Fallback: randomly select indices to round up (WITH replacement if needed)
+                        # CRITICAL: Must still match target_sum to preserve invariant
                         rounded = floors.copy()
+                        if num_round_up > 0:
+                            # Randomly select which cells to round up, allowing replacement
+                            for _ in range(int(num_round_up)):
+                                idx = np.random.randint(n)
+                                rounded[idx] += 1
                 
                 pdf[query] = rounded.astype('int64')
             

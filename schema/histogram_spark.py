@@ -201,6 +201,48 @@ class SparkHistogram:
         
         return stats
     
+    def summary(self) -> str:
+        """
+        Generate a summary string of the histogram.
+        
+        Compatible with TransactionHistogram.summary() for drop-in replacement.
+        Uses Spark aggregations - only collects summary statistics (~1 row).
+        
+        Returns:
+            Formatted summary string
+        """
+        stats = self.summary_stats()
+        
+        lines = [
+            "=" * 60,
+            "Spark Transaction Histogram Summary (100% Spark)",
+            "=" * 60,
+            f"Shape: {self.shape}",
+            f"  Provinces: {self.shape[0]}",
+            f"  Cities: {self.shape[1]}",
+            f"  MCCs: {self.shape[2]}",
+            f"  Days: {self.shape[3]}",
+            f"Non-Zero Cells: {stats['num_cells']:,}",
+            "",
+            "Query Totals:"
+        ]
+        
+        # Show all queries that exist in data
+        for query in self.QUERIES:
+            total_key = f'{query}_total'
+            if total_key in stats:
+                total = stats[total_key]
+                # Add annotation for temporary fields
+                if query == 'total_amount_original':
+                    lines.append(f"  {query}: {total:,} (original unwinsorized, for invariants)")
+                elif query == 'total_amount' and f'total_amount_original_total' in stats:
+                    lines.append(f"  {query}: {total:,} (winsorized, for DP noise)")
+                else:
+                    lines.append(f"  {query}: {total:,}")
+        
+        lines.append("=" * 60)
+        return "\n".join(lines)
+    
     def show_sample(self, n: int = 20) -> None:
         """Show sample rows (for debugging only, collects small sample)."""
         logger.info(f"Sample of {n} rows from histogram:")
