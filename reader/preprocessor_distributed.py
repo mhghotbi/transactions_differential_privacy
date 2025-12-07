@@ -110,20 +110,25 @@ class DistributedPreprocessor:
         logger.info("Step 1: Geography join (broadcast)...")
         df = self._join_geography(df)
         
-        # Step 2: Apply bounded contribution (clip transactions per card-cell)
-        logger.info("Step 2: Applying bounded contribution...")
+        # Step 2: Compute MCC groups FIRST (needed for per-group K and per-group noise)
+        if self.config.privacy.mcc_grouping_enabled:
+            logger.info("Step 2: Computing MCC groups...")
+            df = self._compute_mcc_groups(df)
+        
+        # Step 3: Apply bounded contribution (clip transactions per card-cell)
+        logger.info("Step 3: Applying bounded contribution...")
         df = self._apply_bounded_contribution(df)
         
-        # Step 3: Compute winsorization cap (approximate quantile)
-        logger.info("Step 3: Computing winsorization cap...")
+        # Step 4: Compute winsorization cap (approximate quantile)
+        logger.info("Step 4: Computing winsorization cap...")
         winsorize_cap = self._compute_winsorize_cap_distributed(df)
         
-        # Step 4: Apply winsorization
-        logger.info("Step 4: Applying winsorization...")
+        # Step 5: Apply winsorization
+        logger.info("Step 5: Applying winsorization...")
         df = self._apply_winsorization(df, winsorize_cap)
         
-        # Step 5: Create time index
-        logger.info("Step 5: Creating time indices...")
+        # Step 6: Create time index
+        logger.info("Step 6: Creating time indices...")
         df = self._create_time_index(df)
         
         # Checkpoint after expensive transformations
@@ -131,12 +136,12 @@ class DistributedPreprocessor:
             logger.info("Checkpointing after preprocessing...")
             df = df.checkpoint()
         
-        # Step 6: Distributed aggregation (the key step!)
-        logger.info("Step 6: Distributed aggregation...")
+        # Step 7: Distributed aggregation (the key step!)
+        logger.info("Step 7: Distributed aggregation...")
         agg_df = self._aggregate_distributed(df)
         
-        # Step 7: Repartition for optimal parallelism
-        logger.info("Step 7: Repartitioning by province...")
+        # Step 8: Repartition for optimal parallelism
+        logger.info("Step 8: Repartitioning by province...")
         agg_df = self._repartition_for_dp(agg_df)
         
         logger.info("Distributed preprocessing complete")
@@ -149,6 +154,53 @@ class DistributedPreprocessor:
             df.acceptor_city == self._geo_df.city_name,
             "left"
         ).drop("city_name")
+    
+    def _compute_mcc_groups(self, df: DataFrame) -> DataFrame:
+        """
+        Compute MCC groups for stratified sensitivity and per-group processing.
+        
+        Groups MCCs by order of magnitude of typical transaction amounts.
+        Uses parallel composition - each group gets full privacy budget.
+        """
+        from core.mcc_groups import compute_mcc_groups_spark
+        
+        logger.info("Computing MCC groups for stratified sensitivity...")
+        
+        self._mcc_grouping = compute_mcc_groups_spark(
+            df=df,
+            mcc_col='mcc',
+            amount_col='amount',
+            num_groups=self.config.privacy.mcc_num_groups,
+            cap_percentile=self.config.privacy.mcc_group_cap_percentile
+        )
+        
+        # Store in config for use by TopDownEngine
+        self.config.privacy.mcc_to_group = self._mcc_grouping.mcc_to_group
+        self.config.privacy.mcc_group_caps = {
+            gid: info.cap for gid, info in self._mcc_grouping.group_info.items()
+        }
+        
+        logger.info(f"Created {self._mcc_grouping.num_groups} MCC groups")
+        
+        # Add MCC group column to DataFrame for per-group processing
+        mcc_group_data = [
+            (mcc, group_id) 
+            for mcc, group_id in self._mcc_grouping.mcc_to_group.items()
+        ]
+        mcc_group_schema = StructType([
+            StructField("mcc_grp_key", StringType(), False),
+            StructField("mcc_group", IntegerType(), False),
+        ])
+        mcc_group_df = self.spark.createDataFrame(mcc_group_data, schema=mcc_group_schema)
+        
+        # Broadcast small MCC group lookup table (~300 MCCs) for efficient join
+        df = df.join(F.broadcast(mcc_group_df), df.mcc == mcc_group_df.mcc_grp_key, "left").drop("mcc_grp_key")
+        
+        # Fill unknown MCCs with highest group (conservative - highest cap)
+        max_group = max(self._mcc_grouping.group_info.keys()) if self._mcc_grouping.group_info else 0
+        df = df.fillna({'mcc_group': max_group})
+        
+        return df
     
     def _apply_bounded_contribution(self, df: DataFrame) -> DataFrame:
         """

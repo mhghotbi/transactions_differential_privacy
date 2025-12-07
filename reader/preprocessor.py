@@ -73,20 +73,20 @@ class TransactionPreprocessor:
         """
         logger.info("Starting preprocessing...")
         
-        # Step 0: Apply bounded contribution (clip transactions per card-cell)
-        df = self._apply_bounded_contribution(df)
-        
-        # Step 0.5: Compute MCC groups for stratified sensitivity
+        # Step 0: Compute MCC groups FIRST (needed for per-group K computation and noise)
         if self.config.privacy.mcc_grouping_enabled:
             df = self._compute_mcc_groups(df)
         
-        # Step 1: Compute and apply winsorization (per-group if enabled)
+        # Step 1: Apply bounded contribution (can now use MCC groups for memory efficiency)
+        df = self._apply_bounded_contribution(df)
+        
+        # Step 3: Compute and apply winsorization (per-group if enabled)
         df = self._apply_winsorization(df)
         
-        # Step 2: Create dimension indices
+        # Step 4: Create dimension indices
         df = self._create_indices(df)
         
-        # Step 3: Aggregate to histogram
+        # Step 5: Aggregate to histogram
         histogram = self._aggregate_to_histogram(df)
         
         logger.info("Preprocessing complete")

@@ -110,6 +110,12 @@ class TopDownEngine:
         self._mcc_to_group = config.privacy.mcc_to_group or {}
         self._mcc_grouping_enabled = config.privacy.mcc_grouping_enabled and bool(self._mcc_group_caps)
         
+        # DIAGNOSTIC: Log MCC grouping status
+        logger.info(f"[TopDownEngine] MCC grouping config enabled: {config.privacy.mcc_grouping_enabled}")
+        logger.info(f"[TopDownEngine] MCC group caps from config: {len(self._mcc_group_caps)} groups")
+        logger.info(f"[TopDownEngine] MCC to group mapping: {len(self._mcc_to_group)} MCCs mapped")
+        logger.info(f"[TopDownEngine] Per-group processing ENABLED: {self._mcc_grouping_enabled}")
+        
         # User-level sensitivity parameters
         self._d_max: Optional[int] = None
         self._user_level_sensitivities: Dict[str, UserLevelSensitivity] = {}
@@ -451,107 +457,6 @@ class TopDownEngine:
             logger.info(f"[MEMORY] End of query: {mem_pct:.1f}% used ({mem_used_gb:.2f} GB)")
             logger.info(f"{'='*60}\n")
     
-    def _apply_stratified_amount_noise(
-        self,
-        histogram: TransactionHistogram,
-        original_data: np.ndarray,
-        rho: Fraction,
-        has_data_mask: np.ndarray
-    ) -> np.ndarray:
-        """
-        Apply stratified noise to total_amount by MCC group.
-        
-        Uses parallel composition: each MCC group gets full budget rho.
-        
-        CRITICAL: Must apply noise ONCE PER GROUP (not per-MCC) to avoid composition violations.
-        All MCCs within a group are noised together in a single call.
-        """
-        logger.info(f"[STRATIFIED] Starting stratified noise for total_amount...")
-        
-        mem_pct = psutil.virtual_memory().percent
-        mem_used_gb = psutil.virtual_memory().used / (1024**3)
-        logger.info(f"[STRATIFIED MEMORY] Entry: {mem_pct:.1f}% used ({mem_used_gb:.2f} GB)")
-        
-        logger.info(f"[STRATIFIED] Creating noisy_data copy (float64)...")
-        noisy_data = original_data.astype(np.float64).copy()
-        logger.info(f"[STRATIFIED] ✓ Noisy data created: {noisy_data.shape}")
-        
-        mcc_labels = histogram.dimensions['mcc'].labels or []
-        logger.info(f"[STRATIFIED] Processing {len(mcc_labels)} MCC codes across {len(self._mcc_group_caps)} groups")
-        
-        # Build MCC index to group mapping
-        logger.info(f"[STRATIFIED] Building MCC index to group mapping...")
-        mcc_idx_to_group = {}
-        for mcc_idx, mcc_code in enumerate(mcc_labels):
-            if mcc_code in self._mcc_to_group:
-                mcc_idx_to_group[mcc_idx] = self._mcc_to_group[mcc_code]
-            else:
-                mcc_idx_to_group[mcc_idx] = max(self._mcc_group_caps.keys()) if self._mcc_group_caps else 0
-        
-        d_max = self._d_max or 1
-        sqrt_d = math.sqrt(d_max)
-        logger.info(f"[STRATIFIED] ✓ MCC mapping complete: {len(mcc_idx_to_group)} MCC indices mapped")
-        logger.info(f"[STRATIFIED] User-level D_max={d_max}, sqrt(D_max)={sqrt_d:.2f}")
-        
-        total_groups = len(self._mcc_group_caps)
-        logger.info(f"[STRATIFIED] Processing {total_groups} MCC groups...")
-        
-        for group_idx, (group_id, group_cap) in enumerate(self._mcc_group_caps.items()):
-            logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] Group ID={group_id}")
-            
-            group_mcc_indices = [
-                mcc_idx for mcc_idx, g_id in mcc_idx_to_group.items()
-                if g_id == group_id
-            ]
-            
-            if not group_mcc_indices:
-                logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] No MCCs in this group, skipping")
-                continue
-            
-            sensitivity = sqrt_d * group_cap
-            sigma = math.sqrt(sensitivity**2 / (2 * float(rho)))
-            
-            # CRITICAL: Build group-level mask for ALL MCCs in this group
-            logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] Building group mask for {len(group_mcc_indices)} MCCs...")
-            group_mask = np.zeros_like(has_data_mask, dtype=bool)
-            for mcc_idx in group_mcc_indices:
-                group_mask[:, :, mcc_idx, :] |= has_data_mask[:, :, mcc_idx, :]
-            
-            group_data_cells = np.sum(group_mask)
-            
-            if group_data_cells == 0:
-                logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] No data cells, skipping")
-                continue
-            
-            logger.info(
-                f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] {len(group_mcc_indices)} MCCs, "
-                f"{group_data_cells:,} data cells, cap={group_cap:,.0f}, Δ₂={sensitivity:,.0f}, σ={sigma:,.0f}"
-            )
-            
-            # CRITICAL: Extract ALL data values for ALL MCCs in this group
-            # This ensures we make ONLY ONE call to add_discrete_gaussian_noise per group
-            logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] Extracting {group_data_cells:,} data values for entire group...")
-            data_values = original_data[group_mask].astype(np.int64)
-            
-            # SINGLE noise call per group (correct DP composition)
-            logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] Sampling noise (SINGLE call for entire group)...")
-            noisy_values = add_discrete_gaussian_noise(
-                data_values,
-                rho=rho,
-                sensitivity=sensitivity,
-                use_fast_sampling=True
-            )
-            
-            # Write back to all MCCs in group
-            logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] Writing {group_data_cells:,} noisy values back...")
-            noisy_data[group_mask] = noisy_values.astype(np.float64)
-            
-            del data_values, noisy_values, group_mask
-            logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] ✓ Complete")
-        
-        logger.info(f"[STRATIFIED] ✓ All groups processed, returning noisy data")
-        return noisy_data
-    
     def _apply_stratified_amount_noise_inplace(
         self,
         histogram: TransactionHistogram,
@@ -593,12 +498,12 @@ class TopDownEngine:
         total_groups = len(self._mcc_group_caps)
         logger.info(f"[STRATIFIED] Processing {total_groups} MCC groups...")
         
-        # CRITICAL: Store original data BEFORE adding any noise
-        # Each group must read from original data to ensure parallel composition
-        logger.info(f"[STRATIFIED] Storing original data for parallel composition...")
-        original_data = histogram.data[query].copy()
+        # MEMORY OPTIMIZATION: NO full copy needed!
+        # MCC groups are DISJOINT - each cell belongs to exactly one group.
+        # When we process group N, those cells haven't been modified yet.
+        # We can read directly from histogram.data[query] for each group.
         
-        # Convert histogram to float64 for noise application
+        # Convert histogram to float64 for noise application (in-place)
         histogram.data[query] = histogram.data[query].astype(np.float64)
         
         # Process each MCC group ONCE (parallel composition)
@@ -634,10 +539,9 @@ class TopDownEngine:
                 f"{group_data_cells:,} data cells, cap={group_cap:,.0f}, Δ₂={sensitivity::.0f}"
             )
             
-            # CRITICAL: Extract from ORIGINAL data (not from histogram which may have other groups' noise)
-            # This ensures parallel composition - each group noises the original independently
-            logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] Extracting {group_data_cells:,} ORIGINAL data values...")
-            data_values = original_data[group_mask].astype(np.int64)
+            # Extract data values for this group (safe: groups are disjoint, cells not yet modified)
+            logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] Extracting {group_data_cells:,} data values...")
+            data_values = histogram.data[query][group_mask].astype(np.int64)
             
             # SINGLE noise call per group (correct DP composition)
             logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] Sampling noise (SINGLE call for entire group)...")
@@ -655,8 +559,6 @@ class TopDownEngine:
             del data_values, noisy_values, group_mask
             logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] ✓ Complete")
         
-        # Clean up original data copy
-        del original_data
         logger.info(f"[STRATIFIED] ✓ All {total_groups} groups processed")
     
     def _apply_per_group_noise_inplace(
@@ -725,10 +627,12 @@ class TopDownEngine:
         
         logger.info(f"[PER-GROUP] Computing per-group D_max for correct sensitivity...")
         
-        # Save original data for parallel composition
-        original_data = histogram.data[query].copy()
+        # MEMORY OPTIMIZATION: NO full copy needed!
+        # MCC groups are DISJOINT - each cell belongs to exactly one group.
+        # When we process group N, those cells haven't been modified yet.
+        # We can read directly from histogram.data[query] for each group.
         
-        # Convert to float64 for noise application
+        # Convert to float64 for noise application (in-place, no extra copy)
         histogram.data[query] = histogram.data[query].astype(np.float64)
         
         # Get unique group IDs
@@ -778,9 +682,9 @@ class TopDownEngine:
             mem_before_gb = psutil.virtual_memory().used / (1024**3)
             logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Memory before: {mem_before:.1f}% ({mem_before_gb:.2f} GB)")
             
-            # Extract ORIGINAL data values for this group
+            # Extract data values for this group (safe: groups are disjoint, cells not yet modified)
             logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Extracting {group_data_cells:,} data values...")
-            data_values = original_data[group_mask].astype(np.int64)
+            data_values = histogram.data[query][group_mask].astype(np.int64)
             
             # Sample noise for this group (FULL budget - parallel composition)
             logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Sampling noise...")
@@ -804,8 +708,6 @@ class TopDownEngine:
             logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Memory after: {mem_after:.1f}% ({mem_after_gb:.2f} GB)")
             logger.info(f"[PER-GROUP {group_idx}/{num_groups}] ✓ Complete")
         
-        # Clean up original data
-        del original_data
         logger.info(f"[PER-GROUP] ✓ All {num_groups} groups processed")
     
     def _compute_group_d_max(self, histogram: TransactionHistogram, group_mask: np.ndarray) -> int:
