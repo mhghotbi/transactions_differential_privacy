@@ -321,92 +321,107 @@ class TopDownSparkEngine:
     @staticmethod
     def _discrete_gaussian_udf(col, sigma: float):
         """
-        Create UDF for TRUE discrete Gaussian noise (Census 2020 compliant).
+        Create UDF for exact Census 2020 discrete Gaussian noise.
         
-        Uses rejection sampling for rigorous DP guarantees on integer queries.
-        Deterministic seeding based on row dimensions ensures reproducibility.
-        
-        Performance: ~1.3 avg iterations per sample, ~500ns per sample.
+        Uses the exact algorithm from US Census Bureau's 2020 DAS:
+        - Rational arithmetic (no floating-point in core algorithm)
+        - Discrete Laplace → Discrete Gaussian via acceptance test
+        - Bernoulli(exp(-gamma)) for exact probabilities
         """
+        # Convert sigma to sigma_sq as fraction (numerator, denominator)
+        from fractions import Fraction
+        sigma_sq_frac = Fraction(sigma * sigma).limit_denominator(1000000)
+        ssq_n = sigma_sq_frac.numerator
+        ssq_d = sigma_sq_frac.denominator
+        
         @F.udf(returnType=DoubleType())
-        def add_discrete_gaussian_noise(value, seed):
+        def add_discrete_gaussian_noise(value):
             """
-            Add discrete Gaussian noise to a numeric value.
-            
-            Type assumptions:
-            - value: Should be numeric (int, long, float, double, Decimal)
-            - Invalid types are converted to 0.0 (this should never happen with proper schema)
-            - None values are passed through as None
-            
-            Args:
-                value: Numeric value to add noise to
-                seed: Deterministic seed for reproducibility
-                
-            Returns:
-                Original value + discrete Gaussian noise (as float)
+            Add exact discrete Gaussian noise (Census 2020 algorithm).
             """
             import random
-            import math
             
             if value is None:
                 return None
             
-            # Convert to float (handles Decimal/BigDecimal types safely)
-            # NOTE: Type errors should never occur with proper DataFrame schema
-            # If they do occur, it indicates a data pipeline issue
+            # Convert to float
             try:
                 val_float = float(value)
             except (TypeError, ValueError):
-                # Fallback to 0.0 (indicates upstream data quality issue)
                 val_float = 0.0
             
-            # Use deterministic seed for reproducibility
-            random.seed(abs(int(seed)) % 2147483647)  # Max int32
+            # === Census 2020 Exact Discrete Gaussian Algorithm ===
             
-            # TRUE Discrete Gaussian via rejection sampling
-            # Samples integer z from discrete Gaussian distribution
-            max_attempts = 1000  # Increased for rigorous DP guarantee (typical: 1-2 iterations)
+            def floorsqrt(n, d):
+                """Compute floor(sqrt(n/d)) exactly using only integer arithmetic."""
+                if n <= 0 or d <= 0:
+                    return 0
+                # Binary search: maintain a^2 <= n/d < b^2
+                a = 0
+                b = 1
+                # Double b until b^2 > n/d
+                while b * b * d <= n:
+                    b = 2 * b
+                # Binary search
+                while a + 1 < b:
+                    c = (a + b) // 2
+                    if c * c * d <= n:
+                        a = c
+                    else:
+                        b = c
+                return a
             
-            for attempt in range(max_attempts):
-                # Step 1: Sample continuous Gaussian via Box-Muller
-                u1 = random.random()
-                u2 = random.random()
-                z_continuous = math.sqrt(-2.0 * math.log(u1 + 1e-10)) * math.cos(2.0 * math.pi * u2)
-                z_scaled = z_continuous * sigma
-                
-                # Step 2: Round to nearest integer
-                z_int = round(z_scaled)
-                
-                # Step 3: Acceptance test for discrete Gaussian
-                # Accept with probability proportional to discrete Gaussian PDF
-                diff = abs(z_scaled - z_int)
-                # Acceptance probability: exp(-diff^2 / (2*sigma^2))
-                # High sigma or small diff → high acceptance rate
-                accept_prob = math.exp(-(diff * diff) / (2.0 * sigma * sigma + 1e-10))
-                
-                if random.random() < accept_prob:
-                    # Accepted: return original value + discrete noise
-                    return val_float + float(z_int)
+            def bernoulli_exp(gn, gd):
+                """Sample Bernoulli(exp(-gn/gd)) exactly."""
+                if gn <= 0:
+                    return 1
+                if 0 <= gn <= gd:
+                    k = 1
+                    a = True
+                    while a:
+                        a = random.randint(0, gd * k - 1) < gn
+                        k = k + 1 if a else k
+                    return k % 2
+                else:
+                    for _ in range(gn // gd):
+                        if not bernoulli_exp(1, 1):
+                            return 0
+                    return bernoulli_exp(gn % gd, gd)
             
-            # CRITICAL: If we reach here after 1000 attempts, something is wrong
-            # Return 0 to maintain discrete integer property (astronomically rare)
-            # This preserves rigorous DP guarantees unlike continuous fallback
-            return val_float
+            def discrete_laplace(s, t):
+                """Sample from Discrete Laplace with scale t/s."""
+                while True:
+                    d = False
+                    while not d:
+                        u = random.randint(0, t - 1)
+                        d = bool(bernoulli_exp(u, t))
+                    v = 0
+                    a = True
+                    while a:
+                        a = bool(bernoulli_exp(1, 1))
+                        v = v + 1 if a else v
+                    x = u + t * v
+                    y = x // s
+                    b = random.randint(0, 1)  # Bernoulli(1/2): 0 or 1
+                    if not (b == 1 and y == 0):
+                        return (1 - 2 * b) * y
+            
+            def discrete_gaussian(ssq_n, ssq_d):
+                """Sample from Discrete Gaussian with variance ssq_n/ssq_d."""
+                t = floorsqrt(ssq_n, ssq_d) + 1
+                while True:
+                    y = discrete_laplace(1, t)
+                    aux1n = abs(y) * t * ssq_d - ssq_n
+                    gamma_n = aux1n * aux1n
+                    gamma_d = t * ssq_d * t * ssq_n * 2
+                    if gamma_d > 0 and bernoulli_exp(gamma_n, gamma_d):
+                        return y
+            
+            # Sample noise and add to value
+            noise = discrete_gaussian(ssq_n, ssq_d)
+            return val_float + float(noise)
         
-        # CRITICAL FIX: Deterministic seed from row dimensions (NOT monotonically_increasing_id)
-        # Use SHA2 for cross-platform reproducibility (F.hash varies by Spark version)
-        seed_col = F.sha2(
-            F.concat_ws('|',
-                F.col('province_idx').cast('string'),
-                F.col('city_idx').cast('string'),
-                F.col('mcc_idx').cast('string'),
-                F.col('day_idx').cast('string')
-            ),
-            256  # SHA-256 hash
-        )
-        # Convert hex string to integer seed (take first 8 hex chars = 32 bits)
-        seed_col = F.conv(F.substring(seed_col, 1, 8), 16, 10).cast('long')
-        return add_discrete_gaussian_noise(col, seed_col)
+        return add_discrete_gaussian_noise(col)
     
     def _nnls_post_process(self, histogram: SparkHistogram) -> SparkHistogram:
         """
