@@ -478,13 +478,14 @@ class TransactionPreprocessor:
         from schema.histogram_spark import SparkHistogram, HistogramDimension
         
         # Compute aggregations (4 queries: transaction_count, unique_cards, total_amount, total_amount_original)
+        # CRITICAL: Cast sums to LongType to avoid Java BigDecimal reflection warnings
         agg_df = df.groupBy(
             'province_code', 'city_idx', 'mcc_idx', 'day_idx'
         ).agg(
-            F.count('*').alias('transaction_count'),
-            F.countDistinct('card_number').alias('unique_cards'),
-            F.sum('amount_winsorized').alias('total_amount'),         # Winsorized (for DP sensitivity)
-            F.sum('amount').alias('total_amount_original')             # Original (for invariants)
+            F.count('*').cast('long').alias('transaction_count'),
+            F.countDistinct('card_number').cast('long').alias('unique_cards'),
+            F.sum('amount_winsorized').cast('long').alias('total_amount'),         # Winsorized (for DP sensitivity)
+            F.sum('amount').cast('long').alias('total_amount_original')             # Original (for invariants)
         )
         
         # Rename province_code to province_idx for consistency
