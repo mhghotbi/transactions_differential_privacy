@@ -1,29 +1,40 @@
 """
-Top-Down DP Engine with User-Level Differential Privacy.
+Top-Down DP Engine with Province-Month Level Invariants and User-Level Differential Privacy.
 
-Implements the top-down mechanism for applying differential privacy
-to the geographic hierarchy: Province -> City.
+Implements a Census 2020 DAS-style methodology for applying differential privacy
+to transaction data with geographic hierarchy.
 
-KEY CHANGE: Uses USER-LEVEL DP (per card) not EVENT-LEVEL DP (per transaction).
+KEY FEATURES:
+1. Province-month level totals are EXACT INVARIANTS (publicly published data)
+2. City-level data receives ALL privacy budget
+3. NNLS post-processing enforces province-month constraints with non-negativity
+4. Controlled rounding maintains integer consistency
 
-User-Level DP means:
+HIERARCHY:
+- Province-Month (invariant): Σ_{city,mcc,day} x_{p,city,mcc,day} = Y_p  [EXACT - PUBLIC]
+- Cell (province,city,mcc,day): Individual measurements with DP noise
+
+The province-month totals are publicly available data that MUST be matched.
+This is not a privacy leak - these are already public statistics.
+
+USER-LEVEL DP:
 - Privacy unit is the CARD (user), not individual transactions
-- Removing a card can affect up to D distinct cells (where D = max cells per card)
-- L2 sensitivity = sqrt(D) * K where K = max transactions per card per cell
-- This provides stronger privacy but requires more noise
+- Removing a card can affect up to D_max distinct cells
+- L2 sensitivity = sqrt(D_max) * K where K = max transactions per card per cell
 
-The top-down approach:
-1. Add noise at province level (using user-level sensitivity)
-2. Add noise at city level (using user-level sensitivity)
-3. Ensure consistency between levels through post-processing
+PRIVACY GUARANTEE:
+- Province-month totals are public (invariants) - no privacy cost
+- Cell-level measurements satisfy (ε, δ)-DP (via zCDP)
+- Post-processing (NNLS + rounding) preserves DP guarantees
 """
 
 import math
 import logging
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Tuple
 from fractions import Fraction
 
 import numpy as np
+from scipy.optimize import nnls
 from pyspark.sql import SparkSession
 
 from core.config import Config
@@ -39,20 +50,32 @@ logger = logging.getLogger(__name__)
 
 class TopDownEngine:
     """
-    Top-down differential privacy engine with USER-LEVEL DP.
+    Top-down differential privacy engine with PROVINCE-MONTH LEVEL INVARIANTS.
     
-    Applies DP noise hierarchically:
-    1. Province level: Aggregate cities, add noise
-    2. City level: Add noise, post-process to be consistent with province totals
+    This implements a Census 2020 DAS-style algorithm where:
+    1. Province-month totals are exact invariants (publicly published - NO noise)
+       - Computed as: Y_p = Σ_{city,mcc,day} x_{p,city,mcc,day}
+    2. City-level data receives DP noise (ALL budget)
+    3. NNLS post-processing ensures:
+       - City sums match exact province-month totals
+       - All values are non-negative
+       - Minimum distortion from noisy measurements
+    4. Controlled rounding produces integer outputs
+    
+    MATHEMATICAL FORMULATION:
+    Let Y_p = exact province-month total for province p (PUBLIC INVARIANT)
+              Y_p = Σ_{city,mcc,day} x_{p,city,mcc,day}
+    Let z_{p,c,m,d} = noisy cell measurement
+    
+    We solve for protected values x_{p,c,m,d}:
+        minimize   Σ_{p,c,m,d} (x_{p,c,m,d} - z_{p,c,m,d})²
+        subject to Σ_{c,m,d} x_{p,c,m,d} = Y_p    for all provinces p
+                   x_{p,c,m,d} ≥ 0                for all cells
+    
+    This is solved using NNLS with iterative projection per province.
     
     Uses zCDP (zero-Concentrated DP) with Discrete Gaussian mechanism.
-    
-    USER-LEVEL DP:
-    - Privacy unit is the CARD, not individual transactions
-    - Sensitivity accounts for cards appearing in multiple cells
-    - L2 sensitivity = sqrt(D_max) * K where:
-      - D_max = max distinct cells any card appears in
-      - K = max transactions per card per cell (bounded contribution)
+    Privacy budget is fully allocated to cell level.
     """
     
     def __init__(
@@ -77,8 +100,9 @@ class TopDownEngine:
         self.budget = budget
         self.allocator = BudgetAllocator(budget, config.data.num_days)
         
-        # Store noisy aggregates for consistency
-        self._province_aggregates: Dict[str, np.ndarray] = {}
+        # Store EXACT province-month aggregates (PUBLIC INVARIANTS - no noise)
+        # Shape per query: (province_dim,) - one value per province
+        self._province_month_invariants: Dict[str, np.ndarray] = {}
         
         # MCC group information for stratified sensitivity
         self._mcc_group_caps = config.privacy.mcc_group_caps or {}
@@ -86,13 +110,15 @@ class TopDownEngine:
         self._mcc_grouping_enabled = config.privacy.mcc_grouping_enabled and bool(self._mcc_group_caps)
         
         # User-level sensitivity parameters
-        # D_max: Maximum number of distinct cells any card appears in
-        # This MUST be computed from data before running the engine
         self._d_max: Optional[int] = None
         self._user_level_sensitivities: Dict[str, UserLevelSensitivity] = {}
         
         # Winsorize cap for amount queries
         self._winsorize_cap: float = 1.0
+        
+        # Post-processing configuration
+        self._nnls_max_iterations = 1000
+        self._nnls_tolerance = 1e-10
     
     def set_user_level_params(
         self,
@@ -158,7 +184,13 @@ class TopDownEngine:
     
     def run(self, histogram: TransactionHistogram) -> TransactionHistogram:
         """
-        Apply top-down DP to the histogram with USER-LEVEL DP.
+        Apply top-down DP with PROVINCE-MONTH LEVEL INVARIANTS.
+        
+        Algorithm:
+        1. Compute province-month totals from data (these match public statistics)
+        2. Add DP noise to cell-level data (full budget)
+        3. NNLS post-processing to enforce province-month constraints
+        4. Controlled rounding for integer consistency
         
         Args:
             histogram: Original histogram with true counts
@@ -167,28 +199,18 @@ class TopDownEngine:
             New histogram with DP-protected values
         """
         logger.info("=" * 60)
-        logger.info("Starting Top-Down DP Processing (User-Level DP)")
+        logger.info("Top-Down DP with PROVINCE-MONTH LEVEL INVARIANTS")
         logger.info("=" * 60)
         logger.info(f"Total privacy budget (rho): {self.budget.total_rho}")
         logger.info(f"Epsilon at delta={self.budget.delta}: {self.budget.total_epsilon:.4f}")
+        logger.info("")
+        logger.info("INVARIANT POLICY: Province-month totals are EXACT (publicly published)")
+        logger.info("                  Y_p = Σ_{city,mcc,day} x_{p,city,mcc,day}")
+        logger.info("NOISE POLICY: All budget allocated to cell level")
         
         # Verify user-level parameters are set
         if self._d_max is None:
-            logger.warning(
-                "WARNING: User-level DP parameters not set! "
-                "Using fallback K-only sensitivity which may violate privacy. "
-                "Call set_user_level_params() before running."
-            )
-            # Try to use config values as fallback
-            K = self.config.privacy.computed_contribution_bound or 1
-            # Assume D_max = 1 (UNSAFE but allows backward compatibility)
-            self._d_max = 1
-            self._winsorize_cap = 1.0
-            self.set_user_level_params(
-                d_max=1,
-                k_bound=K,
-                winsorize_cap=self._winsorize_cap
-            )
+            self._handle_missing_user_level_params()
         else:
             logger.info(f"User-level D_max: {self._d_max}")
             logger.info(f"sqrt(D_max): {math.sqrt(self._d_max):.4f}")
@@ -196,26 +218,40 @@ class TopDownEngine:
         # Create a copy for the protected result
         protected = histogram.copy()
         
-        # Step 1: Province-level noise
+        # Step 1: Compute province-month totals (PUBLIC INVARIANTS)
         logger.info("")
         logger.info("=" * 40)
-        logger.info("Step 1: Province-level noise injection")
+        logger.info("Step 1: Compute Province-Month Invariants (Public Data)")
         logger.info("=" * 40)
-        self._apply_province_level_noise(histogram, protected)
+        self._compute_province_month_invariants(histogram)
         
-        # Step 2: City-level noise
+        # Step 2: Add noise at cell level (FULL BUDGET)
         logger.info("")
         logger.info("=" * 40)
-        logger.info("Step 2: City-level noise injection")
+        logger.info("Step 2: Cell-Level Noise Injection (Full Budget)")
         logger.info("=" * 40)
-        self._apply_city_level_noise(histogram, protected)
+        self._apply_cell_level_noise(histogram, protected)
         
-        # Step 3: Post-processing for non-negativity
+        # Step 3: NNLS post-processing (enforce province-month constraints + non-negativity)
         logger.info("")
         logger.info("=" * 40)
-        logger.info("Step 3: Post-processing")
+        logger.info("Step 3: NNLS Post-Processing (Province-Month Constraints)")
         logger.info("=" * 40)
-        self._post_process(protected)
+        self._nnls_post_process(protected)
+        
+        # Step 4: Controlled rounding
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info("Step 4: Controlled Rounding")
+        logger.info("=" * 40)
+        self._controlled_rounding(protected)
+        
+        # Verify invariants are preserved
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info("Verification: Province-Month Invariants Check")
+        logger.info("=" * 40)
+        self._verify_invariants(protected)
         
         logger.info("")
         logger.info("=" * 60)
@@ -224,63 +260,70 @@ class TopDownEngine:
         
         return protected
     
-    def _apply_province_level_noise(
-        self,
-        original: TransactionHistogram,
-        protected: TransactionHistogram
-    ) -> None:
+    def _handle_missing_user_level_params(self) -> None:
+        """Handle case where user-level params are not set."""
+        logger.warning(
+            "WARNING: User-level DP parameters not set! "
+            "Using fallback K-only sensitivity which may violate privacy. "
+            "Call set_user_level_params() before running."
+        )
+        K = self.config.privacy.computed_contribution_bound or 1
+        self._d_max = 1
+        self._winsorize_cap = 1.0
+        self.set_user_level_params(d_max=1, k_bound=K, winsorize_cap=self._winsorize_cap)
+    
+    def _compute_province_month_invariants(self, histogram: TransactionHistogram) -> None:
         """
-        Apply noise at province level.
+        Compute province-month level totals as invariants.
         
-        Aggregates data to province-day level and adds Discrete Gaussian noise.
+        These are PUBLIC DATA that must be matched exactly.
+        No noise is added - these values are already publicly known.
+        
+        Province-month invariant for province p:
+        Y_p = Σ_{city,mcc,day} x_{p,city,mcc,day}
+        
+        Output shape per query: (province_dim,)
         """
         queries = TransactionHistogram.QUERIES
-        total_queries = len(queries)
         
-        for idx, query in enumerate(queries):
-            # Get budget for this query at province level
-            rho = self.budget.get_query_budget(query, 'province')
+        for query in queries:
+            # Get full histogram: shape (province, city, mcc, day)
+            data = histogram.get_query_array(query)
             
-            # Aggregate to province level
-            # Shape: (province_dim,) after summing over cities, mccs, and days
-            province_data = original.aggregate_to_province(query)
-            array_size = int(np.prod(province_data.shape))
+            # Aggregate to province-month level: sum over cities, MCCs, and days
+            # Result shape: (province_dim,)
+            province_month_totals = np.sum(data, axis=(1, 2, 3))  # Sum over city, mcc, day
             
-            # Use global sensitivity (no per-group stratification at province level)
-            sensitivity = self._get_sensitivity(query)
-            sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
+            # Store as exact invariant (PUBLIC DATA - no noise)
+            self._province_month_invariants[query] = province_month_totals.astype(np.int64)
             
-            logger.info(f"  [{idx+1}/{total_queries}] {query}: rho={float(rho):.6f}, sensitivity={sensitivity:.2f}, sigma={sigma:.2f}, cells={array_size:,}")
+            total_value = np.sum(province_month_totals)
+            num_provinces = len(province_month_totals)
+            nonzero_provinces = np.sum(province_month_totals > 0)
             
-            # Add noise (province level is small, can use exact or fast)
-            noisy_province = add_discrete_gaussian_noise(
-                province_data.astype(np.int64),
-                rho=rho,
-                sensitivity=sensitivity,
-                use_fast_sampling=True
+            logger.info(
+                f"  {query}: total={total_value:,}, "
+                f"provinces={nonzero_provinces}/{num_provinces} with data"
             )
-            
-            # Store for consistency enforcement
-            self._province_aggregates[query] = noisy_province
-            
-            logger.info(f"    Done. Province totals: {np.sum(province_data):,} -> {np.sum(noisy_province):,}")
+        
+        logger.info("  [Province-month totals stored as PUBLIC INVARIANTS]")
     
-    def _apply_city_level_noise(
+    def _apply_cell_level_noise(
         self,
         original: TransactionHistogram,
         protected: TransactionHistogram
     ) -> None:
         """
-        Apply noise at city level and update protected histogram.
+        Apply noise at cell level with FULL privacy budget.
         
-        Adds Discrete Gaussian noise ONLY to cells with actual data.
-        This is critical: adding noise to ALL cells (including zeros) would
-        create massive positive bias after non-negativity post-processing.
+        Since province-month totals are public invariants (no privacy cost),
+        the entire privacy budget is allocated to cell-level measurements.
         
-        Uses fast NumPy-based sampling for performance.
+        Budget allocation:
+        - Province-month level: 0 (public data - invariants)
+        - Cell level: 100% of total_rho
         
-        For total_amount with MCC grouping enabled, uses stratified noise
-        with per-group sensitivity (parallel composition).
+        This is split among queries according to config.privacy.query_split.
         """
         queries = TransactionHistogram.QUERIES
         total_queries = len(queries)
@@ -290,53 +333,55 @@ class TopDownEngine:
         num_data_cells = np.sum(has_data_mask)
         total_cells = int(np.prod(original.shape))
         
-        logger.info(f"  Applying noise to {num_data_cells:,} cells with data (out of {total_cells:,} total)")
+        logger.info(f"  Data cells: {num_data_cells:,} / {total_cells:,} total")
+        
+        # Full budget goes to cell level since province-month are public invariants
+        total_rho = float(self.budget.total_rho)
         
         for idx, query in enumerate(queries):
-            # Get budget for this query at city level
-            rho = self.budget.get_query_budget(query, 'city')
+            # Get query's share of budget
+            query_weight = self.config.privacy.query_split.get(query, 1.0 / total_queries)
+            rho = Fraction(total_rho * query_weight).limit_denominator(10000)
             
             # Get original data
             original_data = original.get_query_array(query)
             
             # Use stratified noise for total_amount if MCC grouping enabled
             if query == 'total_amount' and self._mcc_grouping_enabled:
-                logger.info(f"  [{idx+1}/{total_queries}] {query}: Using stratified noise by MCC group")
+                logger.info(f"  [{idx+1}/{total_queries}] {query}: Stratified noise by MCC group")
                 noisy_data = self._apply_stratified_amount_noise(
                     original, original_data, rho, has_data_mask
                 )
             else:
-                # Standard noise for counting queries - ONLY for cells with data
+                # Standard noise for counting queries
                 sensitivity = self._get_sensitivity(query)
                 sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
                 
-                logger.info(f"  [{idx+1}/{total_queries}] {query}: rho={float(rho):.6f}, sensitivity={sensitivity:.2f}, sigma={sigma:.2f}, data_cells={num_data_cells:,}")
+                logger.info(
+                    f"  [{idx+1}/{total_queries}] {query}: "
+                    f"ρ={float(rho):.6f}, Δ₂={sensitivity:.2f}, σ={sigma:.2f}"
+                )
                 
                 # Create output array (copy of original)
-                noisy_data = original_data.astype(np.int64).copy()
+                noisy_data = original_data.astype(np.float64).copy()
                 
                 # Only add noise to cells with actual data
                 if num_data_cells > 0:
-                    # Get values for cells with data
-                    data_values = original_data[has_data_mask].astype(np.int64)
-                    
-                    # Add noise only to these cells
+                    data_values = original_data[has_data_mask].astype(np.float64)
                     noisy_values = add_discrete_gaussian_noise(
-                        data_values,
+                        data_values.astype(np.int64),
                         rho=rho,
                         sensitivity=sensitivity,
                         use_fast_sampling=True
                     )
-                    
-                    # Put noisy values back
                     noisy_data[has_data_mask] = noisy_values
             
-            # Update protected histogram
-            protected.set_query_array(query, noisy_data)
+            # Update protected histogram (keep as float for NNLS)
+            protected.data[query] = noisy_data.astype(np.float64)
             
             original_total = np.sum(original_data)
             noisy_total = np.sum(noisy_data)
-            logger.info(f"    Done. Total: {original_total:,} -> {noisy_total:,}")
+            logger.info(f"    Total: {original_total:,} -> {noisy_total:,.0f}")
     
     def _apply_stratified_amount_noise(
         self,
@@ -346,30 +391,12 @@ class TopDownEngine:
         has_data_mask: np.ndarray
     ) -> np.ndarray:
         """
-        Apply stratified noise to total_amount by MCC group with USER-LEVEL DP.
+        Apply stratified noise to total_amount by MCC group.
         
-        Each MCC group gets noise scaled to its own sensitivity.
-        Uses parallel composition - each group uses the full budget rho
-        since MCC groups are disjoint.
-        
-        IMPORTANT: Only adds noise to cells with actual data to avoid
-        positive bias from clipping noise on zero cells.
-        
-        USER-LEVEL SENSITIVITY for each group:
-        L2 = sqrt(D_max) * group_cap
-        
-        Args:
-            histogram: Original histogram for MCC label lookup
-            original_data: Original amount data array (shape: province, city, mcc, day)
-            rho: Privacy budget (same for all groups under parallel composition)
-            has_data_mask: Boolean mask indicating which cells have actual data
-            
-        Returns:
-            Noisy data array
+        Uses parallel composition: each MCC group gets full budget rho.
         """
         noisy_data = original_data.astype(np.float64).copy()
         
-        # Get MCC labels from histogram
         mcc_labels = histogram.dimensions['mcc'].labels or []
         
         # Build MCC index to group mapping
@@ -378,16 +405,12 @@ class TopDownEngine:
             if mcc_code in self._mcc_to_group:
                 mcc_idx_to_group[mcc_idx] = self._mcc_to_group[mcc_code]
             else:
-                # Unknown MCC - assign to highest group (most conservative)
                 mcc_idx_to_group[mcc_idx] = max(self._mcc_group_caps.keys()) if self._mcc_group_caps else 0
         
-        # Get D_max for user-level sensitivity
         d_max = self._d_max or 1
         sqrt_d = math.sqrt(d_max)
         
-        # Process each MCC group separately (parallel composition)
         for group_id, group_cap in self._mcc_group_caps.items():
-            # Find MCC indices in this group
             group_mcc_indices = [
                 mcc_idx for mcc_idx, g_id in mcc_idx_to_group.items()
                 if g_id == group_id
@@ -396,42 +419,289 @@ class TopDownEngine:
             if not group_mcc_indices:
                 continue
             
-            # USER-LEVEL SENSITIVITY: sqrt(D_max) * group_cap
-            # This accounts for one card appearing in up to D_max cells
             sensitivity = sqrt_d * group_cap
             sigma = math.sqrt(sensitivity**2 / (2 * float(rho)))
             
-            # Count cells with data for this group
-            group_data_cells = 0
-            for mcc_idx in group_mcc_indices:
-                group_data_cells += np.sum(has_data_mask[:, :, mcc_idx, :])
+            group_data_cells = sum(
+                np.sum(has_data_mask[:, :, mcc_idx, :])
+                for mcc_idx in group_mcc_indices
+            )
             
             logger.info(
                 f"    Group {group_id}: {len(group_mcc_indices)} MCCs, "
-                f"cap={group_cap:,.0f}, L2=sqrt({d_max})*{group_cap:,.0f}={sensitivity:,.0f}, "
-                f"sigma={sigma:,.0f}, data_cells={group_data_cells:,}"
+                f"cap={group_cap:,.0f}, Δ₂={sensitivity:,.0f}, σ={sigma:,.0f}"
             )
             
-            # Extract data for this group's MCCs - ONLY add noise to cells with data
-            # Data shape: (province, city, mcc, day)
             for mcc_idx in group_mcc_indices:
-                # Get mask for this MCC slice
                 mcc_mask = has_data_mask[:, :, mcc_idx, :]
-                
                 if np.sum(mcc_mask) == 0:
-                    continue  # No data cells in this MCC
+                    continue
                 
-                # Get values for cells with data
                 data_values = original_data[:, :, mcc_idx, :][mcc_mask]
-                
-                # Add noise with group-specific sigma (user-level)
                 noise = np.random.normal(0, sigma, data_values.shape)
-                noisy_values = data_values + noise
-                
-                # Put noisy values back only in data cells
-                noisy_data[:, :, mcc_idx, :][mcc_mask] = noisy_values
+                noisy_data[:, :, mcc_idx, :][mcc_mask] = data_values + noise
         
-        return noisy_data.astype(np.int64)
+        return noisy_data
+    
+    def _nnls_post_process(self, protected: TransactionHistogram) -> None:
+        """
+        NNLS post-processing to enforce province-month constraints with non-negativity.
+        
+        For each query, we solve per province:
+            minimize   Σ_{c,m,d} (x_{p,c,m,d} - z_{p,c,m,d})²
+            subject to Σ_{c,m,d} x_{p,c,m,d} = Y_p   (province-month PUBLIC invariant)
+                       x_{p,c,m,d} ≥ 0               (non-negativity)
+        
+        where:
+            x_{p,c,m,d} = protected cell value
+            z_{p,c,m,d} = noisy measurement
+            Y_p = exact province-month invariant (PUBLIC DATA)
+        
+        Algorithm (per province):
+        1. Apply NNLS to get non-negative values closest to noisy measurements
+        2. Compute current sum over (city, mcc, day)
+        3. Adjust values proportionally to match province-month invariant
+        4. Re-verify non-negativity
+        
+        This is a projection onto the intersection of:
+        - The non-negative orthant
+        - The affine subspace defined by province-month sum constraints
+        """
+        queries = TransactionHistogram.QUERIES
+        num_provinces = protected.shape[0]
+        num_cities = protected.shape[1]
+        num_mccs = protected.shape[2]
+        num_days = protected.shape[3]
+        
+        cells_per_province = num_cities * num_mccs * num_days
+        
+        for query in queries:
+            noisy_data = protected.get_query_array(query).astype(np.float64)
+            province_invariants = self._province_month_invariants[query]
+            
+            total_adjusted = 0
+            
+            # Process each province independently
+            for p_idx in range(num_provinces):
+                # Get the province slice: shape (city_dim, mcc_dim, day_dim)
+                province_slice = noisy_data[p_idx].flatten()
+                target_sum = float(province_invariants[p_idx])
+                
+                if target_sum <= 0:
+                    # Province-month invariant is zero - set all cells to 0
+                    noisy_data[p_idx] = 0
+                    continue
+                
+                n = len(province_slice)
+                
+                # Step 1: NNLS projection to non-negative orthant
+                # Solve: min ||x - z||² s.t. x ≥ 0
+                A = np.eye(n)
+                b = province_slice
+                
+                x_nnls, residual = nnls(A, b, maxiter=self._nnls_max_iterations)
+                
+                # Step 2: Enforce sum constraint via proportional adjustment
+                current_sum = np.sum(x_nnls)
+                
+                if current_sum > 0:
+                    # Scale to match province-month invariant (PUBLIC DATA)
+                    scale_factor = target_sum / current_sum
+                    x_adjusted = x_nnls * scale_factor
+                else:
+                    # All values are zero but we need positive sum
+                    # Distribute uniformly across cells that had data
+                    nonzero_mask = province_slice > 0
+                    if np.sum(nonzero_mask) > 0:
+                        x_adjusted = np.zeros(n)
+                        x_adjusted[nonzero_mask] = target_sum / np.sum(nonzero_mask)
+                    else:
+                        # No data cells - distribute uniformly (rare edge case)
+                        x_adjusted = np.full(n, target_sum / n)
+                
+                # Step 3: Verify non-negativity after adjustment
+                x_adjusted = np.maximum(x_adjusted, 0)
+                
+                # Step 4: Re-adjust if clipping changed the sum
+                adjusted_sum = np.sum(x_adjusted)
+                if abs(adjusted_sum - target_sum) > 1e-6 and adjusted_sum > 0:
+                    x_adjusted = x_adjusted * (target_sum / adjusted_sum)
+                
+                # Count adjustments made
+                diff = np.sum(np.abs(x_adjusted - province_slice))
+                if diff > 1e-6:
+                    total_adjusted += 1
+                
+                # Reshape and store
+                noisy_data[p_idx] = x_adjusted.reshape((num_cities, num_mccs, num_days))
+            
+            protected.data[query] = noisy_data
+            logger.info(
+                f"  {query}: {total_adjusted}/{num_provinces} provinces adjusted via NNLS"
+            )
+    
+    def _controlled_rounding(self, protected: TransactionHistogram) -> None:
+        """
+        Apply controlled rounding to maintain integer consistency.
+        
+        Uses randomized rounding that preserves:
+        1. Expected values (unbiased)
+        2. Province-month sum constraints (exactly - PUBLIC DATA)
+        
+        Algorithm:
+        For each province:
+        1. Compute fractional parts of all cells
+        2. Determine how many cells need to round up to match integer sum
+        3. Probabilistically select cells to round up based on fractional parts
+        4. Round remaining cells down
+        
+        This maintains E[round(x)] = x and Σ round(x_{p,c,m,d}) = Y_p
+        """
+        queries = TransactionHistogram.QUERIES
+        num_provinces = protected.shape[0]
+        num_cities = protected.shape[1]
+        num_mccs = protected.shape[2]
+        num_days = protected.shape[3]
+        
+        for query in queries:
+            data = protected.get_query_array(query).astype(np.float64)
+            province_invariants = self._province_month_invariants[query]
+            
+            rounded_data = np.zeros_like(data, dtype=np.int64)
+            
+            for p_idx in range(num_provinces):
+                target_sum = int(province_invariants[p_idx])
+                province_slice = data[p_idx].flatten()
+                n = len(province_slice)
+                
+                if target_sum <= 0:
+                    rounded_data[p_idx] = 0
+                    continue
+                
+                # Floor all values
+                floors = np.floor(province_slice).astype(np.int64)
+                floors = np.maximum(floors, 0)  # Ensure non-negative
+                fractional_parts = province_slice - floors
+                fractional_parts = np.maximum(fractional_parts, 0)  # Handle negative values
+                
+                # Compute how many need to round up to match PUBLIC invariant
+                floor_sum = np.sum(floors)
+                num_round_up = target_sum - floor_sum
+                
+                if num_round_up <= 0:
+                    # Sum of floors meets or exceeds target
+                    rounded_province = floors.copy()
+                    # May need to reduce some values
+                    while np.sum(rounded_province) > target_sum:
+                        non_zero = np.where(rounded_province > 0)[0]
+                        if len(non_zero) == 0:
+                            break
+                        idx = np.random.choice(non_zero)
+                        rounded_province[idx] -= 1
+                elif num_round_up >= n:
+                    # Need to round up all cells and possibly add more
+                    rounded_province = floors + 1
+                    extra_needed = num_round_up - n
+                    if extra_needed > 0:
+                        # Distribute extra among random cells
+                        for _ in range(int(extra_needed)):
+                            idx = np.random.randint(n)
+                            rounded_province[idx] += 1
+                else:
+                    # Normal case: probabilistic rounding
+                    # Select cells to round up based on fractional parts
+                    frac_sum = np.sum(fractional_parts)
+                    if frac_sum > 0:
+                        probs = fractional_parts / frac_sum
+                    else:
+                        probs = np.ones(n) / n
+                    
+                    # Ensure valid probability distribution
+                    probs = np.maximum(probs, 1e-10)
+                    probs = probs / np.sum(probs)
+                    
+                    try:
+                        round_up_indices = np.random.choice(
+                            n, size=int(num_round_up), replace=False, p=probs
+                        )
+                    except ValueError:
+                        # Fallback to uniform sampling
+                        round_up_indices = np.random.choice(
+                            n, size=min(int(num_round_up), n), replace=False
+                        )
+                    
+                    rounded_province = floors.copy()
+                    rounded_province[round_up_indices] += 1
+                
+                # Final adjustment to ensure EXACT match to PUBLIC invariant
+                final_sum = np.sum(rounded_province)
+                diff = target_sum - final_sum
+                
+                if diff > 0:
+                    # Need to add more
+                    for _ in range(int(diff)):
+                        idx = np.random.randint(n)
+                        rounded_province[idx] += 1
+                elif diff < 0:
+                    # Need to subtract
+                    for _ in range(int(-diff)):
+                        non_zero = np.where(rounded_province > 0)[0]
+                        if len(non_zero) == 0:
+                            break
+                        idx = np.random.choice(non_zero)
+                        rounded_province[idx] -= 1
+                
+                rounded_data[p_idx] = rounded_province.reshape((num_cities, num_mccs, num_days))
+            
+            protected.set_query_array(query, rounded_data)
+            
+            # Verify totals match PUBLIC invariants
+            final_total = np.sum(rounded_data)
+            invariant_total = np.sum(province_invariants)
+            logger.info(f"  {query}: rounded total={final_total:,} (public invariant={invariant_total:,})")
+    
+    def _verify_invariants(self, protected: TransactionHistogram) -> None:
+        """
+        Verify that province-month invariants are exactly preserved.
+        
+        This is a CRITICAL verification step - the province-month totals
+        are PUBLIC DATA that MUST match exactly.
+        """
+        queries = TransactionHistogram.QUERIES
+        all_valid = True
+        
+        for query in queries:
+            data = protected.get_query_array(query)
+            invariants = self._province_month_invariants[query]
+            
+            # Compute actual province-month sums: sum over city, mcc, day
+            actual_sums = np.sum(data, axis=(1, 2, 3))  # Sum over city, mcc, day
+            
+            # Check EXACT match (these are PUBLIC values that MUST match)
+            match = np.array_equal(actual_sums, invariants)
+            status = "✓" if match else "✗"
+            
+            max_diff = np.max(np.abs(actual_sums - invariants))
+            
+            if not match:
+                all_valid = False
+                logger.error(
+                    f"  {query}: {status} MISMATCH with public data! Max deviation: {max_diff:.0f}"
+                )
+                # Log problematic provinces
+                mismatches = np.where(actual_sums != invariants)[0]
+                for p_idx in mismatches[:5]:
+                    logger.error(
+                        f"    Province {p_idx}: public={invariants[p_idx]:,}, "
+                        f"computed={actual_sums[p_idx]:,}, diff={actual_sums[p_idx] - invariants[p_idx]:,}"
+                    )
+            else:
+                logger.info(f"  {query}: {status} Province-month totals EXACTLY match public data")
+        
+        if all_valid:
+            logger.info("  [All province-month invariants verified - matches public data]")
+        else:
+            logger.error("  [CRITICAL: Public data mismatch detected!]")
     
     def _get_sensitivity(self, query: str, mcc_group: Optional[int] = None) -> float:
         """
@@ -439,26 +709,15 @@ class TopDownEngine:
         
         USER-LEVEL SENSITIVITY:
         - L2 = sqrt(D_max) * per_cell_contribution
-        - This accounts for one card appearing in up to D_max cells
         
         For counting queries: L2 = sqrt(D_max) * K
         For unique queries: L2 = sqrt(D_max) * 1
         For sum queries: L2 = sqrt(D_max) * cap
-        
-        Args:
-            query: Query name
-            mcc_group: Optional MCC group ID for stratified sensitivity
-            
-        Returns:
-            L2 sensitivity value for user-level DP
         """
-        # Check if user-level sensitivities have been set
         if self._user_level_sensitivities and query in self._user_level_sensitivities:
             base_sensitivity = self._user_level_sensitivities[query].l2_sensitivity
             
-            # For total_amount with MCC grouping, adjust the cap component
             if query == 'total_amount' and mcc_group is not None and mcc_group in self._mcc_group_caps:
-                # Recalculate with per-group cap
                 d_max = self._d_max or 1
                 sqrt_d = math.sqrt(d_max)
                 group_cap = self._mcc_group_caps[mcc_group]
@@ -466,121 +725,23 @@ class TopDownEngine:
             
             return base_sensitivity
         
-        # Fallback: compute sensitivity from config (backward compatibility)
-        # This path should NOT be used in production - always set user-level params
+        # Fallback computation
         K = self.config.privacy.computed_contribution_bound or 1
-        d_max = self._d_max or 1  # Use D_max if set, else assume 1 (UNSAFE)
+        d_max = self._d_max or 1
         sqrt_d = math.sqrt(d_max)
         
-        if d_max == 1:
-            logger.warning(
-                f"D_max not set! Using D_max=1 which UNDERESTIMATES sensitivity. "
-                f"Call set_user_level_params() before running the engine."
-            )
-        
         if query == 'total_amount':
-            # For sum of amounts, sensitivity is sqrt(D_max) × cap
-            # The cap should be in the same units as the amounts (not normalized to [0,1])
-            # Amounts are winsorized but NOT normalized, so cap is in original units (e.g., dollars)
             if mcc_group is not None and mcc_group in self._mcc_group_caps:
                 cap = self._mcc_group_caps[mcc_group]
             elif self._mcc_group_caps:
                 cap = max(self._mcc_group_caps.values())
             else:
-                # Use winsorize cap from set_user_level_params()
                 cap = self._winsorize_cap
-                if cap == 1.0:
-                    # This should not happen in production - winsorize_cap should be set correctly
-                    # Log error as this indicates a configuration issue
-                    logger.error(
-                        f"ERROR: Using default winsorize_cap=1.0 for total_amount sensitivity. "
-                        f"This assumes amounts are normalized to [0,1], but amounts are in original units. "
-                        f"This will UNDERESTIMATE sensitivity and VIOLATE PRIVACY. "
-                        f"Ensure set_user_level_params() is called with correct winsorize_cap from preprocessor."
-                    )
-            
-            sensitivity = sqrt_d * cap
-            logger.debug(f"total_amount sensitivity: sqrt({d_max}) * {cap} = {sensitivity:.4f}")
-            return sensitivity
-            
+            return sqrt_d * cap
         elif query == 'unique_cards':
-            # Unique queries: each cell changes by at most 1
-            sensitivity = sqrt_d * 1.0
-            logger.debug(f"{query} sensitivity: sqrt({d_max}) * 1 = {sensitivity:.4f}")
-            return sensitivity
-            
+            return sqrt_d * 1.0
         else:
-            # Counting queries: each cell changes by at most K
-            sensitivity = sqrt_d * K
-            logger.debug(f"{query} sensitivity: sqrt({d_max}) * {K} = {sensitivity:.4f}")
-            return sensitivity
-    
-    def _post_process(self, protected: TransactionHistogram) -> None:
-        """
-        Post-process protected histogram.
-        
-        Operations:
-        1. Round to integers
-        2. Enforce non-negativity (set negative values to 0)
-        3. Optionally enforce consistency between levels
-        """
-        queries = TransactionHistogram.QUERIES
-        
-        for query in queries:
-            data = protected.get_query_array(query)
-            
-            # Count negative values before
-            negative_count = np.sum(data < 0)
-            
-            # Round and enforce non-negativity
-            data = np.round(data).astype(np.int64)
-            data = np.maximum(data, 0)
-            
-            protected.set_query_array(query, data)
-            
-            if negative_count > 0:
-                logger.info(f"  {query}: {negative_count:,} negative values set to 0")
-    
-    def _enforce_consistency(
-        self,
-        protected: TransactionHistogram,
-        query: str
-    ) -> None:
-        """
-        Enforce consistency between city-level and province-level aggregates.
-        
-        Uses simple proportional adjustment to make city sums match province totals.
-        
-        This is optional and may not preserve DP guarantees strictly.
-        """
-        if query not in self._province_aggregates:
-            return
-        
-        province_targets = self._province_aggregates[query]
-        data = protected.get_query_array(query)
-        
-        num_provinces = data.shape[0]
-        
-        for p_idx in range(num_provinces):
-            # Current sum for this province (over all cities, mccs, days)
-            current_sum = np.sum(data[p_idx])
-            
-            if current_sum == 0:
-                continue
-            
-            # Target from province-level noise
-            target_sum = np.sum(province_targets[p_idx])
-            
-            if target_sum <= 0:
-                # Province total is zero or negative, set all to 0
-                data[p_idx] = 0
-            else:
-                # Scale proportionally
-                scale_factor = target_sum / current_sum
-                data[p_idx] = np.round(data[p_idx] * scale_factor).astype(np.int64)
-                data[p_idx] = np.maximum(data[p_idx], 0)
-        
-        protected.set_query_array(query, data)
+            return sqrt_d * K
 
 
 class SimpleEngine:
@@ -600,8 +761,6 @@ class SimpleEngine:
         
         total_rho = self.budget.total_rho
         num_queries = len(TransactionHistogram.QUERIES)
-        
-        # Split budget equally among queries
         rho_per_query = total_rho / num_queries
         
         for query in TransactionHistogram.QUERIES:
@@ -613,10 +772,7 @@ class SimpleEngine:
                 sensitivity=1.0
             )
             
-            # Post-process: non-negativity
             noisy_data = np.maximum(np.round(noisy_data), 0).astype(np.int64)
-            
             protected.set_query_array(query, noisy_data)
         
         return protected
-

@@ -227,17 +227,19 @@ By parallel composition: Total privacy cost for the month = ρ_day (not 30 × ρ
 ```
 Monthly Budget: ρ = 0.25
 │
-├── Province Level: 20% = 0.05
-│   └── Per query: 0.05/4 = 0.0125
+├── Province-Month Level: 0% (PUBLIC DATA - no noise)
+│   └── These totals are published exactly (no privacy cost)
 │
-└── City Level: 80% = 0.20
-    └── Per query: 0.20/4 = 0.05
+└── Cell Level: 100% = 0.25
+    └── Per query: 0.25/3 ≈ 0.083
 ```
 
 **Total composition**:
-- Province queries: 4 × 0.0125 = 0.05
-- City queries: 4 × 0.05 = 0.20
+- Province-month: 0 (public invariants)
+- Cell-level queries: 3 × 0.083 = 0.25
 - **Total**: 0.25 ✓
+
+**Key Point**: Since province-month totals are public data (already published), they consume no privacy budget. The entire budget is allocated to cell-level measurements.
 
 ---
 
@@ -254,17 +256,22 @@ If M satisfies ρ-zCDP, then for any function g, the mechanism g(M(D)) also sati
 4. **Confidence intervals**: Computing from σ — Free!
 5. **Suppression**: Hiding small cells — Free (and improves privacy)!
 
-### 5.2 Invariants are NOT Free
+### 5.2 Province-Month Invariants (Public Data)
 
-**Important**: Publishing EXACT (non-noisy) totals DOES cost privacy.
+**Important**: Our system uses **province-month totals as public invariants**.
 
 Our invariants:
-- National monthly total: EXACT (no DP cost if this is public knowledge)
-- Province monthly total: EXACT (same reasoning)
+- Province-month totals: EXACT (no DP cost - these are publicly published data)
 
-**Justification**: If national/province totals are already public (e.g., from aggregate banking reports), releasing them exactly doesn't reveal additional information.
+**Justification**: Province-month totals are already publicly available (e.g., from aggregate banking reports, government statistics). Releasing them exactly doesn't reveal additional information beyond what is already public.
 
-If they are NOT public, we would need to add noise or count them against the privacy budget.
+**Algorithm**:
+1. Compute province-month totals from data (these match public statistics)
+2. Add DP noise to cell-level (city, mcc, day) measurements with full budget
+3. NNLS post-processing ensures cell sums match exact province-month invariants
+4. Controlled rounding produces integer outputs
+
+**Privacy Guarantee**: The cell-level measurements satisfy ρ-zCDP. The province-month invariants are treated as public information (no privacy cost).
 
 ---
 
@@ -310,7 +317,7 @@ Converting to (ε, δ)-DP with δ=10⁻¹⁰:
 | **Geographic Hierarchy** | 6 levels | 2 levels |
 | **NNLS Post-Processing** | Yes | Yes ✓ |
 | **Controlled Rounding** | Yes | Yes ✓ |
-| **Invariants** | Pop totals exact | Monthly totals exact ✓ |
+| **Invariants** | Pop totals exact | Province-month totals (public) ✓ |
 | **Suppression** | Yes | Yes ✓ |
 | **Confidence Intervals** | Yes | Yes ✓ |
 | **Global Sensitivity** | N/A (one residence) | √M × K ✓ |

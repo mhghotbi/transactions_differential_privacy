@@ -387,50 +387,49 @@ The `CensusDASEngine` class exactly replicates the US Census Bureau's 2020 metho
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│              CENSUS DAS-STYLE HIERARCHICAL NOISE                     │
+│         CENSUS DAS-STYLE WITH PROVINCE-MONTH INVARIANTS              │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                      │
-│  STEP 1: Province-Level Noise (20% of budget)                       │
-│  ═══════════════════════════════════════════                        │
+│  STEP 1: Compute Province-Month Invariants (PUBLIC DATA)           │
+│  ═══════════════════════════════════════════════════════            │
 │                                                                      │
 │    Province A           Province B           Province C              │
 │    ┌─────────┐          ┌─────────┐          ┌─────────┐            │
-│    │ True:   │          │ True:   │          │ True:   │            │
+│    │ Public: │          │ Public: │          │ Public: │            │
 │    │ 10,000  │          │  5,000  │          │  8,000  │            │
-│    │   ↓     │          │   ↓     │          │   ↓     │            │
-│    │ +noise  │          │ +noise  │          │ +noise  │            │
-│    │   ↓     │          │   ↓     │          │   ↓     │            │
-│    │ Noisy:  │          │ Noisy:  │          │ Noisy:  │            │
-│    │ 10,003  │          │  4,998  │          │  8,005  │            │
+│    │ (EXACT) │          │ (EXACT) │          │ (EXACT) │            │
 │    └─────────┘          └─────────┘          └─────────┘            │
+│    No noise added - these are publicly published statistics         │
 │                                                                      │
-│  STEP 2: City-Level Noise (80% of budget)                           │
-│  ════════════════════════════════════════                           │
+│  STEP 2: Cell-Level Noise (100% of budget)                          │
+│  ═══════════════════════════════════════                            │
 │                                                                      │
-│    Province A                                                        │
+│    Province A (cells: city × mcc × day)                             │
 │    ┌────────────────────────────────────────┐                       │
-│    │  City 1    City 2    City 3    City 4  │                       │
-│    │  ┌────┐    ┌────┐    ┌────┐    ┌────┐  │                       │
-│    │  │2500│    │3000│    │2500│    │2000│  │ True = 10,000         │
-│    │  │+n  │    │+n  │    │+n  │    │+n  │  │                       │
-│    │  │2502│    │2998│    │2503│    │2001│  │ Noisy = 10,004        │
-│    │  └────┘    └────┘    └────┘    └────┘  │                       │
+│    │  City 1, MCC 5411, Day 1: 2500 → 2502 │                       │
+│    │  City 1, MCC 5411, Day 2: 1800 → 1803 │                       │
+│    │  City 2, MCC 5812, Day 1: 3000 → 2998 │                       │
+│    │  City 2, MCC 5812, Day 2: 2700 → 2701 │                       │
+│    │  ... (all cells get noise)              │                       │
 │    └────────────────────────────────────────┘                       │
+│    Noisy cell sum = 10,004 (doesn't match public 10,000 yet)        │
 │                                                                      │
-│  STEP 3: Consistency Enforcement                                    │
-│  ═══════════════════════════════                                    │
+│  STEP 3: NNLS Post-Processing (Enforce Province Constraint)         │
+│  ═══════════════════════════════════════════════════════            │
 │                                                                      │
-│    Problem: City sum (10,004) ≠ Province noisy (10,003)             │
+│    Problem: Cell sum (10,004) ≠ Province public invariant (10,000)  │
 │                                                                      │
-│    Solution: Proportional scaling                                    │
-│    Scale factor = 10,003 / 10,004 = 0.9999                          │
+│    Solution: NNLS optimization                                       │
+│    minimize   Σ (x_cell - noisy_cell)²                              │
+│    subject to Σ x_cell = 10,000 (province invariant)                │
+│               x_cell ≥ 0 (non-negativity)                            │
 │                                                                      │
-│    City 1: 2502 × 0.9999 = 2502 (rounded)                           │
-│    City 2: 2998 × 0.9999 = 2998                                     │
-│    City 3: 2503 × 0.9999 = 2503                                     │
-│    City 4: 2001 × 0.9999 = 2001 - 1 = 2000 (adjustment)             │
+│    Result: Adjusted cells sum to exactly 10,000 ✓                   │
 │                                                                      │
-│    Final city sum = 10,003 ✓ (matches province)                     │
+│  STEP 4: Controlled Rounding                                        │
+│  ═══════════════════════════                                        │
+│                                                                      │
+│    Round to integers while preserving province sum = 10,000         │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -441,9 +440,11 @@ The `CensusDASEngine` class exactly replicates the US Census Bureau's 2020 metho
 |---------|----------------|
 | Exact Discrete Gaussian | `_discrete_gaussian()` with rational arithmetic |
 | Cryptographic RNG | Python `secrets` module |
-| Hierarchical noise | Province → City top-down |
+| Province-Month Invariants | Exact public data (no noise) |
+| Cell-Level Noise | Full budget to (city, mcc, day) cells |
+| NNLS Post-Processing | Enforces province-month constraints |
+| Controlled Rounding | Integer outputs preserving sums |
 | Budget composition | zCDP additive composition |
-| Consistency | Proportional adjustment to match parent totals |
 | Post-processing | Non-negativity (free under DP) |
 
 **Usage:**
@@ -580,19 +581,17 @@ contribution_bound_fixed = 5
 │  Total Monthly:  ρ = 0.25                                           │
 │  ════════════════════════                                            │
 │         │                                                            │
-│         ├──── Province (20%) ───→ ρ = 0.05                          │
-│         │         │                                                  │
-│         │         ├── transaction_count (25%) → ρ = 0.0125          │
-│         │         ├── unique_cards (25%)      → ρ = 0.0125          │
-│         │         ├── unique_acceptors (25%)  → ρ = 0.0125          │
-│         │         └── total_amount (25%)      → ρ = 0.0125          │
+│         ├──── Province-Month: 0% (PUBLIC DATA - no noise)            │
+│         │     These totals are published exactly                    │
 │         │                                                            │
-│         └──── City (80%) ───────→ ρ = 0.20                          │
+│         └──── Cell Level (100%) ───→ ρ = 0.25                       │
 │                   │                                                  │
-│                   ├── transaction_count (25%) → ρ = 0.05            │
-│                   ├── unique_cards (25%)      → ρ = 0.05            │
-│                   ├── unique_acceptors (25%)  → ρ = 0.05            │
-│                   └── total_amount (25%)      → ρ = 0.05            │
+│                   ├── transaction_count (33%) → ρ = 0.083           │
+│                   ├── unique_cards (33%)      → ρ = 0.083           │
+│                   └── total_amount (34%)      → ρ = 0.084           │
+│                                                                      │
+│  Note: Full budget allocated to cell level since province-month    │
+│        totals are public invariants (no privacy cost)                │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -622,33 +621,35 @@ contribution_bound_fixed = 5
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Sigma Values per Query/Level
+#### Sigma Values per Query (Cell Level)
 
-| Level | Query | ρ | σ | Typical Noise (95%) |
-|-------|-------|-----|------|---------------------|
-| Province | transaction_count | 0.0125 | 6.32 | ±12 |
-| Province | unique_cards | 0.0125 | 6.32 | ±12 |
-| Province | unique_acceptors | 0.0125 | 6.32 | ±12 |
-| Province | total_amount | 0.0125 | 6.32 × cap | depends on cap |
-| **City** | **transaction_count** | **0.05** | **3.16** | **±6** |
-| **City** | **unique_cards** | **0.05** | **3.16** | **±6** |
-| **City** | **unique_acceptors** | **0.05** | **3.16** | **±6** |
-| **City** | **total_amount** | **0.05** | **3.16 × cap** | **depends** |
+| Query | ρ | σ | Typical Noise (95%) |
+|-------|-----|------|---------------------|
+| transaction_count | 0.083 | 2.45 | ±5 |
+| unique_cards | 0.083 | 2.45 | ±5 |
+| total_amount | 0.084 | 2.44 × cap | depends on cap |
+
+**Note**: Province-month totals are EXACT (public data) - no noise added.
+All privacy budget is allocated to cell-level (city, mcc, day) measurements.
 
 #### Practical Impact Examples
 
 ```
-Large City (1000 transactions/day):
+Large Cell (1000 transactions):
   True count: 1000
-  σ = 3.16 → noise typically ±6
-  Output: ~994 to 1006
-  Relative error: ~0.6%
+  σ = 2.45 → noise typically ±5
+  Output: ~995 to 1005
+  Relative error: ~0.5%
 
-Small City (10 transactions/day):
+Small Cell (10 transactions):
   True count: 10  
-  σ = 3.16 → noise typically ±6
-  Output: ~4 to 16
-  Relative error: ~60% (high for small cells)
+  σ = 2.45 → noise typically ±5
+  Output: ~5 to 15
+  Relative error: ~50% (high for small cells)
+
+Province-Month Total:
+  Public value: 10,000 (EXACT - no noise)
+  All cells sum to exactly 10,000 after NNLS
 ```
 
 #### Continuous Release & Annual Privacy
@@ -1516,22 +1517,23 @@ sensitivity_method = global
 │     └── Clip transactions per card-cell to K                        │
 │                                                                      │
 │  3. COMPUTE GLOBAL SENSITIVITY                                       │
-│     ├── Find M = max cells per card                                 │
-│     └── Δ₂ = √M × K for each query                                  │
+│     ├── Find D_max = max cells per card                              │
+│     └── Δ₂ = √D_max × K for each query                              │
 │                                                                      │
-│  4. COMPUTE INVARIANTS (before noise)                               │
-│     ├── National monthly totals (EXACT)                             │
-│     └── Province monthly totals (EXACT)                             │
+│  4. COMPUTE PROVINCE-MONTH INVARIANTS (PUBLIC DATA)                 │
+│     ├── Province-month totals (EXACT - no noise)                     │
+│     └── These match publicly published statistics                  │
 │                                                                      │
-│  5. ADD NOISE (city-day level only)                                 │
-│     ├── σ² = Δ₂² / (2ρ)                                             │
+│  5. ADD NOISE (cell level: city, mcc, day) - FULL BUDGET             │
+│     ├── σ² = Δ₂² / (2ρ) where ρ = total_rho (100% to cells)         │
 │     └── noise ~ Discrete Gaussian(σ²)                               │
 │                                                                      │
 │  6. NNLS POST-PROCESSING                                             │
-│     └── Adjust city values to sum to province invariant             │
+│     └── Adjust cell values to sum to province-month invariant       │
+│         (minimize distortion while matching public totals)           │
 │                                                                      │
 │  7. CONTROLLED ROUNDING                                              │
-│     └── Round to integers preserving sums                           │
+│     └── Round to integers preserving province-month sums            │
 │                                                                      │
 │  8. ADD CONFIDENCE INTERVALS                                         │
 │     └── MOE, CI lower/upper for each query                          │

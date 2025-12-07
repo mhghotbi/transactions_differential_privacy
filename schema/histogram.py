@@ -55,7 +55,8 @@ class TransactionHistogram:
         day_dim: int = 30,
         province_labels: Optional[List[str]] = None,
         city_labels: Optional[List[str]] = None,
-        mcc_labels: Optional[List[str]] = None
+        mcc_labels: Optional[List[str]] = None,
+        city_codes: Optional[List[int]] = None
     ):
         """
         Initialize histogram structure.
@@ -68,6 +69,7 @@ class TransactionHistogram:
             province_labels: Optional province names
             city_labels: Optional city names
             mcc_labels: Optional MCC codes
+            city_codes: Optional city codes (parallel to city_labels)
         """
         self.dimensions = {
             'province': HistogramDimension('province', province_dim, province_labels),
@@ -77,6 +79,9 @@ class TransactionHistogram:
         }
         
         self.shape = (province_dim, city_dim, mcc_dim, day_dim)
+        
+        # Store city codes (parallel to city_labels, city_codes[idx] = code for city at idx)
+        self.city_codes = city_codes
         
         # Initialize data arrays for each query
         self.data: Dict[str, np.ndarray] = {
@@ -195,7 +200,8 @@ class TransactionHistogram:
             day_dim=self.shape[3],
             province_labels=self.dimensions['province'].labels,
             city_labels=self.dimensions['city'].labels,
-            mcc_labels=self.dimensions['mcc'].labels
+            mcc_labels=self.dimensions['mcc'].labels,
+            city_codes=self.city_codes.copy() if self.city_codes else None
         )
         
         for query in self.QUERIES:
@@ -211,7 +217,7 @@ class TransactionHistogram:
         Uses NumPy vectorization for fast conversion.
         
         Returns:
-            List of dicts with province, city, mcc, day, and query values
+            List of dicts with province, city, city_code, mcc, day, and query values
         """
         # Use NumPy to find non-zero cells efficiently
         indices = np.where(self._has_data)
@@ -224,6 +230,9 @@ class TransactionHistogram:
         city_labels = self.dimensions['city'].labels or [str(i) for i in range(self.shape[1])]
         mcc_labels = self.dimensions['mcc'].labels or [str(i) for i in range(self.shape[2])]
         day_labels = self.dimensions['day'].labels or [str(i) for i in range(self.shape[3])]
+        
+        # Pre-fetch city codes (default to index if not available)
+        city_codes_list = self.city_codes or list(range(self.shape[1]))
         
         # Pre-fetch query data for all non-zero cells
         query_data = {
@@ -243,6 +252,7 @@ class TransactionHistogram:
                 'province': province_labels[p] if p < len(province_labels) else str(p),
                 'city_idx': int(c),
                 'city': city_labels[c] if c < len(city_labels) else str(c),
+                'city_code': int(city_codes_list[c]) if c < len(city_codes_list) else int(c),
                 'mcc_idx': int(m),
                 'mcc': mcc_labels[m] if m < len(mcc_labels) else str(m),
                 'day_idx': int(d),
@@ -275,7 +285,7 @@ class TransactionHistogram:
         
         if len(indices[0]) == 0:
             # Return empty DataFrame with correct columns
-            columns = ['province_idx', 'province', 'city_idx', 'city', 
+            columns = ['province_idx', 'province', 'city_idx', 'city', 'city_code',
                       'mcc_idx', 'mcc', 'day_idx', 'day'] + self.QUERIES
             return pd.DataFrame(columns=columns)
         
@@ -285,12 +295,16 @@ class TransactionHistogram:
         mcc_labels = self.dimensions['mcc'].labels or [str(i) for i in range(self.shape[2])]
         day_labels = self.dimensions['day'].labels or [str(i) for i in range(self.shape[3])]
         
+        # Pre-fetch city codes (default to index if not available)
+        city_codes_list = self.city_codes or list(range(self.shape[1]))
+        
         # Build DataFrame columns directly from arrays
         data = {
             'province_idx': indices[0].astype(int),
             'province': [province_labels[i] if i < len(province_labels) else str(i) for i in indices[0]],
             'city_idx': indices[1].astype(int),
             'city': [city_labels[i] if i < len(city_labels) else str(i) for i in indices[1]],
+            'city_code': [int(city_codes_list[i]) if i < len(city_codes_list) else int(i) for i in indices[1]],
             'mcc_idx': indices[2].astype(int),
             'mcc': [mcc_labels[i] if i < len(mcc_labels) else str(i) for i in indices[2]],
             'day_idx': indices[3].astype(int),

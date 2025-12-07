@@ -430,8 +430,12 @@ class TransactionPreprocessor:
                 province_labels[code] = province.name
         
         city_labels = [''] * num_cities
+        city_codes = [0] * num_cities  # NEW: city codes list
         for city, idx in self._city_to_idx.items():
             city_labels[idx] = city
+            # Get city code from geography
+            city_code = self.geography.get_city_code(city)
+            city_codes[idx] = city_code if city_code is not None else idx
         
         mcc_labels = [''] * num_mccs
         for mcc, idx in self._mcc_to_idx.items():
@@ -444,7 +448,8 @@ class TransactionPreprocessor:
             day_dim=num_days,
             province_labels=province_labels,
             city_labels=city_labels,
-            mcc_labels=mcc_labels
+            mcc_labels=mcc_labels,
+            city_codes=city_codes  # NEW: pass city codes
         )
         
         # Fill histogram

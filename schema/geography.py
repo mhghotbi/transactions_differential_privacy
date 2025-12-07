@@ -34,6 +34,7 @@ class Province:
 class City:
     """Represents a city."""
     name: str
+    code: int  # CityCode from CSV
     province_code: int
     province_name: str
     
@@ -51,19 +52,22 @@ class Geography:
     Manages the geographic hierarchy: Province -> City.
     
     Loads from city_province.csv with columns:
-    - StateCode: Province code (int)
-    - StateName: Province name (str)
     - CityName: City name (str)
+    - StateName: Province name (str)
+    - CityCode: City code (int)
+    - StateCode: Province code (int)
     """
     
     # Special code for unknown province (cities not in city_province file)
     UNKNOWN_PROVINCE_CODE = 999
     UNKNOWN_PROVINCE_NAME = "Unknown"
+    UNKNOWN_CITY_CODE = 999999  # Special code for unknown cities
     
     def __init__(self):
         self._provinces: Dict[int, Province] = {}
         self._cities: Dict[str, City] = {}
         self._city_to_province: Dict[str, int] = {}
+        self._city_name_to_code: Dict[str, int] = {}  # Maps city_name -> city_code
         self._province_to_cities: Dict[int, List[str]] = {}
         self._has_unknown_province = False
     
@@ -72,9 +76,9 @@ class Geography:
         """
         Load geography from CSV file.
         
-        Expected format:
-        StateCode,StateName,CityName
-        0,ProvinceName,CityName
+        Expected format (4 columns):
+        CityName,StateName,CityCode,StateCode
+        CityName,ProvinceName,123,0
         ...
         
         Args:
@@ -96,6 +100,7 @@ class Geography:
                 province_code = int(row['StateCode'])
                 province_name = row['StateName'].strip()
                 city_name = row['CityName'].strip()
+                city_code = int(row['CityCode'])
                 
                 # Add province if not exists
                 if province_code not in geo._provinces:
@@ -110,10 +115,12 @@ class Geography:
                 if city_name not in geo._cities:
                     geo._cities[city_name] = City(
                         name=city_name,
+                        code=city_code,
                         province_code=province_code,
                         province_name=province_name
                     )
                     geo._city_to_province[city_name] = province_code
+                    geo._city_name_to_code[city_name] = city_code
                     geo._provinces[province_code].cities.append(city_name)
                     geo._province_to_cities[province_code].append(city_name)
         
@@ -173,6 +180,11 @@ class Geography:
         """Get all city names."""
         return sorted(self._cities.keys())
     
+    @property
+    def city_codes(self) -> List[int]:
+        """Get all city codes."""
+        return sorted(set(self._city_name_to_code.values()))
+    
     def get_province(self, code: int) -> Optional[Province]:
         """Get province by code."""
         return self._provinces.get(code)
@@ -201,6 +213,10 @@ class Geography:
                 return province.name
         return None
     
+    def get_city_code(self, city_name: str) -> Optional[int]:
+        """Get city code for a city name."""
+        return self._city_name_to_code.get(city_name)
+    
     def get_cities_in_province(self, province_code: int) -> List[str]:
         """Get all cities in a province."""
         return self._province_to_cities.get(province_code, [])
@@ -217,16 +233,16 @@ class Geography:
             hierarchy[province.name] = sorted(province.cities)
         return hierarchy
     
-    def city_to_province_broadcast(self) -> Dict[str, Tuple[int, str]]:
+    def city_to_province_broadcast(self) -> Dict[str, Tuple[int, str, int]]:
         """
         Get a dictionary suitable for Spark broadcast.
         
         Returns:
-            Dict mapping city_name -> (province_code, province_name)
+            Dict mapping city_name -> (province_code, province_name, city_code)
         """
         result = {}
         for city_name, city in self._cities.items():
-            result[city_name] = (city.province_code, city.province_name)
+            result[city_name] = (city.province_code, city.province_name, city.code)
         return result
     
     def validate_city(self, city_name: str) -> bool:

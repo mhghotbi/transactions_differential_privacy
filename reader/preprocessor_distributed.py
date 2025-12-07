@@ -74,9 +74,9 @@ class DistributedPreprocessor:
     def _broadcast_geography(self) -> None:
         """Create and broadcast geography lookup table."""
         # Geography is small (~500 cities) - safe to broadcast
-        # Use the existing method that returns city -> (province_code, province_name)
+        # Use the existing method that returns city -> (province_code, province_name, city_code)
         geo_data = [
-            (city, info[0], info[1])  # city_name, province_code, province_name
+            (city, info[0], info[1], info[2])  # city_name, province_code, province_name, city_code
             for city, info in self.geography.city_to_province_broadcast().items()
         ]
         
@@ -84,6 +84,7 @@ class DistributedPreprocessor:
             StructField("city_name", StringType(), False),
             StructField("province_code", IntegerType(), False),
             StructField("province_name", StringType(), False),
+            StructField("city_code", IntegerType(), False),
         ])
         
         self._geo_df = self.spark.createDataFrame(geo_data, schema=geo_schema)

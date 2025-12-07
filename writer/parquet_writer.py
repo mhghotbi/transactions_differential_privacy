@@ -29,20 +29,18 @@ class ParquetWriter:
     
     Output structure:
     - One Parquet file with all protected data
-    - Columns: province, city, mcc, day, transaction_count, unique_cards, 
+    - Columns: province_code, city_code, mcc, day, transaction_count, unique_cards, 
                transaction_amount_sum
-    - Partitioned by province for efficient queries
+    - Partitioned by province_code and city_code for efficient queries
     """
     
     # Output schema
     OUTPUT_SCHEMA = StructType([
         StructField("province_code", IntegerType(), False),
-        StructField("province_name", StringType(), True),
-        StructField("city_idx", IntegerType(), False),
-        StructField("city_name", StringType(), True),
-        StructField("mcc_idx", IntegerType(), False),
+        StructField("city_code", IntegerType(), False),
         StructField("mcc", StringType(), True),
         StructField("day_idx", IntegerType(), False),
+        StructField("transaction_date", StringType(), True),
         StructField("transaction_count", LongType(), False),
         StructField("unique_cards", LongType(), False),
         StructField("transaction_amount_sum", LongType(), False),
@@ -64,7 +62,7 @@ class ParquetWriter:
         """
         self.spark = spark
         self.config = config
-        self.partition_by = partition_by or ['province_name']
+        self.partition_by = partition_by or ['province_code', 'city_code']
     
     def write(
         self,
@@ -147,12 +145,10 @@ class ParquetWriter:
         mapped_records = [
             {
                 'province_code': r['province_idx'],
-                'province_name': r['province'],
-                'city_idx': r['city_idx'],
-                'city_name': r['city'],
-                'mcc_idx': r['mcc_idx'],
+                'city_code': r['city_code'],
                 'mcc': r['mcc'],
                 'day_idx': r['day_idx'],
+                'transaction_date': r.get('day', str(r['day_idx'])),
                 'transaction_count': int(r['transaction_count']),
                 'unique_cards': int(r['unique_cards']),
                 'transaction_amount_sum': int(r['total_amount']),
@@ -177,12 +173,10 @@ class ParquetWriter:
         mapped_records = [
             {
                 'province_code': r['province_idx'],
-                'province_name': r['province'],
-                'city_idx': r['city_idx'],
-                'city_name': r['city'],
-                'mcc_idx': r['mcc_idx'],
+                'city_code': r['city_code'],
                 'mcc': r['mcc'],
                 'day_idx': r['day_idx'],
+                'transaction_date': r.get('day', str(r['day_idx'])),
                 'transaction_count': int(r['transaction_count']),
                 'unique_cards': int(r['unique_cards']),
                 'transaction_amount_sum': int(r['total_amount']),
@@ -262,13 +256,12 @@ class CSVWriter:
         
         # Write CSV
         fieldnames = [
-            'province_idx', 'province', 'city_idx', 'city',
-            'mcc_idx', 'mcc', 'day_idx', 'day',
+            'province_idx', 'city_code', 'mcc', 'day_idx',
             'transaction_count', 'unique_cards', 'transaction_amount_sum'
         ]
         
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(records)
         

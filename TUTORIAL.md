@@ -547,13 +547,15 @@ python examples/run_production.py \
 ### Invariant Structure
 
 ```
-INVARIANTS (EXACT - no noise):
-  - National monthly totals (all 4 metrics)
-  - Province monthly totals (all 4 metrics)
+INVARIANTS (EXACT - PUBLIC DATA):
+  - Province-month totals (all queries)
+  - These match publicly published statistics
+  - No noise added (no privacy cost)
 
-NOISY (but adjusted for consistency):
-  - Daily values (sum to monthly invariant)
-  - City values (sum to province daily)
+NOISY (with DP protection):
+  - Cell-level values (city, mcc, day)
+  - Full privacy budget allocated here
+  - Adjusted via NNLS to sum to province-month invariants
 ```
 
 ### Production Architecture
@@ -777,9 +779,11 @@ plt.savefig("city_counts.png")
 total_rho = 1/4
 delta = 1e-10
 
-# Geographic allocation (must sum to 1.0)
-geographic_split_province = 0.2
-geographic_split_city = 0.8
+# Geographic allocation (NOTE: Province-month are public invariants)
+# All budget goes to cell level (city, mcc, day)
+# Geographic split is not used - full budget to cells
+geographic_split_province = 0.0
+geographic_split_city = 1.0
 
 # Query allocation (must sum to 1.0)
 query_split_transaction_count = 0.25

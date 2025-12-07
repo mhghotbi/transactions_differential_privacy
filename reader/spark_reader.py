@@ -162,7 +162,7 @@ class SparkTransactionReader:
         
         # Create city-province lookup DataFrame (no UDFs!)
         city_province_data = [
-            (city, info[0], info[1])  # city_name, province_code, province_name
+            (city, info[0], info[1], info[2])  # city_name, province_code, province_name, city_code
             for city, info in self.geography.city_to_province_broadcast().items()
         ]
         
@@ -170,6 +170,7 @@ class SparkTransactionReader:
             StructField("city_name", StringType(), False),
             StructField("province_code", IntegerType(), False),
             StructField("province_name", StringType(), False),
+            StructField("city_code", IntegerType(), False),
         ])
         
         city_province_df = self.spark.createDataFrame(city_province_data, schema=city_province_schema)
@@ -185,10 +186,11 @@ class SparkTransactionReader:
         # Count unknown cities before filling
         unknown_count = df.filter(F.col('province_code').isNull()).count()
         
-        # Assign unknown cities to "Unknown" province
+        # Assign unknown cities to "Unknown" province and unknown city code
         df = df.fillna({
             'province_code': Geography.UNKNOWN_PROVINCE_CODE,
-            'province_name': Geography.UNKNOWN_PROVINCE_NAME
+            'province_name': Geography.UNKNOWN_PROVINCE_NAME,
+            'city_code': Geography.UNKNOWN_CITY_CODE
         })
         
         after_city_join = df.count()
