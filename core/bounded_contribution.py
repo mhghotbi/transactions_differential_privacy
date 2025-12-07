@@ -90,7 +90,7 @@ class BoundedContributionCalculator:
         fixed_k: int = 5,
         percentile: float = 99.0,
         compute_per_group: bool = True,
-        num_groups_for_k: int = 3
+        num_groups_for_k: int = 5
     ):
         """
         Initialize calculator.
@@ -106,7 +106,7 @@ class BoundedContributionCalculator:
             percentile: Target percentile (0-100) for percentile methods
             compute_per_group: If True and mcc_group column exists, compute K per group
                               then take max. Reduces memory for large datasets.
-            num_groups_for_k: Number of MCC groups to use for K computation (e.g., 3)
+            num_groups_for_k: Number of MCC groups to use for K computation (e.g., 5)
         """
         self.method = method
         self.iqr_multiplier = iqr_multiplier
@@ -279,7 +279,7 @@ class BoundedContributionCalculator:
         """
         Compute K using a SEPARATE coarse MCC grouping for memory efficiency.
         
-        This method creates a NEW grouping with num_groups_for_k groups (e.g., 3)
+        This method creates a NEW grouping with num_groups_for_k groups (e.g., 5)
         JUST for K computation. This is different from the main mcc_group column
         which has more groups (e.g., 20) and is used for DP noise application.
         
