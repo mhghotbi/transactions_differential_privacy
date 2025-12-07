@@ -97,8 +97,48 @@ class SparkTransactionReader:
         return df
     
     def _read_parquet(self, path: str) -> DataFrame:
-        """Read from Parquet format."""
-        return self.spark.read.parquet(path)
+        """
+        Read from Parquet format with error handling.
+        
+        Args:
+            path: Path to Parquet file or directory
+            
+        Returns:
+            DataFrame with transaction data
+            
+        Raises:
+            ValueError: If file is empty, corrupted, or cannot be read
+        """
+        try:
+            df = self.spark.read.parquet(path)
+            
+            # Validate that we got a valid DataFrame
+            if df is None:
+                raise ValueError(f"Failed to read Parquet file: {path} (returned None)")
+            
+            # Check if DataFrame has partitions (indicates file was read)
+            try:
+                num_partitions = df.rdd.getNumPartitions()
+                if num_partitions == 0:
+                    logger.warning(f"Parquet file {path} has 0 partitions - may be empty")
+            except Exception as e:
+                logger.warning(f"Could not check partitions: {e}")
+            
+            return df
+            
+        except Exception as e:
+            error_msg = f"Error reading Parquet file {path}: {str(e)}"
+            logger.error(error_msg)
+            
+            # Provide more helpful error message for common issues
+            if "read length must be non-negative or -1" in str(e):
+                raise ValueError(
+                    f"Parquet file appears corrupted or empty: {path}\n"
+                    f"Original error: {str(e)}\n"
+                    f"Please verify the file exists and is not corrupted."
+                ) from e
+            else:
+                raise ValueError(error_msg) from e
     
     def _read_csv(self, path: str) -> DataFrame:
         """Read from CSV format."""
@@ -147,8 +187,25 @@ class SparkTransactionReader:
             logger.info("Skipping record counts for performance (skip_counts=True)")
             initial_count = -1
         else:
-            initial_count = df.count()
-            logger.info(f"Initial record count: {initial_count:,}")
+            try:
+                initial_count = df.count()
+                logger.info(f"Initial record count: {initial_count:,}")
+                
+                if initial_count == 0:
+                    raise ValueError(
+                        "Input DataFrame is empty. Please verify your input file contains data."
+                    )
+            except Exception as e:
+                if "read length must be non-negative or -1" in str(e):
+                    raise ValueError(
+                        "Error reading input data. This may indicate:\n"
+                        "1. The input file is corrupted or empty\n"
+                        "2. The file format is incorrect\n"
+                        "3. There's an issue with the file system\n"
+                        f"Original error: {str(e)}"
+                    ) from e
+                else:
+                    raise
         
         # Convert transaction_date to DateType if it's a string
         date_field = [f for f in df.schema.fields if f.name == 'transaction_date'][0]
@@ -168,9 +225,27 @@ class SparkTransactionReader:
             df = df.filter(F.col(col).isNotNull())
         
         if not skip_counts:
-            after_null_filter = df.count()
-            logger.info(f"After null filter: {after_null_filter:,} "
-                       f"(dropped {initial_count - after_null_filter:,})")
+            try:
+                after_null_filter = df.count()
+                logger.info(f"After null filter: {after_null_filter:,} "
+                           f"(dropped {initial_count - after_null_filter:,})")
+                
+                if after_null_filter == 0:
+                    raise ValueError(
+                        "All records were filtered out after null filtering. "
+                        "Please check your input data - all required columns must have non-null values."
+                    )
+            except Exception as e:
+                if "read length must be non-negative or -1" in str(e):
+                    raise ValueError(
+                        "Error counting records after null filter. This may indicate:\n"
+                        "1. The input file is corrupted or empty\n"
+                        "2. All records were filtered out\n"
+                        "3. There's an issue with the file system\n"
+                        f"Original error: {str(e)}"
+                    ) from e
+                else:
+                    raise
         
         # Create city-province lookup DataFrame (no UDFs!)
         city_province_data = [
