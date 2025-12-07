@@ -720,10 +720,10 @@ class TopDownEngine:
         logger.info(f"[PER-GROUP] Processing query '{query}' with {num_groups} MCC groups")
         logger.info(f"[PER-GROUP] Using PARALLEL composition (disjoint groups, each gets full rho={float(rho):.4f})")
         
-        # Compute sensitivity (same for all groups in counting queries)
-        sensitivity = self._get_sensitivity(query)
-        sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
-        logger.info(f"[PER-GROUP] Global sensitivity: Δ₂={sensitivity:.2f}, σ={sigma:.2f}")
+        # Get contribution bound K
+        K = self.config.privacy.computed_contribution_bound or 1
+        
+        logger.info(f"[PER-GROUP] Computing per-group D_max for correct sensitivity...")
         
         # Save original data for parallel composition
         original_data = histogram.data[query].copy()
@@ -760,9 +760,17 @@ class TopDownEngine:
                 logger.info(f"[PER-GROUP {group_idx}/{num_groups}] No data cells, skipping")
                 continue
             
+            # CRITICAL: Compute D_max for THIS GROUP ONLY
+            # For parallel composition to be valid, we need per-group sensitivity
+            # D_max_group = max number of cells any card can affect WITHIN this group
+            group_d_max = self._compute_group_d_max(histogram, group_mask)
+            sqrt_d_group = math.sqrt(group_d_max)
+            sensitivity = sqrt_d_group * K
+            sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
+            
             logger.info(
                 f"[PER-GROUP {group_idx}/{num_groups}] {len(group_mcc_indices)} MCCs, "
-                f"{group_data_cells:,} data cells, Δ₂={sensitivity:.2f}"
+                f"{group_data_cells:,} data cells, D_max_group={group_d_max}, Δ₂={sensitivity:.2f}, σ={sigma:.2f}"
             )
             
             # Memory checkpoint
@@ -799,6 +807,43 @@ class TopDownEngine:
         # Clean up original data
         del original_data
         logger.info(f"[PER-GROUP] ✓ All {num_groups} groups processed")
+    
+    def _compute_group_d_max(self, histogram: TransactionHistogram, group_mask: np.ndarray) -> int:
+        """
+        Compute D_max for a specific MCC group (conservative approximation).
+        
+        D_max_group = maximum number of cells any card can appear in WITHIN this group.
+        
+        MATHEMATICAL REQUIREMENT:
+        For parallel composition to be valid with user-level DP:
+        - Each group must use sensitivity based on max cells a card affects IN THAT GROUP
+        - Using global D_max would double-count privacy cost for cards spanning groups
+        
+        IMPLEMENTATION:
+        This uses a conservative approximation: min(global_d_max, group_cell_count)
+        - Safe (adds more noise than needed, never less)
+        - Maintains parallel composition validity
+        - Optimal implementation would track per-card, per-group cell counts during preprocessing
+        
+        Args:
+            histogram: TransactionHistogram with aggregated data
+            group_mask: Boolean mask for cells in this group
+            
+        Returns:
+            Conservative upper bound on D_max for this group
+        """
+        global_d_max = self._d_max or 1
+        group_total_cells = np.sum(group_mask)
+        
+        # Conservative: a card can affect at most min(global_d_max, cells_in_group)
+        # This is safe because:
+        # 1. Can't exceed cells that exist in the group
+        # 2. Can't exceed card's global max cells
+        group_d_max = min(global_d_max, group_total_cells)
+        
+        logger.debug(f"    Group D_max: min({global_d_max}, {group_total_cells}) = {group_d_max}")
+        
+        return max(1, int(group_d_max))
     
     def _nnls_post_process(self, histogram: TransactionHistogram) -> None:
         """
