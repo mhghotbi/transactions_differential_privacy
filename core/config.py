@@ -58,7 +58,8 @@ class PrivacyConfig:
     
     # MCC grouping settings for stratified sensitivity
     mcc_grouping_enabled: bool = True
-    mcc_num_groups: int = 20  # Target number of groups (auto-determined from data)
+    mcc_num_groups: int = 10  # Number of groups for DP noise application (parallel composition)
+    mcc_num_groups_for_k: int = 5  # Number of groups for K computation (memory efficiency)
     mcc_group_cap_percentile: float = 99.0  # Percentile for per-group caps
     
     # Computed MCC grouping (set after analysis)
@@ -238,6 +239,8 @@ class Config:
                 config.privacy.mcc_grouping_enabled = sec.getboolean('mcc_grouping_enabled')
             if 'mcc_num_groups' in sec:
                 config.privacy.mcc_num_groups = int(sec['mcc_num_groups'])
+            if 'mcc_num_groups_for_k' in sec:
+                config.privacy.mcc_num_groups_for_k = int(sec['mcc_num_groups_for_k'])
             if 'mcc_group_cap_percentile' in sec:
                 config.privacy.mcc_group_cap_percentile = float(sec['mcc_group_cap_percentile'])
         
@@ -296,6 +299,7 @@ class Config:
             'fixed_max_cells_per_card': str(self.privacy.fixed_max_cells_per_card),
             'mcc_grouping_enabled': str(self.privacy.mcc_grouping_enabled).lower(),
             'mcc_num_groups': str(self.privacy.mcc_num_groups),
+            'mcc_num_groups_for_k': str(self.privacy.mcc_num_groups_for_k),
             'mcc_group_cap_percentile': str(self.privacy.mcc_group_cap_percentile),
         }
         for query, weight in self.privacy.query_split.items():

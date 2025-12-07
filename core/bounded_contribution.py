@@ -89,7 +89,8 @@ class BoundedContributionCalculator:
         iqr_multiplier: float = 1.5,
         fixed_k: int = 5,
         percentile: float = 99.0,
-        compute_per_group: bool = True
+        compute_per_group: bool = True,
+        num_groups_for_k: int = 3
     ):
         """
         Initialize calculator.
@@ -105,12 +106,14 @@ class BoundedContributionCalculator:
             percentile: Target percentile (0-100) for percentile methods
             compute_per_group: If True and mcc_group column exists, compute K per group
                               then take max. Reduces memory for large datasets.
+            num_groups_for_k: Number of MCC groups to use for K computation (e.g., 3)
         """
         self.method = method
         self.iqr_multiplier = iqr_multiplier
         self.fixed_k = fixed_k
         self.percentile = percentile
         self.compute_per_group = compute_per_group
+        self.num_groups_for_k = num_groups_for_k
         
         self._computed_k: Optional[int] = None
         self._stats: Dict[str, float] = {}
@@ -145,12 +148,10 @@ class BoundedContributionCalculator:
         
         logger.info(f"Computing contribution bound K using method: {self.method}")
         
-        # Check if we should compute per MCC group for memory efficiency
-        if self.compute_per_group and 'mcc_group' in df.columns:
-            return self._compute_k_per_group(df, card_col, city_col, mcc_col, day_col)
-        
-        # Standard computation: Count transactions per card-cell across ALL data
-        logger.info("  Computing cell counts (groupBy card, city, mcc, day)...")
+        # IMPORTANT: K is ALWAYS computed globally (across ALL MCC groups)
+        # This ensures transaction_weighted_percentile keeps exactly p% of ALL transactions
+        # The compute_per_group flag only affects noise application, not K computation
+        logger.info("  Computing cell counts globally (groupBy card, city, mcc, day)...")
         cell_counts = df.groupBy(card_col, city_col, mcc_col, day_col).agg(
             F.count('*').alias('tx_count')
         )
@@ -276,40 +277,54 @@ class BoundedContributionCalculator:
         day_col: str
     ) -> int:
         """
-        Compute K per MCC group, then take maximum.
+        Compute K using a SEPARATE coarse MCC grouping for memory efficiency.
         
-        For large datasets (billions of records), this reduces memory by:
-        - Processing each MCC group separately (smaller groupBy operations)
-        - Taking max(K_group1, K_group2, ...) as global K
+        This method creates a NEW grouping with num_groups_for_k groups (e.g., 3)
+        JUST for K computation. This is different from the main mcc_group column
+        which has more groups (e.g., 20) and is used for DP noise application.
         
-        This is mathematically correct: if each group satisfies K-bounded contribution,
-        then the global data also satisfies K-bounded contribution where K = max(all K_i).
+        Strategy:
+        1. Create temporary K-computation grouping (3 groups) from MCC amounts
+        2. Compute K for each group: K₁, K₂, K₃
+        3. Take MAX(K₁, K₂, K₃) as global K
+        4. Return this K to be used with the main 20-group stratification for DP
         
         Args:
-            df: Input DataFrame with 'mcc_group' column
+            df: Input DataFrame (will create temporary grouping)
             card_col, city_col, mcc_col, day_col: Column names
             
         Returns:
-            Maximum K across all MCC groups
+            Maximum K across K-computation groups
         """
-        logger.info("  Using per-MCC-group computation for memory efficiency")
+        logger.info(f"  Creating temporary {self.num_groups_for_k}-group MCC stratification for K computation")
+        logger.info(f"  (This is separate from the main MCC grouping used for DP noise)")
         
-        # Get list of MCC groups
-        groups = df.select('mcc_group').distinct().rdd.flatMap(lambda x: x).collect()
+        # Create temporary K-computation grouping
+        from reader.preprocessor import TransactionPreprocessor
+        temp_grouping = TransactionPreprocessor._compute_mcc_groups_static(
+            df=df,
+            mcc_col=mcc_col,
+            amount_col='amount',
+            num_groups=self.num_groups_for_k,
+            column_name='mcc_group_k'
+        )
+        
+        # Get list of K-computation groups
+        groups = temp_grouping.select('mcc_group_k').distinct().rdd.flatMap(lambda x: x).collect()
         groups = sorted(groups)
         num_groups = len(groups)
         
-        logger.info(f"  Found {num_groups} MCC groups")
+        logger.info(f"  Created {num_groups} groups for K computation")
         logger.info(f"  Will compute K for each group, then take maximum")
         
         k_values = []
         group_stats = []
         
         for i, group_id in enumerate(groups, 1):
-            logger.info(f"  [{i}/{num_groups}] Processing MCC group {group_id}...")
+            logger.info(f"  [{i}/{num_groups}] Processing K-computation group {group_id}...")
             
             # Filter to this group only
-            df_group = df.filter(F.col('mcc_group') == group_id)
+            df_group = temp_grouping.filter(F.col('mcc_group_k') == group_id)
             
             # Count records in this group
             group_count = df_group.count()

@@ -94,9 +94,71 @@ class TransactionPreprocessor:
         
         return histogram
     
+    @staticmethod
+    def _compute_mcc_groups_static(
+        df: DataFrame,
+        mcc_col: str = 'mcc',
+        amount_col: str = 'amount',
+        num_groups: int = 3,
+        cap_percentile: float = 99.0,
+        column_name: str = 'mcc_group_k'
+    ) -> DataFrame:
+        """
+        Static method to compute MCC groups without needing instance state.
+        
+        This is used for K computation grouping (separate from main DP grouping).
+        
+        Args:
+            df: Input DataFrame
+            mcc_col: MCC column name
+            amount_col: Amount column name
+            num_groups: Number of groups to create
+            cap_percentile: Percentile for winsorization cap
+            column_name: Name for the output group column
+            
+        Returns:
+            DataFrame with added group column
+        """
+        from core.mcc_groups import compute_mcc_groups_spark
+        
+        # Get Spark session from DataFrame
+        spark = df.sql_ctx.sparkSession
+        
+        logger.info(f"Computing {num_groups}-group MCC stratification for {column_name}...")
+        
+        mcc_grouping = compute_mcc_groups_spark(
+            df=df,
+            mcc_col=mcc_col,
+            amount_col=amount_col,
+            num_groups=num_groups,
+            cap_percentile=cap_percentile
+        )
+        
+        # Add MCC group column to DataFrame
+        mcc_group_data = [
+            (mcc, group_id) 
+            for mcc, group_id in mcc_grouping.mcc_to_group.items()
+        ]
+        mcc_group_schema = StructType([
+            StructField("mcc_key_temp", StringType(), False),
+            StructField(column_name, IntegerType(), False),
+        ])
+        mcc_group_df = spark.createDataFrame(mcc_group_data, schema=mcc_group_schema)
+        
+        # Broadcast small MCC group lookup table (~300 MCCs) for efficient join
+        df = df.join(F.broadcast(mcc_group_df), df[mcc_col] == mcc_group_df.mcc_key_temp, "left").drop("mcc_key_temp")
+        
+        # Fill unknown MCCs with highest group (conservative)
+        max_group = max(mcc_grouping.group_info.keys()) if mcc_grouping.group_info else 0
+        df = df.fillna({column_name: max_group})
+        
+        logger.info(f"Created {mcc_grouping.num_groups} groups for {column_name}")
+        
+        return df
+    
     def _compute_mcc_groups(self, df: DataFrame) -> DataFrame:
         """
-        Compute MCC groups for stratified sensitivity.
+        Compute MCC groups for stratified sensitivity (main DP grouping).
         
         Groups MCCs by order of magnitude of typical transaction amounts.
         Uses parallel composition - each group gets full privacy budget.
@@ -158,7 +220,8 @@ class TransactionPreprocessor:
             iqr_multiplier=self.config.privacy.contribution_bound_iqr_multiplier,
             fixed_k=self.config.privacy.contribution_bound_fixed,
             percentile=self.config.privacy.contribution_bound_percentile,
-            compute_per_group=self.config.privacy.contribution_bound_per_group
+            compute_per_group=self.config.privacy.contribution_bound_per_group,
+            num_groups_for_k=self.config.privacy.mcc_num_groups_for_k
         )
         
         # Need day_idx for cell definition, compute it temporarily
