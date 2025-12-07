@@ -105,6 +105,10 @@ class TopDownEngine:
         # Shape per query: (province_dim,) - one value per province
         self._province_month_invariants: Dict[str, np.ndarray] = {}
         
+        # Per-group invariants for parallel composition
+        # Shape per query per group: (province_dim,)
+        self._per_group_invariants: Dict[str, Dict[int, np.ndarray]] = {}
+        
         # MCC group information for stratified sensitivity
         self._mcc_group_caps = config.privacy.mcc_group_caps or {}
         self._mcc_to_group = config.privacy.mcc_to_group or {}
@@ -322,8 +326,8 @@ class TopDownEngine:
         # Use OUTPUT_QUERIES to process only the main queries (not temporary fields)
         queries_to_process = ['transaction_count', 'unique_cards', 'total_amount']
         
-        # Initialize per-group invariants storage
-        self._per_group_invariants: Dict[str, Dict[int, np.ndarray]] = {}
+        # Reset per-group invariants storage (initialized in __init__)
+        self._per_group_invariants.clear()
         
         # Build MCC index to group mapping if MCC grouping is enabled
         mcc_idx_to_group = {}
