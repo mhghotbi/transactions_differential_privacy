@@ -200,10 +200,10 @@ class PrivacyConfig:
     query_split: Dict[str, float]       # {"transaction_count": 0.25, ...}
     
     # Bounded Contribution
-    contribution_bound_method: str      # "iqr", "percentile", "fixed"
+    contribution_bound_method: str      # "transaction_weighted_percentile", "iqr", "percentile", "fixed"
     contribution_bound_iqr_multiplier: float  # 1.5
     contribution_bound_fixed: int       # 5
-    contribution_bound_percentile: float # 99.0
+    contribution_bound_percentile: float # 99.0 (used for transaction_weighted_percentile and percentile methods)
     
     # Suppression
     suppression_threshold: int          # 10
@@ -323,7 +323,7 @@ def validate(self):
     assert sum(query_split.values()) == 1.0
     assert total_rho > 0
     assert delta > 0 and delta < 1
-    assert contribution_bound_method in ("iqr", "percentile", "fixed")
+    assert contribution_bound_method in ("transaction_weighted_percentile", "iqr", "percentile", "fixed")
     assert suppression_threshold >= 0
     assert suppression_method in ("flag", "null", "value")
     assert sensitivity_method in ("local", "global", "fixed")
@@ -561,13 +561,17 @@ M(D) = f(D) + η,    where η ~ N_Z(0, σ²)
 
 ```ini
 [privacy]
-# Method: 'iqr' (auto), 'percentile', or 'fixed'
-contribution_bound_method = iqr
+# Method: 'transaction_weighted_percentile', 'iqr', 'percentile', or 'fixed'
+# RECOMMENDED: transaction_weighted_percentile (minimizes data loss)
+contribution_bound_method = transaction_weighted_percentile
 
-# IQR multiplier (default 1.5)
+# Percentile for transaction retention (e.g., 99 = keep 99% of transactions)
+contribution_bound_percentile = 99
+
+# IQR multiplier (for IQR method)
 contribution_bound_iqr_multiplier = 1.5
 
-# Fixed K if method = fixed
+# Fixed K (for fixed method)
 contribution_bound_fixed = 5
 ```
 
@@ -1486,12 +1490,12 @@ query_split_unique_acceptors = 0.25
 query_split_total_amount = 0.25
 
 # Bounded Contribution
-contribution_bound_method = iqr
+contribution_bound_method = transaction_weighted_percentile
 contribution_bound_iqr_multiplier = 1.5
 contribution_bound_percentile = 99
 
 # Suppression
-suppression_threshold = 10
+suppression_threshold = 5
 suppression_method = flag
 
 # Confidence Intervals

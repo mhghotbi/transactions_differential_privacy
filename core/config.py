@@ -31,10 +31,11 @@ class PrivacyConfig:
     })
     
     # Bounded contribution settings
-    contribution_bound_method: str = "iqr"  # 'iqr', 'percentile', or 'fixed'
+    contribution_bound_method: str = "transaction_weighted_percentile"  # 'transaction_weighted_percentile', 'iqr', 'percentile', or 'fixed'
     contribution_bound_iqr_multiplier: float = 1.5
     contribution_bound_fixed: int = 5
     contribution_bound_percentile: float = 99.0
+    contribution_bound_per_group: bool = True  # Compute K per MCC group for memory efficiency (large datasets)
     
     # Computed K value (set after analysis)
     computed_contribution_bound: Optional[int] = None
@@ -43,7 +44,7 @@ class PrivacyConfig:
     computed_d_max: Optional[int] = None
     
     # Suppression settings
-    suppression_threshold: int = 10  # Suppress cells with noisy count < threshold
+    suppression_threshold: int = 5  # Suppress cells with noisy count < threshold
     suppression_method: str = "flag"  # 'flag', 'null', or 'value'
     suppression_sentinel: int = -1  # Sentinel value for suppressed cells (if method='value')
     
@@ -57,7 +58,7 @@ class PrivacyConfig:
     
     # MCC grouping settings for stratified sensitivity
     mcc_grouping_enabled: bool = True
-    mcc_num_groups: int = 5  # Target number of groups (auto-determined from data)
+    mcc_num_groups: int = 20  # Target number of groups (auto-determined from data)
     mcc_group_cap_percentile: float = 99.0  # Percentile for per-group caps
     
     # Computed MCC grouping (set after analysis)
@@ -77,8 +78,8 @@ class PrivacyConfig:
         if self.total_rho <= 0:
             raise ValueError(f"total_rho must be positive, got {self.total_rho}")
         
-        if self.contribution_bound_method not in ('iqr', 'percentile', 'fixed'):
-            raise ValueError(f"contribution_bound_method must be 'iqr', 'percentile', or 'fixed', got {self.contribution_bound_method}")
+        if self.contribution_bound_method not in ('transaction_weighted_percentile', 'iqr', 'percentile', 'fixed'):
+            raise ValueError(f"contribution_bound_method must be 'transaction_weighted_percentile', 'iqr', 'percentile', or 'fixed', got {self.contribution_bound_method}")
         
         if self.contribution_bound_fixed < 1:
             raise ValueError(f"contribution_bound_fixed must be >= 1, got {self.contribution_bound_fixed}")
@@ -209,6 +210,8 @@ class Config:
                 config.privacy.contribution_bound_fixed = int(sec['contribution_bound_fixed'])
             if 'contribution_bound_percentile' in sec:
                 config.privacy.contribution_bound_percentile = float(sec['contribution_bound_percentile'])
+            if 'contribution_bound_per_group' in sec:
+                config.privacy.contribution_bound_per_group = sec.getboolean('contribution_bound_per_group')
             
             # Parse suppression settings
             if 'suppression_threshold' in sec:
@@ -283,6 +286,7 @@ class Config:
             'contribution_bound_iqr_multiplier': str(self.privacy.contribution_bound_iqr_multiplier),
             'contribution_bound_fixed': str(self.privacy.contribution_bound_fixed),
             'contribution_bound_percentile': str(self.privacy.contribution_bound_percentile),
+            'contribution_bound_per_group': str(self.privacy.contribution_bound_per_group).lower(),
             'suppression_threshold': str(self.privacy.suppression_threshold),
             'suppression_method': self.privacy.suppression_method,
             'suppression_sentinel': str(self.privacy.suppression_sentinel),

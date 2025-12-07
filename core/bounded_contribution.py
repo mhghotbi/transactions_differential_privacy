@@ -5,8 +5,16 @@ Implements contribution bounding to ensure correct sensitivity for DP queries.
 Each card's contribution per cell (city, mcc, day) is limited to K.
 
 Methods:
+- Transaction-Weighted Percentile (RECOMMENDED): K where p% of TRANSACTIONS are kept
+  Minimizes data loss by finding K such that cumulative transactions / total ≥ p/100
+  Example: p=99 means keep 99% of transactions (~1% data loss)
+  
+- Cell Percentile: K = p-th percentile of cell counts (transactions per card-cell)
+  Keeps p% of CELLS intact but can lose 50%+ of transactions if distribution is skewed
+  Example: p=99, K=10 means 99% of cells have ≤10 txns, but high-volume cells get clipped
+  
 - IQR: K = ceil(Q3 + 1.5 * IQR) - statistical outlier detection
-- Percentile: K = percentile(contributions, p)
+  
 - Fixed: K = user-specified value
 
 Reference: Census 2020 also bounds household contributions.
@@ -80,21 +88,29 @@ class BoundedContributionCalculator:
         method: str = 'iqr',
         iqr_multiplier: float = 1.5,
         fixed_k: int = 5,
-        percentile: float = 99.0
+        percentile: float = 99.0,
+        compute_per_group: bool = True
     ):
         """
         Initialize calculator.
         
         Args:
-            method: 'iqr', 'percentile', or 'fixed'
+            method: One of:
+                - 'transaction_weighted_percentile': Keep p% of transactions (RECOMMENDED)
+                - 'percentile': p-th percentile of cell counts (can lose many transactions)
+                - 'iqr': Statistical outlier detection
+                - 'fixed': Use fixed K value
             iqr_multiplier: Multiplier for IQR method (default 1.5)
             fixed_k: Fixed K value if method='fixed'
-            percentile: Percentile if method='percentile'
+            percentile: Target percentile (0-100) for percentile methods
+            compute_per_group: If True and mcc_group column exists, compute K per group
+                              then take max. Reduces memory for large datasets.
         """
         self.method = method
         self.iqr_multiplier = iqr_multiplier
         self.fixed_k = fixed_k
         self.percentile = percentile
+        self.compute_per_group = compute_per_group
         
         self._computed_k: Optional[int] = None
         self._stats: Dict[str, float] = {}
@@ -109,6 +125,10 @@ class BoundedContributionCalculator:
     ) -> int:
         """
         Compute K from Spark DataFrame using configured method.
+        
+        For large datasets (billions of records), if df has 'mcc_group' column
+        and compute_per_group=True, will compute K per MCC group and take maximum.
+        This reduces memory usage by processing smaller chunks.
         
         Args:
             df: Input DataFrame with transaction data
@@ -125,10 +145,16 @@ class BoundedContributionCalculator:
         
         logger.info(f"Computing contribution bound K using method: {self.method}")
         
-        # Count transactions per card-cell
+        # Check if we should compute per MCC group for memory efficiency
+        if self.compute_per_group and 'mcc_group' in df.columns:
+            return self._compute_k_per_group(df, card_col, city_col, mcc_col, day_col)
+        
+        # Standard computation: Count transactions per card-cell across ALL data
+        logger.info("  Computing cell counts (groupBy card, city, mcc, day)...")
         cell_counts = df.groupBy(card_col, city_col, mcc_col, day_col).agg(
             F.count('*').alias('tx_count')
         )
+        logger.info("  ✓ Cell counts computed")
         
         if self.method == 'fixed':
             self._computed_k = self.fixed_k
@@ -161,7 +187,62 @@ class BoundedContributionCalculator:
         
         logger.info(f"  Statistics: {self._stats}")
         
-        if self.method == 'iqr':
+        if self.method == 'transaction_weighted_percentile':
+            # Transaction-weighted percentile: Find K such that p% of TRANSACTIONS are kept
+            # MEMORY-EFFICIENT: Aggregate by tx_count first to avoid window over millions of rows
+            logger.info(f"  Using transaction-weighted percentile method (target: keep {self.percentile}% of transactions)")
+            
+            # Step 1: Aggregate - count how many cells have each tx_count value
+            # This reduces millions of cells to ~hundreds/thousands of distinct values
+            tx_count_freq = cell_counts.groupBy('tx_count').agg(
+                F.count('*').alias('num_cells'),
+                (F.col('tx_count') * F.count('*')).alias('total_txns_at_count')
+            ).orderBy('tx_count')
+            
+            # Step 2: Collect aggregated data (small - typically < 10K rows)
+            freq_data = tx_count_freq.collect()
+            
+            if not freq_data:
+                logger.warning("  No cell count data, using default K=1")
+                self._computed_k = 1
+                return self._computed_k
+            
+            # Step 3: Compute cumulative sum in memory (efficient - O(distinct_tx_counts))
+            total_txns = sum(row['total_txns_at_count'] for row in freq_data)
+            total_cells = sum(row['num_cells'] for row in freq_data)
+            
+            cumsum_txns = 0
+            self._computed_k = 1
+            actual_retention = 0.0
+            
+            for row in freq_data:
+                cumsum_txns += row['total_txns_at_count']
+                retention_pct = (cumsum_txns / total_txns) * 100
+                
+                if retention_pct >= self.percentile:
+                    self._computed_k = max(1, int(math.ceil(row['tx_count'])))
+                    actual_retention = retention_pct
+                    break
+            else:
+                # If we didn't break (shouldn't happen), use the last value
+                self._computed_k = int(freq_data[-1]['tx_count'])
+                actual_retention = 100.0
+            
+            self._stats['total_transactions'] = float(total_txns)
+            self._stats['total_cells'] = float(total_cells)
+            self._stats['target_retention_pct'] = self.percentile
+            self._stats['actual_retention_pct'] = float(actual_retention)
+            self._stats['estimated_data_loss_pct'] = 100.0 - float(actual_retention)
+            
+            logger.info(f"  Total transactions: {total_txns:,}")
+            logger.info(f"  Total cells: {total_cells:,}")
+            logger.info(f"  Distinct tx_count values: {len(freq_data):,}")
+            logger.info(f"  Target retention: {self.percentile}%")
+            logger.info(f"  Computed K = {self._computed_k}")
+            logger.info(f"  Estimated retention: {actual_retention:.2f}% of transactions")
+            logger.info(f"  Estimated data loss: {100-actual_retention:.2f}%")
+            
+        elif self.method == 'iqr':
             q1 = self._stats['q1']
             q3 = self._stats['q3']
             iqr = q3 - q1
@@ -172,12 +253,166 @@ class BoundedContributionCalculator:
             logger.info(f"  IQR = {iqr:.2f}, Upper bound = {upper_bound:.2f}")
             
         elif self.method == 'percentile':
+            # Cell-based percentile (old method - can lose many transactions)
+            logger.warning(
+                f"  Using 'percentile' method which keeps {self.percentile}% of CELLS intact, "
+                "but may lose 50%+ of transactions if distribution is skewed. "
+                "Consider using 'transaction_weighted_percentile' to minimize data loss."
+            )
             self._computed_k = max(1, int(math.ceil(self._stats[f'p{int(self.percentile)}'])))
             
         else:
             raise ValueError(f"Unknown method: {self.method}")
         
         logger.info(f"  Computed K = {self._computed_k}")
+        return self._computed_k
+    
+    def _compute_k_per_group(
+        self,
+        df: DataFrame,
+        card_col: str,
+        city_col: str,
+        mcc_col: str,
+        day_col: str
+    ) -> int:
+        """
+        Compute K per MCC group, then take maximum.
+        
+        For large datasets (billions of records), this reduces memory by:
+        - Processing each MCC group separately (smaller groupBy operations)
+        - Taking max(K_group1, K_group2, ...) as global K
+        
+        This is mathematically correct: if each group satisfies K-bounded contribution,
+        then the global data also satisfies K-bounded contribution where K = max(all K_i).
+        
+        Args:
+            df: Input DataFrame with 'mcc_group' column
+            card_col, city_col, mcc_col, day_col: Column names
+            
+        Returns:
+            Maximum K across all MCC groups
+        """
+        logger.info("  Using per-MCC-group computation for memory efficiency")
+        
+        # Get list of MCC groups
+        groups = df.select('mcc_group').distinct().rdd.flatMap(lambda x: x).collect()
+        groups = sorted(groups)
+        num_groups = len(groups)
+        
+        logger.info(f"  Found {num_groups} MCC groups")
+        logger.info(f"  Will compute K for each group, then take maximum")
+        
+        k_values = []
+        group_stats = []
+        
+        for i, group_id in enumerate(groups, 1):
+            logger.info(f"  [{i}/{num_groups}] Processing MCC group {group_id}...")
+            
+            # Filter to this group only
+            df_group = df.filter(F.col('mcc_group') == group_id)
+            
+            # Count records in this group
+            group_count = df_group.count()
+            logger.info(f"    Records in group: {group_count:,}")
+            
+            # Compute cell counts for this group
+            cell_counts = df_group.groupBy(card_col, city_col, mcc_col, day_col).agg(
+                F.count('*').alias('tx_count')
+            )
+            
+            # Compute K using the standard logic (same as global computation)
+            if self.method == 'fixed':
+                k_group = self.fixed_k
+                stats_group = {'group_id': group_id, 'fixed_k': float(self.fixed_k)}
+            else:
+                # Compute statistics for this group
+                stats = cell_counts.select(
+                    F.min('tx_count').alias('min'),
+                    F.max('tx_count').alias('max'),
+                    F.mean('tx_count').alias('mean'),
+                    F.stddev('tx_count').alias('stddev'),
+                    F.expr('percentile_approx(tx_count, 0.25)').alias('q1'),
+                    F.expr('percentile_approx(tx_count, 0.5)').alias('median'),
+                    F.expr('percentile_approx(tx_count, 0.75)').alias('q3'),
+                    F.expr(f'percentile_approx(tx_count, {self.percentile / 100})').alias('pct')
+                ).first()
+                
+                stats_group = {
+                    'group_id': group_id,
+                    'min': float(stats['min']),
+                    'max': float(stats['max']),
+                    'mean': float(stats['mean']),
+                    'median': float(stats['median']),
+                }
+                
+                if self.method == 'transaction_weighted_percentile':
+                    # Memory-efficient transaction-weighted percentile for this group
+                    tx_count_freq = cell_counts.groupBy('tx_count').agg(
+                        F.count('*').alias('num_cells'),
+                        (F.col('tx_count') * F.count('*')).alias('total_txns_at_count')
+                    ).orderBy('tx_count')
+                    
+                    freq_data = tx_count_freq.collect()
+                    
+                    if not freq_data:
+                        k_group = 1
+                    else:
+                        total_txns = sum(row['total_txns_at_count'] for row in freq_data)
+                        cumsum_txns = 0
+                        k_group = 1
+                        
+                        for row in freq_data:
+                            cumsum_txns += row['total_txns_at_count']
+                            retention_pct = (cumsum_txns / total_txns) * 100
+                            
+                            if retention_pct >= self.percentile:
+                                k_group = max(1, int(math.ceil(row['tx_count'])))
+                                stats_group['retention_pct'] = float(retention_pct)
+                                break
+                        else:
+                            k_group = int(freq_data[-1]['tx_count'])
+                            stats_group['retention_pct'] = 100.0
+                        
+                        stats_group['total_transactions'] = float(total_txns)
+                
+                elif self.method == 'iqr':
+                    q1 = stats_group['q1'] = float(stats['q1'])
+                    q3 = stats_group['q3'] = float(stats['q3'])
+                    iqr = q3 - q1
+                    upper_bound = q3 + self.iqr_multiplier * iqr
+                    k_group = max(1, int(math.ceil(upper_bound)))
+                    stats_group['iqr'] = iqr
+                    stats_group['upper_bound'] = upper_bound
+                
+                elif self.method == 'percentile':
+                    k_group = max(1, int(math.ceil(float(stats['pct']))))
+                    stats_group[f'p{int(self.percentile)}'] = float(stats['pct'])
+                
+                else:
+                    raise ValueError(f"Unknown method: {self.method}")
+            
+            k_values.append(k_group)
+            group_stats.append(stats_group)
+            logger.info(f"    K for group {group_id}: {k_group}")
+        
+        # Take maximum K across all groups
+        self._computed_k = max(k_values)
+        
+        # Store aggregated statistics
+        self._stats = {
+            'num_groups': num_groups,
+            'k_values': k_values,
+            'global_k': self._computed_k,
+            'min_k': min(k_values),
+            'max_k': max(k_values),
+            'mean_k': sum(k_values) / len(k_values),
+            'group_stats': group_stats
+        }
+        
+        logger.info(f"  Per-group K values: {k_values}")
+        logger.info(f"  Global K (maximum): {self._computed_k}")
+        logger.info(f"  K range: [{min(k_values)}, {max(k_values)}]")
+        
         return self._computed_k
     
     def compute_k_from_numpy(self, contributions: np.ndarray) -> int:
@@ -204,7 +439,28 @@ class BoundedContributionCalculator:
             'q3': float(np.percentile(contributions, 75)),
         }
         
-        if self.method == 'iqr':
+        if self.method == 'transaction_weighted_percentile':
+            # Transaction-weighted percentile for numpy
+            total_txns = np.sum(contributions)
+            sorted_contributions = np.sort(contributions)
+            cumsum = np.cumsum(sorted_contributions)
+            retention_pct = (cumsum / total_txns) * 100
+            
+            # Find minimum K where retention >= target
+            mask = retention_pct >= self.percentile
+            if np.any(mask):
+                self._computed_k = max(1, int(math.ceil(sorted_contributions[mask][0])))
+                actual_retention = retention_pct[mask][0]
+            else:
+                self._computed_k = int(np.max(contributions))
+                actual_retention = 100.0
+            
+            self._stats['total_transactions'] = float(total_txns)
+            self._stats['total_cells'] = len(contributions)
+            self._stats['target_retention_pct'] = self.percentile
+            self._stats['actual_retention_pct'] = float(actual_retention)
+            
+        elif self.method == 'iqr':
             q1 = self._stats['q1']
             q3 = self._stats['q3']
             iqr = q3 - q1

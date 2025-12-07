@@ -388,8 +388,17 @@ class TopDownEngine:
                     histogram, query, rho, has_data_mask
                 )
                 logger.info(f"[STEP 1] ✓ Stratified noise applied")
+            elif self._mcc_grouping_enabled:
+                # Use per-group noise for counting queries too (memory efficiency)
+                # MCC groups are DISJOINT → parallel composition (each gets full budget)
+                logger.info(f"[STEP 1] Applying per-MCC-group noise for memory efficiency...")
+                logger.info(f"[STEP 1] Using PARALLEL composition (disjoint MCC groups)")
+                self._apply_per_group_noise_inplace(
+                    histogram, query, rho, has_data_mask
+                )
+                logger.info(f"[STEP 1] ✓ Per-group noise applied")
             else:
-                # Standard noise for counting queries
+                # Standard noise for counting queries (no MCC grouping)
                 logger.info(f"[STEP 1] Computing sensitivity...")
                 sensitivity = self._get_sensitivity(query)
                 sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
@@ -649,6 +658,147 @@ class TopDownEngine:
         # Clean up original data copy
         del original_data
         logger.info(f"[STRATIFIED] ✓ All {total_groups} groups processed")
+    
+    def _apply_per_group_noise_inplace(
+        self,
+        histogram: TransactionHistogram,
+        query: str,
+        rho: Fraction,
+        has_data_mask: np.ndarray
+    ) -> None:
+        """
+        Apply noise per MCC group for counting queries (memory efficiency).
+        
+        Uses parallel composition: MCC groups are DISJOINT, so each group
+        gets the FULL privacy budget rho independently.
+        
+        MATHEMATICAL JUSTIFICATION (Parallel Composition Theorem):
+        - MCC groups are DISJOINT: each transaction belongs to exactly ONE group
+        - For disjoint datasets D₁, D₂, ..., Dₙ:
+          If Mᵢ satisfies ρ-zCDP on Dᵢ, then (M₁, M₂, ..., Mₙ) satisfies ρ-zCDP on D₁ ∪ D₂ ∪ ... ∪ Dₙ
+        - Privacy cost: ρ (NOT ρ × num_groups, that would be sequential composition)
+        
+        Memory benefit: Process one group at a time instead of all cells together,
+        reducing peak memory usage by ~num_groups factor.
+        
+        Args:
+            histogram: TransactionHistogram (modified in-place)
+            query: Query name (e.g., 'transaction_count', 'unique_cards')
+            rho: Privacy budget (FULL budget for each group - parallel composition)
+            has_data_mask: Boolean mask of cells with data
+        """
+        import psutil
+        
+        # Build MCC index to group mapping (same logic as stratified noise)
+        mcc_labels = histogram.dimensions['mcc'].labels or []
+        
+        if not self._mcc_to_group or not self._mcc_group_caps:
+            logger.warning("[PER-GROUP] No MCC group mapping found, falling back to global noise")
+            # Fallback to standard global noise
+            sensitivity = self._get_sensitivity(query)
+            data_values = histogram.data[query][has_data_mask].astype(np.int64)
+            noisy_values = add_discrete_gaussian_noise(
+                data_values, rho=rho, sensitivity=sensitivity, use_fast_sampling=True
+            )
+            histogram.data[query] = histogram.data[query].astype(np.float64)
+            histogram.data[query][has_data_mask] = noisy_values.astype(np.float64)
+            del data_values, noisy_values
+            return
+        
+        # Build MCC index to group mapping
+        logger.info(f"[PER-GROUP] Building MCC index to group mapping for {len(mcc_labels)} MCCs...")
+        mcc_idx_to_group = {}
+        for mcc_idx, mcc_code in enumerate(mcc_labels):
+            if mcc_code in self._mcc_to_group:
+                mcc_idx_to_group[mcc_idx] = self._mcc_to_group[mcc_code]
+            else:
+                # Assign unmapped MCCs to the highest group
+                mcc_idx_to_group[mcc_idx] = max(self._mcc_group_caps.keys()) if self._mcc_group_caps else 0
+        
+        num_groups = len(set(mcc_idx_to_group.values()))
+        
+        logger.info(f"[PER-GROUP] Processing query '{query}' with {num_groups} MCC groups")
+        logger.info(f"[PER-GROUP] Using PARALLEL composition (disjoint groups, each gets full rho={float(rho):.4f})")
+        
+        # Compute sensitivity (same for all groups in counting queries)
+        sensitivity = self._get_sensitivity(query)
+        sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
+        logger.info(f"[PER-GROUP] Global sensitivity: Δ₂={sensitivity:.2f}, σ={sigma:.2f}")
+        
+        # Save original data for parallel composition
+        original_data = histogram.data[query].copy()
+        
+        # Convert to float64 for noise application
+        histogram.data[query] = histogram.data[query].astype(np.float64)
+        
+        # Get unique group IDs
+        group_ids = sorted(set(mcc_idx_to_group.values()))
+        
+        # Process each MCC group independently
+        for group_idx, group_id in enumerate(group_ids, 1):
+            logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Processing group {group_id}")
+            
+            # Find all MCC indices in this group
+            group_mcc_indices = [
+                mcc_idx for mcc_idx, g_id in mcc_idx_to_group.items()
+                if g_id == group_id
+            ]
+            
+            if not group_mcc_indices:
+                logger.info(f"[PER-GROUP {group_idx}/{num_groups}] No MCCs in group, skipping")
+                continue
+            
+            # Build mask for this group's cells
+            logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Building mask for {len(group_mcc_indices)} MCCs...")
+            group_mask = np.zeros_like(has_data_mask, dtype=bool)
+            for mcc_idx in group_mcc_indices:
+                group_mask[:, :, mcc_idx, :] |= has_data_mask[:, :, mcc_idx, :]
+            
+            group_data_cells = np.sum(group_mask)
+            
+            if group_data_cells == 0:
+                logger.info(f"[PER-GROUP {group_idx}/{num_groups}] No data cells, skipping")
+                continue
+            
+            logger.info(
+                f"[PER-GROUP {group_idx}/{num_groups}] {len(group_mcc_indices)} MCCs, "
+                f"{group_data_cells:,} data cells, Δ₂={sensitivity:.2f}"
+            )
+            
+            # Memory checkpoint
+            mem_before = psutil.virtual_memory().percent
+            mem_before_gb = psutil.virtual_memory().used / (1024**3)
+            logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Memory before: {mem_before:.1f}% ({mem_before_gb:.2f} GB)")
+            
+            # Extract ORIGINAL data values for this group
+            logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Extracting {group_data_cells:,} data values...")
+            data_values = original_data[group_mask].astype(np.int64)
+            
+            # Sample noise for this group (FULL budget - parallel composition)
+            logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Sampling noise...")
+            noisy_values = add_discrete_gaussian_noise(
+                data_values,
+                rho=rho,  # FULL budget for this group
+                sensitivity=sensitivity,
+                use_fast_sampling=True
+            )
+            
+            # Write noisy values back
+            logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Writing {group_data_cells:,} noisy values...")
+            histogram.data[query][group_mask] = noisy_values.astype(np.float64)
+            
+            # Clean up
+            del data_values, noisy_values, group_mask
+            
+            # Memory checkpoint
+            mem_after = psutil.virtual_memory().percent
+            mem_after_gb = psutil.virtual_memory().used / (1024**3)
+            logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Memory after: {mem_after:.1f}% ({mem_after_gb:.2f} GB)")
+            logger.info(f"[PER-GROUP {group_idx}/{num_groups}] ✓ Complete")
+        
+        # Clean up original data
+        del original_data
+        logger.info(f"[PER-GROUP] ✓ All {num_groups} groups processed")
     
     def _nnls_post_process(self, histogram: TransactionHistogram) -> None:
         """

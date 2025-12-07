@@ -24,7 +24,7 @@ Raw Transactions  →  Aggregate by (City, MCC, Day)  →  Add DP Noise  →  NN
 | **Cell Suppression** | Hide small counts |
 | **Confidence Intervals** | Quantified uncertainty |
 | **Global Sensitivity** | Correct for multi-cell cards |
-| **Bounded Contribution** | IQR-based outlier handling |
+| **Bounded Contribution** | Transaction-weighted percentile (minimizes data loss) |
 
 ## Quick Start
 
@@ -115,8 +115,12 @@ Edit `configs/default.ini`:
 # Monthly privacy budget
 total_rho = 1/4                    # ρ = 0.25 → ε ≈ 5 per month
 
+# Bounded contribution (IMPORTANT: affects data loss)
+contribution_bound_method = transaction_weighted_percentile  # Keep 99% of transactions
+contribution_bound_percentile = 99.0                        # Target retention percentage
+
 # Suppression
-suppression_threshold = 10         # Hide cells with count < 10
+suppression_threshold = 5          # Hide cells with count < 5
 
 # Confidence intervals
 confidence_levels = 0.90           # 90% CI

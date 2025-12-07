@@ -157,7 +157,8 @@ class TransactionPreprocessor:
             method=self.config.privacy.contribution_bound_method,
             iqr_multiplier=self.config.privacy.contribution_bound_iqr_multiplier,
             fixed_k=self.config.privacy.contribution_bound_fixed,
-            percentile=self.config.privacy.contribution_bound_percentile
+            percentile=self.config.privacy.contribution_bound_percentile,
+            compute_per_group=self.config.privacy.contribution_bound_per_group
         )
         
         # Need day_idx for cell definition, compute it temporarily

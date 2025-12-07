@@ -678,17 +678,18 @@ Limit transactions per card per cell:
 
 ```ini
 [privacy]
-# Method: iqr (auto), percentile, fixed
-contribution_bound_method = iqr
+# Method: transaction_weighted_percentile, iqr, percentile, fixed
+# RECOMMENDED: transaction_weighted_percentile (minimizes data loss)
+contribution_bound_method = transaction_weighted_percentile
+
+# Percentile for transaction retention (e.g., 99 = keep 99% of transactions)
+contribution_bound_percentile = 99
 
 # IQR method: K = Q3 + multiplier * IQR
 contribution_bound_iqr_multiplier = 1.5
 
 # Fixed method
 contribution_bound_fixed = 5
-
-# Percentile method
-contribution_bound_percentile = 99
 ```
 
 ---
@@ -792,13 +793,13 @@ query_split_unique_acceptors = 0.25
 query_split_total_amount = 0.25
 
 # Bounded Contribution
-contribution_bound_method = iqr
+contribution_bound_method = transaction_weighted_percentile
 contribution_bound_iqr_multiplier = 1.5
 contribution_bound_fixed = 5
 contribution_bound_percentile = 99
 
 # Suppression
-suppression_threshold = 10
+suppression_threshold = 5
 suppression_method = flag
 suppression_sentinel = -1
 
