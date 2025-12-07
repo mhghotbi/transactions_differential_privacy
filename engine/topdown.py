@@ -443,10 +443,15 @@ class TopDownEngine:
                 data_slice = original_data[:, :, mcc_idx, :]
                 noisy_slice = noisy_data[:, :, mcc_idx, :]
                 
-                # Apply noise only to cells with data
-                data_values = data_slice[mcc_mask]
-                noise = np.random.normal(0, sigma, data_values.shape)
-                noisy_slice[mcc_mask] = data_values + noise
+                # Apply DISCRETE Gaussian noise (Census 2020 DAS requirement)
+                data_values = data_slice[mcc_mask].astype(np.int64)
+                noisy_values = add_discrete_gaussian_noise(
+                    data_values,
+                    rho=rho,
+                    sensitivity=sensitivity,
+                    use_fast_sampling=True
+                )
+                noisy_slice[mcc_mask] = noisy_values
         
         return noisy_data
     
@@ -614,6 +619,12 @@ class TopDownEngine:
                     while np.sum(rounded_province) > target_sum:
                         non_zero = np.where(rounded_province > 0)[0]
                         if len(non_zero) == 0:
+                            # All cells are zero but sum still > target (impossible unless target < 0)
+                            # This should not happen given target_sum > 0 check above
+                            logger.warning(
+                                f"Controlled rounding: all cells zero but sum > target "
+                                f"(sum={np.sum(rounded_province)}, target={target_sum})"
+                            )
                             break
                         idx = np.random.choice(non_zero)
                         rounded_province[idx] -= 1
@@ -657,7 +668,7 @@ class TopDownEngine:
                 diff = target_sum - final_sum
                 
                 if diff > 0:
-                    # Need to add more
+                    # Need to add more - always possible
                     for _ in range(int(diff)):
                         idx = np.random.randint(n)
                         rounded_province[idx] += 1
@@ -666,6 +677,14 @@ class TopDownEngine:
                     for _ in range(int(-diff)):
                         non_zero = np.where(rounded_province > 0)[0]
                         if len(non_zero) == 0:
+                            # Cannot subtract further - all cells are zero but target_sum < 0
+                            # This should never happen given target_sum > 0 check at start
+                            logger.error(
+                                f"CRITICAL: Cannot achieve province-month invariant! "
+                                f"All cells zero but need to subtract {-diff} more. "
+                                f"Target={target_sum}, Current={final_sum}"
+                            )
+                            # Force break and accept the mismatch (should trigger verification failure)
                             break
                         idx = np.random.choice(non_zero)
                         rounded_province[idx] -= 1
