@@ -290,6 +290,9 @@ class Config:
             'include_relative_moe': str(self.privacy.include_relative_moe).lower(),
             'sensitivity_method': self.privacy.sensitivity_method,
             'fixed_max_cells_per_card': str(self.privacy.fixed_max_cells_per_card),
+            'mcc_grouping_enabled': str(self.privacy.mcc_grouping_enabled).lower(),
+            'mcc_num_groups': str(self.privacy.mcc_num_groups),
+            'mcc_group_cap_percentile': str(self.privacy.mcc_group_cap_percentile),
         }
         for query, weight in self.privacy.query_split.items():
             parser['privacy'][f'query_split_{query}'] = str(weight)
