@@ -255,64 +255,53 @@ class BoundedContributionCalculator:
         
         logger.info(f"Clipping contributions to K = {k}")
         
-        # For very large datasets (4.5B+ rows), skip expensive count() operations
-        # The window function with row_number() is already very expensive and necessary
-        # Count operations force full materialization which can take hours on 4.5B rows
-        # Make counts optional - they're only used for logging statistics
+        # CRITICAL: The window function and clipping operations below are ESSENTIAL for DP correctness
+        # They MUST run - no skipping or optimization that affects the actual clipping logic.
+        # This implements the bounded contribution mechanism required for user-level DP.
+        
+        # Count before clipping (for statistics/logging only - does NOT affect DP correctness)
+        # On 4.5B rows, this can take 10+ minutes but is only for reporting
+        logger.info("  Counting records before clipping (for statistics only - may take time on large datasets)...")
+        records_before = df.count()
+        
+        # CRITICAL DP OPERATION: Window function with row_number()
+        # This is ESSENTIAL for bounded contribution - it identifies which transactions to keep
+        # within each (card, city, mcc, day) cell, ordered by transaction_date
+        # This operation is expensive on 4.5B rows but MUST run for DP correctness
         # 
-        # To skip counts for performance, set this to True:
-        # skip_counts = True  # Recommended for datasets > 1B rows
-        skip_counts = False
-        
-        if skip_counts:
-            logger.info("  Skipping record counts for performance (very large dataset)")
-            records_before = None
-            records_after = None
-            records_clipped = None
-        else:
-            # Count before clipping (expensive on 4.5B rows - can take 10+ minutes)
-            logger.info("  Counting records before clipping (this may take time on large datasets)...")
-            records_before = df.count()
-        
-        # Add row number within each card-cell, ordered by transaction date
-        # NOTE: This window function is VERY expensive on 4.5B rows but necessary for correctness
-        # It requires sorting within partitions, which is one of the most expensive Spark operations
-        # Consider checkpointing the DataFrame before this operation for fault tolerance
-        logger.info("  Applying window function with row_number() (expensive operation on large datasets)...")
+        # Performance note: This requires sorting within partitions, which is expensive.
+        # Consider checkpointing before this operation for fault tolerance on very large datasets.
+        logger.info("  Applying window function with row_number() (CRITICAL for DP correctness)...")
         window = Window.partitionBy(card_col, city_col, mcc_col, day_col).orderBy(order_col)
         
         df_with_rownum = df.withColumn('_row_num', F.row_number().over(window))
         
-        # Keep only first K transactions per card-cell
+        # CRITICAL DP OPERATION: Filter to keep only first K transactions per card-cell
+        # This enforces the contribution bound K, which is required for user-level DP sensitivity
+        # This operation MUST run - it directly affects the DP mechanism
         df_clipped = df_with_rownum.filter(F.col('_row_num') <= k).drop('_row_num')
         
-        # Count after clipping (also expensive)
-        if not skip_counts and records_before is not None:
-            logger.info("  Counting records after clipping (this may take time on large datasets)...")
-            records_after = df_clipped.count()
-            records_clipped = records_before - records_after
-        elif skip_counts:
-            records_after = None
-            records_clipped = None
+        # Count after clipping (for statistics/logging only - does NOT affect DP correctness)
+        logger.info("  Counting records after clipping (for statistics only - may take time on large datasets)...")
+        records_after = df_clipped.count()
+        records_clipped = records_before - records_after
         
         result = ContributionBoundResult(
             k=k,
             method=self.method,
             stats=self._stats.copy(),
-            records_before=records_before or 0,
-            records_after=records_after or 0,
-            records_clipped=records_clipped or 0
+            records_before=records_before,
+            records_after=records_after,
+            records_clipped=records_clipped
         )
         
-        if records_before is not None:
-            logger.info(f"  Records before: {records_before:,}")
-            logger.info(f"  Records after:  {records_after:,}")
-            if records_clipped is not None and records_before > 0:
-                logger.info(f"  Records clipped: {records_clipped:,} ({records_clipped/records_before*100:.2f}%)")
-            else:
-                logger.info(f"  Records clipped: {records_clipped:,}")
+        # Log statistics (these counts are for monitoring only, not used in DP computation)
+        logger.info(f"  Records before clipping: {records_before:,}")
+        logger.info(f"  Records after clipping:  {records_after:,}")
+        if records_before > 0:
+            logger.info(f"  Records clipped: {records_clipped:,} ({records_clipped/records_before*100:.2f}%)")
         else:
-            logger.info("  Record counts skipped for performance (very large dataset)")
+            logger.info(f"  Records clipped: {records_clipped:,}")
         
         return df_clipped, result
     
