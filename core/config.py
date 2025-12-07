@@ -133,6 +133,11 @@ class SparkConfig:
     driver_memory: str = "180g"
     shuffle_partitions: int = 200
     
+    # Performance optimization: Skip expensive count() operations used only for logging
+    # Set to True for production runs on very large datasets (10B+ rows) 
+    # This skips record counts that don't affect DP correctness but take 10+ min each
+    skip_expensive_counts: bool = False
+    
     def to_spark_conf(self) -> Dict[str, str]:
         """Convert to Spark configuration dictionary."""
         return {

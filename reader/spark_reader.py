@@ -90,7 +90,9 @@ class SparkTransactionReader:
         df = self._rename_columns(df)
         
         # Validate and filter
-        df = self._validate_and_filter(df)
+        # Use skip_expensive_counts from config for production runs on very large datasets
+        skip_counts = getattr(self.config.spark, 'skip_expensive_counts', False)
+        df = self._validate_and_filter(df, skip_counts=skip_counts)
         
         return df
     
@@ -116,7 +118,7 @@ class SparkTransactionReader:
         
         return df
     
-    def _validate_and_filter(self, df: DataFrame) -> DataFrame:
+    def _validate_and_filter(self, df: DataFrame, skip_counts: bool = False) -> DataFrame:
         """
         Validate data and filter invalid records.
         
@@ -125,6 +127,11 @@ class SparkTransactionReader:
         - Converts transaction_date to DateType if needed
         - Validates cities against geography
         - Adds province information
+        
+        Args:
+            df: Input DataFrame
+            skip_counts: If True, skip expensive count() operations (for 10B+ row datasets)
+                        These counts are ONLY for logging and do NOT affect processing
         """
         # Check required columns (internal names after column mapping)
         required_columns = [
@@ -136,8 +143,12 @@ class SparkTransactionReader:
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
         
-        initial_count = df.count()
-        logger.info(f"Initial record count: {initial_count:,}")
+        if skip_counts:
+            logger.info("Skipping record counts for performance (skip_counts=True)")
+            initial_count = -1
+        else:
+            initial_count = df.count()
+            logger.info(f"Initial record count: {initial_count:,}")
         
         # Convert transaction_date to DateType if it's a string
         date_field = [f for f in df.schema.fields if f.name == 'transaction_date'][0]
@@ -156,9 +167,10 @@ class SparkTransactionReader:
         for col in required_columns:
             df = df.filter(F.col(col).isNotNull())
         
-        after_null_filter = df.count()
-        logger.info(f"After null filter: {after_null_filter:,} "
-                   f"(dropped {initial_count - after_null_filter:,})")
+        if not skip_counts:
+            after_null_filter = df.count()
+            logger.info(f"After null filter: {after_null_filter:,} "
+                       f"(dropped {initial_count - after_null_filter:,})")
         
         # Create city-province lookup DataFrame (no UDFs!)
         city_province_data = [
@@ -177,32 +189,36 @@ class SparkTransactionReader:
         
         # Join to add province info (instead of UDF)
         # Use LEFT join to keep unknown cities, assign them to "Unknown" province
+        # Broadcast small city-province lookup table (~1500 cities) for efficient join
         df = df.join(
-            city_province_df,
+            F.broadcast(city_province_df),
             df.acceptor_city == city_province_df.city_name,
             "left"  # Keep all cities, even if not in city_province file
         ).drop("city_name")
         
-        # Count unknown cities before filling
-        unknown_count = df.filter(F.col('province_code').isNull()).count()
-        
         # Assign unknown cities to "Unknown" province and unknown city code
+        # Count unknown cities (for logging only - can skip for large datasets)
+        if not skip_counts:
+            unknown_count = df.filter(F.col('province_code').isNull()).count()
+            if unknown_count > 0:
+                logger.warning(f"Found {unknown_count:,} transactions with unknown cities - assigned to 'Unknown' province")
+        
         df = df.fillna({
             'province_code': Geography.UNKNOWN_PROVINCE_CODE,
             'province_name': Geography.UNKNOWN_PROVINCE_NAME,
             'city_code': Geography.UNKNOWN_CITY_CODE
         })
         
-        after_city_join = df.count()
-        logger.info(f"After city mapping: {after_city_join:,} records")
-        if unknown_count > 0:
-            logger.warning(f"Found {unknown_count:,} transactions with unknown cities - assigned to 'Unknown' province")
+        if not skip_counts:
+            after_city_join = df.count()
+            logger.info(f"After city mapping: {after_city_join:,} records")
         
         # Filter positive amounts
         df = df.filter(F.col('amount') > 0)
         
-        final_count = df.count()
-        logger.info(f"Final record count: {final_count:,}")
+        if not skip_counts:
+            final_count = df.count()
+            logger.info(f"Final record count: {final_count:,}")
         
         return df
     

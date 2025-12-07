@@ -195,20 +195,20 @@ class CityTierClassifier:
         logger.info("Classifying cities into tiers...")
         
         # Count transactions per city
-        city_counts = df.groupBy(city_col).agg(
+        city_counts_df = df.groupBy(city_col).agg(
             F.count("*").alias("tx_count")
-        ).collect()
+        )
         
-        if not city_counts:
+        # Stream results to driver instead of collecting all at once (1500 cities)
+        city_txns = {row[city_col]: row["tx_count"] for row in city_counts_df.toLocalIterator()}
+        
+        if not city_txns:
             logger.warning("No cities found in data")
             return CityTierResult(
                 city_to_tier={},
                 tier_info={},
                 tier_boundaries={}
             )
-        
-        # Build city -> count mapping
-        city_txns = {row[city_col]: row["tx_count"] for row in city_counts}
         counts = list(city_txns.values())
         
         logger.info(f"Found {len(city_txns)} cities")

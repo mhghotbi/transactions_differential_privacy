@@ -228,7 +228,8 @@ class BoundedContributionCalculator:
         city_col: str = 'acceptor_city',
         mcc_col: str = 'mcc',
         day_col: str = 'day_idx',
-        order_col: str = 'transaction_date'
+        order_col: str = 'transaction_date',
+        skip_counts: bool = False
     ) -> Tuple[DataFrame, ContributionBoundResult]:
         """
         Clip contributions in Spark DataFrame to at most K per card-cell.
@@ -241,6 +242,8 @@ class BoundedContributionCalculator:
             mcc_col: MCC column
             day_col: Day index column
             order_col: Column to order by when selecting which transactions to keep
+            skip_counts: If True, skip expensive count() operations (for 10B+ row datasets)
+                        These counts are ONLY for logging and do NOT affect DP correctness
             
         Returns:
             Tuple of (clipped DataFrame, result summary)
@@ -261,8 +264,12 @@ class BoundedContributionCalculator:
         
         # Count before clipping (for statistics/logging only - does NOT affect DP correctness)
         # On 4.5B rows, this can take 10+ minutes but is only for reporting
-        logger.info("  Counting records before clipping (for statistics only - may take time on large datasets)...")
-        records_before = df.count()
+        if skip_counts:
+            logger.info("  Skipping record counts (skip_counts=True for performance)")
+            records_before = -1  # Sentinel value indicating count was skipped
+        else:
+            logger.info("  Counting records before clipping (for statistics only - may take time on large datasets)...")
+            records_before = df.count()
         
         # CRITICAL DP OPERATION: Window function with row_number()
         # This is ESSENTIAL for bounded contribution - it identifies which transactions to keep
@@ -282,9 +289,14 @@ class BoundedContributionCalculator:
         df_clipped = df_with_rownum.filter(F.col('_row_num') <= k).drop('_row_num')
         
         # Count after clipping (for statistics/logging only - does NOT affect DP correctness)
-        logger.info("  Counting records after clipping (for statistics only - may take time on large datasets)...")
-        records_after = df_clipped.count()
-        records_clipped = records_before - records_after
+        if skip_counts:
+            records_after = -1  # Sentinel value indicating count was skipped
+            records_clipped = -1
+            logger.info("  Skipped record counts for performance (skip_counts=True)")
+        else:
+            logger.info("  Counting records after clipping (for statistics only - may take time on large datasets)...")
+            records_after = df_clipped.count()
+            records_clipped = records_before - records_after
         
         result = ContributionBoundResult(
             k=k,
@@ -296,12 +308,13 @@ class BoundedContributionCalculator:
         )
         
         # Log statistics (these counts are for monitoring only, not used in DP computation)
-        logger.info(f"  Records before clipping: {records_before:,}")
-        logger.info(f"  Records after clipping:  {records_after:,}")
-        if records_before > 0:
-            logger.info(f"  Records clipped: {records_clipped:,} ({records_clipped/records_before*100:.2f}%)")
-        else:
-            logger.info(f"  Records clipped: {records_clipped:,}")
+        if not skip_counts:
+            logger.info(f"  Records before clipping: {records_before:,}")
+            logger.info(f"  Records after clipping:  {records_after:,}")
+            if records_before > 0:
+                logger.info(f"  Records clipped: {records_clipped:,} ({records_clipped/records_before*100:.2f}%)")
+            else:
+                logger.info(f"  Records clipped: {records_clipped:,}")
         
         return df_clipped, result
     

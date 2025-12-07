@@ -39,13 +39,21 @@ class TransactionHistogram:
     - mcc: MCC code index
     - day: Day index (0-29 for 30 days)
     
-    Each cell contains 3 values (one per query):
+    Each cell contains 3-4 values (one per query):
     - transaction_count: Number of transactions
     - unique_cards: Number of unique card numbers
-    - total_amount: Sum of transaction amounts (winsorized)
+    - total_amount: Sum of transaction amounts (winsorized, for DP noise calibration)
+    - total_amount_original: Sum of original unwinsorized amounts (for invariants, dropped after DP)
+    
+    NOTE: total_amount_original is temporary - used during preprocessing and invariant 
+    computation, then dropped before final output to avoid confusion.
     """
     
-    QUERIES = ['transaction_count', 'unique_cards', 'total_amount']
+    # All queries including temporary ones (during preprocessing/DP)
+    QUERIES = ['transaction_count', 'unique_cards', 'total_amount', 'total_amount_original']
+    
+    # Output queries (after DP processing, without temporary fields)
+    OUTPUT_QUERIES = ['transaction_count', 'unique_cards', 'total_amount']
     
     def __init__(
         self,
@@ -139,10 +147,11 @@ class TransactionHistogram:
         mcc_idx: int,
         day_idx: int
     ) -> Dict[str, int]:
-        """Get all query values for a cell."""
+        """Get all query values for a cell (only queries that exist in data)."""
         return {
             query: int(self.data[query][province_idx, city_idx, mcc_idx, day_idx])
             for query in self.QUERIES
+            if query in self.data
         }
     
     def aggregate_to_province(self, query: str) -> np.ndarray:
@@ -204,11 +213,27 @@ class TransactionHistogram:
             city_codes=self.city_codes.copy() if self.city_codes else None
         )
         
+        # Copy only queries that exist in data (total_amount_original may be dropped)
         for query in self.QUERIES:
-            new_hist.data[query] = self.data[query].copy()
+            if query in self.data:
+                new_hist.data[query] = self.data[query].copy()
         new_hist._has_data = self._has_data.copy()
         
         return new_hist
+    
+    def drop_original_amounts(self) -> None:
+        """
+        Drop total_amount_original from histogram after DP processing.
+        
+        This removes the temporary field used for invariant computation,
+        leaving only the DP-protected total_amount in the output.
+        
+        This ensures users only see winsorized amounts that match the
+        DP noise calibration, avoiding confusion with dual amount tracking.
+        """
+        if 'total_amount_original' in self.data:
+            del self.data['total_amount_original']
+            logger.info("Dropped total_amount_original (used only for invariant computation)")
     
     def to_records(self) -> List[Dict[str, Any]]:
         """
@@ -235,9 +260,11 @@ class TransactionHistogram:
         city_codes_list = self.city_codes or list(range(self.shape[1]))
         
         # Pre-fetch query data for all non-zero cells
+        # Only process queries that exist in data (total_amount_original may be dropped)
         query_data = {
             query: self.data[query][indices].astype(int)
             for query in self.QUERIES
+            if query in self.data
         }
         
         # Build records using vectorized operations
@@ -259,7 +286,8 @@ class TransactionHistogram:
                 'day': day_labels[d] if d < len(day_labels) else str(d)
             }
             
-            for query in self.QUERIES:
+            # Only add queries that exist in query_data (total_amount_original may be dropped)
+            for query in query_data.keys():
                 record[query] = int(query_data[query][i])
             
             records.append(record)
@@ -285,8 +313,10 @@ class TransactionHistogram:
         
         if len(indices[0]) == 0:
             # Return empty DataFrame with correct columns
+            # Only include queries that exist in data (total_amount_original may be dropped)
+            existing_queries = [q for q in self.QUERIES if q in self.data]
             columns = ['province_idx', 'province', 'city_idx', 'city', 'city_code',
-                      'mcc_idx', 'mcc', 'day_idx', 'day'] + self.QUERIES
+                      'mcc_idx', 'mcc', 'day_idx', 'day'] + existing_queries
             return pd.DataFrame(columns=columns)
         
         # Pre-fetch all labels
@@ -311,9 +341,10 @@ class TransactionHistogram:
             'day': [day_labels[i] if i < len(day_labels) else str(i) for i in indices[3]],
         }
         
-        # Add query data
+        # Add query data (only for queries that exist - total_amount_original may be dropped)
         for query in self.QUERIES:
-            data[query] = self.data[query][indices].astype(int)
+            if query in self.data:
+                data[query] = self.data[query][indices].astype(int)
         
         return pd.DataFrame(data)
     
@@ -334,9 +365,17 @@ class TransactionHistogram:
             "Query Totals:"
         ]
         
+        # Show all queries that exist in data (including temporary ones during preprocessing)
         for query in self.QUERIES:
-            total = np.sum(self.data[query])
-            lines.append(f"  {query}: {total:,}")
+            if query in self.data:
+                total = np.sum(self.data[query])
+                # Add annotation for temporary fields
+                if query == 'total_amount_original':
+                    lines.append(f"  {query}: {total:,} (original unwinsorized, for invariants)")
+                elif query == 'total_amount' and 'total_amount_original' in self.data:
+                    lines.append(f"  {query}: {total:,} (winsorized, for DP noise)")
+                else:
+                    lines.append(f"  {query}: {total:,}")
         
         lines.append("=" * 60)
         return "\n".join(lines)

@@ -262,6 +262,10 @@ class DistributedPreprocessor:
         For 31 provinces × 500 cities × 100 MCCs × 30 days = 46.5M cells max
         (but most will be sparse/zero, so actual is much less)
         
+        CRITICAL: Computes BOTH capped and original amounts:
+        - total_amount (capped/winsorized): For DP noise calibration
+        - total_amount_original: For computing invariants that match public data
+        
         Output stays in Spark - no collect()!
         """
         agg_df = df.groupBy(
@@ -274,7 +278,8 @@ class DistributedPreprocessor:
             F.count('*').alias('transaction_count'),
             F.countDistinct('card_number').alias('unique_cards'),
             F.countDistinct('acceptor_id').alias('unique_acceptors'),
-            F.sum('amount_capped').alias('total_amount')
+            F.sum('amount_capped').alias('total_amount'),           # Capped (for DP sensitivity)
+            F.sum('amount').alias('total_amount_original')          # Original (for invariants)
         )
         
         # Log stats without collecting
@@ -588,24 +593,37 @@ class CensusDASEngine(DistributedDPEngine):
         
         # Step 1: Compute MONTHLY invariants (EXACT - no noise)
         logger.info("\nStep 1: Computing monthly invariants (EXACT)...")
+        logger.info("  CRITICAL: Using ORIGINAL (unwinsorized) amounts for total_amount invariants")
         
         # National monthly (sum of all data)
+        # CRITICAL: For total_amount, use ORIGINAL amounts to match public data
         national_monthly = df.agg(
-            *[F.sum(q).alias(f'{q}_national_monthly') for q in queries]
+            F.sum('transaction_count').alias('transaction_count_national_monthly'),
+            F.sum('unique_cards').alias('unique_cards_national_monthly'),
+            F.sum('unique_acceptors').alias('unique_acceptors_national_monthly'),
+            F.sum('total_amount_original').alias('total_amount_national_monthly')  # ORIGINAL, not winsorized
         ).first()
         
-        logger.info("  National monthly invariants:")
+        logger.info("  National monthly invariants (from ORIGINAL amounts):")
         for q in queries:
             logger.info(f"    {q}: {national_monthly[f'{q}_national_monthly']}")
         
         # Province monthly (sum per province, all days)
+        # CRITICAL: For total_amount, use ORIGINAL amounts to match public data
         province_monthly_df = df.groupBy('province_code', 'province_name').agg(
-            *[F.sum(q).alias(f'{q}_province_monthly') for q in queries]
+            F.sum('transaction_count').alias('transaction_count_province_monthly'),
+            F.sum('unique_cards').alias('unique_cards_province_monthly'),
+            F.sum('unique_acceptors').alias('unique_acceptors_province_monthly'),
+            F.sum('total_amount_original').alias('total_amount_province_monthly')  # ORIGINAL, not winsorized
         )
         
         # Province daily (for consistency enforcement)
+        # CRITICAL: For total_amount, use ORIGINAL amounts
         province_daily_df = df.groupBy('province_code', 'province_name', 'day_idx').agg(
-            *[F.sum(q).alias(f'{q}_province_daily') for q in queries]
+            F.sum('transaction_count').alias('transaction_count_province_daily'),
+            F.sum('unique_cards').alias('unique_cards_province_daily'),
+            F.sum('unique_acceptors').alias('unique_acceptors_province_daily'),
+            F.sum('total_amount_original').alias('total_amount_province_daily')  # ORIGINAL, not winsorized
         )
         
         logger.info(f"  Province invariants computed for {province_monthly_df.count()} provinces")
@@ -637,10 +655,17 @@ class CensusDASEngine(DistributedDPEngine):
             df, province_monthly_df, national_monthly, queries
         )
         
+        # Cleanup: Drop temporary columns (total_amount_original, amount_capped)
+        logger.info("\nCleanup: Removing temporary fields...")
+        df = df.drop('total_amount_original', 'amount_capped')
+        logger.info("  Dropped: total_amount_original (used only for invariants)")
+        logger.info("  Dropped: amount_capped (used only for DP noise calibration)")
+        
         logger.info("\nHierarchical noise injection complete")
         logger.info("  ✓ Monthly national totals: EXACT (invariant)")
         logger.info("  ✓ Monthly province totals: EXACT (invariant)")
         logger.info("  ✓ Daily city values: NOISY (adjusted)")
+        logger.info("  ✓ Output contains only DP-protected values")
         
         return df
     

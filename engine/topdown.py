@@ -186,17 +186,21 @@ class TopDownEngine:
         """
         Apply top-down DP with PROVINCE-MONTH LEVEL INVARIANTS.
         
+        IMPORTANT: This method modifies the histogram IN-PLACE for memory efficiency.
+        This is safe for DP - guarantees depend on the algorithm, not memory management.
+        
         Algorithm:
-        1. Compute province-month totals from data (these match public statistics)
-        2. Add DP noise to cell-level data (full budget)
-        3. NNLS post-processing to enforce province-month constraints
-        4. Controlled rounding for integer consistency
+        1. Compute province-month totals from data (uses total_amount_original)
+        2. Drop total_amount_original to free memory (~25% memory savings)
+        3. Add DP noise to cell-level data (full budget)
+        4. NNLS post-processing to enforce province-month constraints
+        5. Controlled rounding for integer consistency
         
         Args:
-            histogram: Original histogram with true counts
+            histogram: Original histogram with true counts (modified in-place)
             
         Returns:
-            New histogram with DP-protected values
+            The same histogram object with DP-protected values
         """
         logger.info("=" * 60)
         logger.info("Top-Down DP with PROVINCE-MONTH LEVEL INVARIANTS")
@@ -207,6 +211,7 @@ class TopDownEngine:
         logger.info("INVARIANT POLICY: Province-month totals are EXACT (publicly published)")
         logger.info("                  Y_p = Σ_{city,mcc,day} x_{p,city,mcc,day}")
         logger.info("NOISE POLICY: All budget allocated to cell level")
+        logger.info("MEMORY POLICY: In-place modification (no copy, DP-safe)")
         
         # Verify user-level parameters are set
         if self._d_max is None:
@@ -215,50 +220,55 @@ class TopDownEngine:
             logger.info(f"User-level D_max: {self._d_max}")
             logger.info(f"sqrt(D_max): {math.sqrt(self._d_max):.4f}")
         
-        # Create a copy for the protected result
-        protected = histogram.copy()
+        # NO COPY - work in-place for memory efficiency (DP-safe)
         
         # Step 1: Compute province-month totals (PUBLIC INVARIANTS)
+        # Uses total_amount_original to match publicly published data
         logger.info("")
         logger.info("=" * 40)
         logger.info("Step 1: Compute Province-Month Invariants (Public Data)")
         logger.info("=" * 40)
         self._compute_province_month_invariants(histogram)
         
+        # CRITICAL MEMORY OPTIMIZATION: Drop total_amount_original immediately
+        # This frees ~25% of memory and is safe - invariants already computed
+        histogram.drop_original_amounts()
+        logger.info("Memory: Freed total_amount_original after invariant computation (~25% memory saved)")
+        
         # Step 2: Add noise at cell level (FULL BUDGET)
         logger.info("")
         logger.info("=" * 40)
         logger.info("Step 2: Cell-Level Noise Injection (Full Budget)")
         logger.info("=" * 40)
-        self._apply_cell_level_noise(histogram, protected)
+        self._apply_cell_level_noise(histogram)
         
         # Step 3: NNLS post-processing (enforce province-month constraints + non-negativity)
         logger.info("")
         logger.info("=" * 40)
         logger.info("Step 3: NNLS Post-Processing (Province-Month Constraints)")
         logger.info("=" * 40)
-        self._nnls_post_process(protected)
+        self._nnls_post_process(histogram)
         
         # Step 4: Controlled rounding
         logger.info("")
         logger.info("=" * 40)
         logger.info("Step 4: Controlled Rounding")
         logger.info("=" * 40)
-        self._controlled_rounding(protected)
+        self._controlled_rounding(histogram)
         
         # Verify invariants are preserved
         logger.info("")
         logger.info("=" * 40)
         logger.info("Verification: Province-Month Invariants Check")
         logger.info("=" * 40)
-        self._verify_invariants(protected)
+        self._verify_invariants(histogram)
         
         logger.info("")
         logger.info("=" * 60)
         logger.info("Top-Down DP Processing Complete")
         logger.info("=" * 60)
         
-        return protected
+        return histogram
     
     def _handle_missing_user_level_params(self) -> None:
         """Handle case where user-level params are not set."""
@@ -279,16 +289,27 @@ class TopDownEngine:
         These are PUBLIC DATA that must be matched exactly.
         No noise is added - these values are already publicly known.
         
+        CRITICAL FIX: Uses ORIGINAL (unwinsorized) amounts for total_amount invariants
+        to match publicly published data. Winsorization is ONLY for DP sensitivity.
+        
         Province-month invariant for province p:
         Y_p = Σ_{city,mcc,day} x_{p,city,mcc,day}
         
         Output shape per query: (province_dim,)
         """
-        queries = TransactionHistogram.QUERIES
+        # Use OUTPUT_QUERIES to process only the main queries (not temporary fields)
+        queries_to_process = ['transaction_count', 'unique_cards', 'total_amount']
         
-        for query in queries:
-            # Get full histogram: shape (province, city, mcc, day)
-            data = histogram.get_query_array(query)
+        for query in queries_to_process:
+            # CRITICAL: For total_amount, use ORIGINAL (unwinsorized) values
+            # This ensures invariants match publicly published province totals
+            if query == 'total_amount' and 'total_amount_original' in histogram.data:
+                # Use original unwinsorized amounts for invariants
+                data = histogram.get_query_array('total_amount_original')
+                logger.info(f"  Using ORIGINAL (unwinsorized) amounts for {query} invariants")
+            else:
+                # transaction_count and unique_cards unchanged by winsorization
+                data = histogram.get_query_array(query)
             
             # Aggregate to province-month level: sum over cities, MCCs, and days
             # Result shape: (province_dim,)
@@ -306,15 +327,14 @@ class TopDownEngine:
                 f"provinces={nonzero_provinces}/{num_provinces} with data"
             )
         
-        logger.info("  [Province-month totals stored as PUBLIC INVARIANTS]")
+        logger.info("  [Province-month totals stored as PUBLIC INVARIANTS - from ORIGINAL amounts]")
     
     def _apply_cell_level_noise(
         self,
-        original: TransactionHistogram,
-        protected: TransactionHistogram
+        histogram: TransactionHistogram
     ) -> None:
         """
-        Apply noise at cell level with FULL privacy budget.
+        Apply noise at cell level with FULL privacy budget (in-place).
         
         Since province-month totals are public invariants (no privacy cost),
         the entire privacy budget is allocated to cell-level measurements.
@@ -324,14 +344,18 @@ class TopDownEngine:
         - Cell level: 100% of total_rho
         
         This is split among queries according to config.privacy.query_split.
+        
+        Args:
+            histogram: Histogram with original values (modified in-place with noise)
         """
-        queries = TransactionHistogram.QUERIES
+        # Only process OUTPUT_QUERIES (total_amount_original already dropped)
+        queries = TransactionHistogram.OUTPUT_QUERIES
         total_queries = len(queries)
         
         # Get the mask of cells with actual data
-        has_data_mask = original._has_data
+        has_data_mask = histogram._has_data
         num_data_cells = np.sum(has_data_mask)
-        total_cells = int(np.prod(original.shape))
+        total_cells = int(np.prod(histogram.shape))
         
         logger.info(f"  Data cells: {num_data_cells:,} / {total_cells:,} total")
         
@@ -343,14 +367,14 @@ class TopDownEngine:
             query_weight = self.config.privacy.query_split.get(query, 1.0 / total_queries)
             rho = Fraction(total_rho * query_weight).limit_denominator(10000)
             
-            # Get original data
-            original_data = original.get_query_array(query)
+            # Get original data before modification
+            original_data = histogram.get_query_array(query).copy()
             
             # Use stratified noise for total_amount if MCC grouping enabled
             if query == 'total_amount' and self._mcc_grouping_enabled:
                 logger.info(f"  [{idx+1}/{total_queries}] {query}: Stratified noise by MCC group")
                 noisy_data = self._apply_stratified_amount_noise(
-                    original, original_data, rho, has_data_mask
+                    histogram, original_data, rho, has_data_mask
                 )
             else:
                 # Standard noise for counting queries
@@ -362,7 +386,7 @@ class TopDownEngine:
                     f"ρ={float(rho):.6f}, Δ₂={sensitivity:.2f}, σ={sigma:.2f}"
                 )
                 
-                # Create output array (copy of original)
+                # Create output array (copy of original for noise addition)
                 noisy_data = original_data.astype(np.float64).copy()
                 
                 # Only add noise to cells with actual data
@@ -376,10 +400,10 @@ class TopDownEngine:
                     )
                     noisy_data[has_data_mask] = noisy_values
             
-            # Update protected histogram (keep as float for NNLS)
+            # Update histogram in-place (keep as float for NNLS)
             # Note: We store float64 temporarily for NNLS processing
             # This will be converted to int64 after controlled rounding
-            protected.data[query] = noisy_data.astype(np.float64)
+            histogram.data[query] = noisy_data.astype(np.float64)
             
             original_total = np.sum(original_data)
             noisy_total = np.sum(noisy_data)
@@ -455,9 +479,9 @@ class TopDownEngine:
         
         return noisy_data
     
-    def _nnls_post_process(self, protected: TransactionHistogram) -> None:
+    def _nnls_post_process(self, histogram: TransactionHistogram) -> None:
         """
-        NNLS post-processing to enforce province-month constraints with non-negativity.
+        NNLS post-processing to enforce province-month constraints with non-negativity (in-place).
         
         For each query, we solve per province:
             minimize   Σ_{c,m,d} (x_{p,c,m,d} - z_{p,c,m,d})²
@@ -478,17 +502,20 @@ class TopDownEngine:
         This is a projection onto the intersection of:
         - The non-negative orthant
         - The affine subspace defined by province-month sum constraints
+        
+        Args:
+            histogram: Histogram with noisy values (modified in-place)
         """
-        queries = TransactionHistogram.QUERIES
-        num_provinces = protected.shape[0]
-        num_cities = protected.shape[1]
-        num_mccs = protected.shape[2]
-        num_days = protected.shape[3]
+        queries = TransactionHistogram.OUTPUT_QUERIES
+        num_provinces = histogram.shape[0]
+        num_cities = histogram.shape[1]
+        num_mccs = histogram.shape[2]
+        num_days = histogram.shape[3]
         
         cells_per_province = num_cities * num_mccs * num_days
         
         for query in queries:
-            noisy_data = protected.get_query_array(query).astype(np.float64)
+            noisy_data = histogram.get_query_array(query).astype(np.float64)
             province_invariants = self._province_month_invariants[query]
             
             total_adjusted = 0
@@ -559,14 +586,14 @@ class TopDownEngine:
                 noisy_data[p_idx] = x_adjusted.reshape((num_cities, num_mccs, num_days))
             
             # Store float64 data (will be rounded to int64 in next step)
-            protected.data[query] = noisy_data.astype(np.float64)
+            histogram.data[query] = noisy_data.astype(np.float64)
             logger.info(
                 f"  {query}: {total_adjusted}/{num_provinces} provinces adjusted via NNLS"
             )
     
-    def _controlled_rounding(self, protected: TransactionHistogram) -> None:
+    def _controlled_rounding(self, histogram: TransactionHistogram) -> None:
         """
-        Apply controlled rounding to maintain integer consistency.
+        Apply controlled rounding to maintain integer consistency (in-place).
         
         Uses randomized rounding that preserves:
         1. Expected values (unbiased)
@@ -580,15 +607,18 @@ class TopDownEngine:
         4. Round remaining cells down
         
         This maintains E[round(x)] = x and Σ round(x_{p,c,m,d}) = Y_p
+        
+        Args:
+            histogram: Histogram with float values (modified in-place to int64)
         """
-        queries = TransactionHistogram.QUERIES
-        num_provinces = protected.shape[0]
-        num_cities = protected.shape[1]
-        num_mccs = protected.shape[2]
-        num_days = protected.shape[3]
+        queries = TransactionHistogram.OUTPUT_QUERIES
+        num_provinces = histogram.shape[0]
+        num_cities = histogram.shape[1]
+        num_mccs = histogram.shape[2]
+        num_days = histogram.shape[3]
         
         for query in queries:
-            data = protected.get_query_array(query).astype(np.float64)
+            data = histogram.get_query_array(query).astype(np.float64)
             province_invariants = self._province_month_invariants[query]
             
             rounded_data = np.zeros_like(data, dtype=np.int64)
@@ -691,25 +721,28 @@ class TopDownEngine:
                 
                 rounded_data[p_idx] = rounded_province.reshape((num_cities, num_mccs, num_days))
             
-            protected.set_query_array(query, rounded_data)
+            histogram.set_query_array(query, rounded_data)
             
             # Verify totals match PUBLIC invariants
             final_total = np.sum(rounded_data)
             invariant_total = np.sum(province_invariants)
             logger.info(f"  {query}: rounded total={final_total:,} (public invariant={invariant_total:,})")
     
-    def _verify_invariants(self, protected: TransactionHistogram) -> None:
+    def _verify_invariants(self, histogram: TransactionHistogram) -> None:
         """
-        Verify that province-month invariants are exactly preserved.
+        Verify that province-month invariants are exactly preserved (in-place verification).
         
         This is a CRITICAL verification step - the province-month totals
         are PUBLIC DATA that MUST match exactly.
+        
+        Args:
+            histogram: Histogram with DP-protected values (not modified, only verified)
         """
-        queries = TransactionHistogram.QUERIES
+        queries = TransactionHistogram.OUTPUT_QUERIES
         all_valid = True
         
         for query in queries:
-            data = protected.get_query_array(query)
+            data = histogram.get_query_array(query)
             invariants = self._province_month_invariants[query]
             
             # Compute actual province-month sums: sum over city, mcc, day
@@ -794,14 +827,20 @@ class SimpleEngine:
         self.budget = budget
     
     def run(self, histogram: TransactionHistogram) -> TransactionHistogram:
-        """Apply flat DP noise to histogram."""
-        protected = histogram.copy()
+        """
+        Apply flat DP noise to histogram (in-place for memory efficiency).
         
+        Args:
+            histogram: Input histogram (modified in-place)
+            
+        Returns:
+            Same histogram with DP-protected values
+        """
         total_rho = self.budget.total_rho
-        num_queries = len(TransactionHistogram.QUERIES)
+        num_queries = len(TransactionHistogram.OUTPUT_QUERIES)
         rho_per_query = total_rho / num_queries
         
-        for query in TransactionHistogram.QUERIES:
+        for query in TransactionHistogram.OUTPUT_QUERIES:
             data = histogram.get_query_array(query)
             
             noisy_data = add_discrete_gaussian_noise(
@@ -811,6 +850,6 @@ class SimpleEngine:
             )
             
             noisy_data = np.maximum(np.round(noisy_data), 0).astype(np.int64)
-            protected.set_query_array(query, noisy_data)
+            histogram.set_query_array(query, noisy_data)
         
-        return protected
+        return histogram

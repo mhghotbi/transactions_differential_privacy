@@ -282,13 +282,14 @@ class GlobalSensitivityCalculator:
         cells_per_individual.cache()
         
         # Group by num_cells and count - final result is small (distinct num_cells values)
-        # Use toLocalIterator() for memory efficiency, though result should be small anyway
-        distribution = cells_per_individual.groupBy("num_cells").count().collect()
+        # Use toLocalIterator() for memory efficiency to prevent OOM with thousands of unique values
+        distribution_df = cells_per_individual.groupBy("num_cells").count()
         
         # Uncache to free memory
         cells_per_individual.unpersist()
         
-        self._cells_distribution = {row["num_cells"]: row["count"] for row in distribution}
+        # Stream results to driver instead of collecting all at once
+        self._cells_distribution = {row["num_cells"]: row["count"] for row in distribution_df.toLocalIterator()}
         
         # Log summary statistics
         total_individuals = sum(self._cells_distribution.values())

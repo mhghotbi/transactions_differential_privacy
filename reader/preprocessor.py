@@ -132,7 +132,8 @@ class TransactionPreprocessor:
         ])
         mcc_group_df = self.spark.createDataFrame(mcc_group_data, schema=mcc_group_schema)
         
-        df = df.join(mcc_group_df, df.mcc == mcc_group_df.mcc_grp_key, "left").drop("mcc_grp_key")
+        # Broadcast small MCC group lookup table (~300 MCCs) for efficient join
+        df = df.join(F.broadcast(mcc_group_df), df.mcc == mcc_group_df.mcc_grp_key, "left").drop("mcc_grp_key")
         
         # Fill unknown MCCs with highest group (conservative - highest cap)
         max_group = max(self._mcc_grouping.group_info.keys()) if self._mcc_grouping.group_info else 0
@@ -303,8 +304,8 @@ class TransactionPreprocessor:
         ])
         cap_df = self.spark.createDataFrame(cap_data, schema=cap_schema)
         
-        # Join to get per-row cap
-        df = df.join(cap_df, df.mcc_group == cap_df.cap_group_id, "left").drop("cap_group_id")
+        # Broadcast small cap lookup table (~20 MCC groups) for efficient join
+        df = df.join(F.broadcast(cap_df), df.mcc_group == cap_df.cap_group_id, "left").drop("cap_group_id")
         df = df.fillna({'group_cap': max_cap})
         
         # Apply per-group winsorization
@@ -372,16 +373,15 @@ class TransactionPreprocessor:
         ])
         mcc_df = self.spark.createDataFrame(mcc_mapping_data, schema=mcc_schema)
         
-        df = df.join(mcc_df, df.mcc == mcc_df.mcc_key, "left").drop("mcc_key")
+        # Broadcast small MCC index lookup table (~300 MCCs) for efficient join
+        df = df.join(F.broadcast(mcc_df), df.mcc == mcc_df.mcc_key, "left").drop("mcc_key")
         
         logger.info(f"Unique MCCs: {len(self._mcc_to_idx)}")
         
         # Create city index mapping using join (no UDF!)
-        city_data = (
-            df.select('province_code', 'acceptor_city')
-            .distinct()
-            .collect()
-        )
+        # Stream distinct city-province pairs (1500+ pairs) instead of collecting all at once
+        city_data_df = df.select('province_code', 'acceptor_city').distinct()
+        city_data = list(city_data_df.toLocalIterator())
         
         # Global city index
         unique_cities = sorted(set(row.acceptor_city for row in city_data))
@@ -394,21 +394,31 @@ class TransactionPreprocessor:
         ])
         city_df = self.spark.createDataFrame(city_mapping_data, schema=city_schema)
         
-        df = df.join(city_df, df.acceptor_city == city_df.city_key, "left").drop("city_key")
+        # Broadcast small city index lookup table (~1500 cities) for efficient join
+        df = df.join(F.broadcast(city_df), df.acceptor_city == city_df.city_key, "left").drop("city_key")
         
         logger.info(f"Unique cities: {len(self._city_to_idx)}")
         
         return df
     
     def _aggregate_to_histogram(self, df: DataFrame) -> TransactionHistogram:
-        """Aggregate data to histogram structure."""
-        # Compute aggregations (3 queries: transaction_count, unique_cards, total_amount)
+        """
+        Aggregate data to histogram structure.
+        
+        CRITICAL: Computes BOTH winsorized and original amounts:
+        - total_amount (winsorized): For DP noise calibration
+        - total_amount_original: For computing invariants that match public data
+        
+        This single aggregation pass is memory-efficient (no extra shuffles).
+        """
+        # Compute aggregations (4 queries: transaction_count, unique_cards, total_amount, total_amount_original)
         agg_df = df.groupBy(
             'province_code', 'city_idx', 'mcc_idx', 'day_idx'
         ).agg(
             F.count('*').alias('transaction_count'),
             F.countDistinct('card_number').alias('unique_cards'),
-            F.sum('amount_winsorized').alias('total_amount')
+            F.sum('amount_winsorized').alias('total_amount'),         # Winsorized (for DP sensitivity)
+            F.sum('amount').alias('total_amount_original')             # Original (for invariants)
         )
         
         # Get count first (for logging) - use count() instead of collect()
@@ -475,6 +485,8 @@ class TransactionPreprocessor:
                                        'unique_cards', int(row.unique_cards))
                     histogram.set_value(p_idx, c_idx, m_idx, d_idx,
                                        'total_amount', int(row.total_amount))
+                    histogram.set_value(p_idx, c_idx, m_idx, d_idx,
+                                       'total_amount_original', int(row.total_amount_original))
         
         return histogram
     
