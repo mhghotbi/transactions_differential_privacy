@@ -212,7 +212,11 @@ class SparkTransactionReader:
         
         # Convert transaction_date to DateType if it's a string
         date_field = [f for f in df.schema.fields if f.name == 'transaction_date'][0]
+        date_conversion_happened = False
+        after_date_conversion = initial_count if not skip_counts else -1
+        
         if isinstance(date_field.dataType, StringType):
+            date_conversion_happened = True
             logger.info("Converting transaction_date from StringType to DateType")
             # Try to parse date (supports ISO format YYYY-MM-DD)
             df = df.withColumn(
@@ -221,7 +225,29 @@ class SparkTransactionReader:
             )
             # Filter out any null dates (parsing failures)
             df = df.filter(F.col('transaction_date').isNotNull())
-            logger.info("Date conversion complete")
+            
+            # Count after date conversion (if not skipping counts)
+            if not skip_counts:
+                try:
+                    after_date_conversion = df.count()
+                    date_dropped = initial_count - after_date_conversion
+                    if date_dropped > 0:
+                        logger.info(f"Date conversion: {after_date_conversion:,} records "
+                                   f"(dropped {date_dropped:,} with invalid dates)")
+                    else:
+                        logger.info("Date conversion complete (no records dropped)")
+                except Exception as e:
+                    if "read length must be non-negative or -1" in str(e):
+                        raise ValueError(
+                            "Error counting records after date conversion. This may indicate:\n"
+                            "1. The input file is corrupted\n"
+                            "2. There's an issue with the file system\n"
+                            f"Original error: {str(e)}"
+                        ) from e
+                    else:
+                        raise
+            else:
+                logger.info("Date conversion complete")
         
         # Filter null values
         for col in required_columns:
@@ -244,8 +270,21 @@ class SparkTransactionReader:
                     raise
             
             # Then, validate the count (separate from data reading errors)
-            logger.info(f"After null filter: {after_null_filter:,} "
-                       f"(dropped {initial_count - after_null_filter:,})")
+            # Calculate drops accurately: after date conversion (if happened) or initial count
+            if date_conversion_happened:
+                # Date conversion happened, so compare to count after date conversion
+                base_count = after_date_conversion
+                null_dropped = base_count - after_null_filter
+                total_dropped = initial_count - after_null_filter
+                logger.info(f"After null filter: {after_null_filter:,} "
+                           f"(dropped {null_dropped:,} null values, "
+                           f"{total_dropped:,} total from initial)")
+            else:
+                # No date conversion, so compare directly to initial count
+                null_dropped = initial_count - after_null_filter
+                logger.info(f"After null filter: {after_null_filter:,} "
+                           f"(dropped {null_dropped:,})")
+            
             if after_null_filter == 0:
                 raise ValueError(
                     "All records were filtered out after null filtering. "

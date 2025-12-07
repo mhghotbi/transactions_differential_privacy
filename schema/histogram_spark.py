@@ -98,6 +98,22 @@ class SparkHistogram:
         """Get underlying Spark DataFrame (NEVER collects to driver)."""
         return self._df
     
+    @property
+    def total_cells(self) -> int:
+        """Total number of possible cells in the histogram (product of dimensions)."""
+        import numpy as np
+        return int(np.prod(self.shape))
+    
+    @property
+    def non_zero_cells(self) -> int:
+        """
+        Number of cells with data.
+        
+        WARNING: This triggers a Spark action (.count()) but does NOT collect data.
+        Only returns a single integer.
+        """
+        return self._df.count()
+    
     def filter_mcc_group(self, mcc_indices: List[int]) -> 'SparkHistogram':
         """
         Filter to specific MCC indices.

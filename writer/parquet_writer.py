@@ -267,7 +267,7 @@ class ParquetWriter:
     def _write_metadata(
         self,
         output_path: str,
-        histogram: TransactionHistogram,
+        histogram,  # Union[TransactionHistogram, SparkHistogram]
         num_records: int
     ) -> None:
         """Write metadata file with processing information."""
