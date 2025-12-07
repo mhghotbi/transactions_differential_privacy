@@ -187,15 +187,11 @@ class SparkTransactionReader:
             logger.info("Skipping record counts for performance (skip_counts=True)")
             initial_count = -1
         else:
+            # First, try to get count - catch only data reading errors
             try:
                 initial_count = df.count()
-                logger.info(f"Initial record count: {initial_count:,}")
-                
-                if initial_count == 0:
-                    raise ValueError(
-                        "Input DataFrame is empty. Please verify your input file contains data."
-                    )
             except Exception as e:
+                # Handle data reading errors (corrupted file, etc.)
                 if "read length must be non-negative or -1" in str(e):
                     raise ValueError(
                         "Error reading input data. This may indicate:\n"
@@ -206,6 +202,13 @@ class SparkTransactionReader:
                     ) from e
                 else:
                     raise
+            
+            # Then, validate the count (separate from data reading errors)
+            logger.info(f"Initial record count: {initial_count:,}")
+            if initial_count == 0:
+                raise ValueError(
+                    "Input DataFrame is empty. Please verify your input file contains data."
+                )
         
         # Convert transaction_date to DateType if it's a string
         date_field = [f for f in df.schema.fields if f.name == 'transaction_date'][0]
@@ -225,27 +228,29 @@ class SparkTransactionReader:
             df = df.filter(F.col(col).isNotNull())
         
         if not skip_counts:
+            # First, try to get count - catch only data reading errors
             try:
                 after_null_filter = df.count()
-                logger.info(f"After null filter: {after_null_filter:,} "
-                           f"(dropped {initial_count - after_null_filter:,})")
-                
-                if after_null_filter == 0:
-                    raise ValueError(
-                        "All records were filtered out after null filtering. "
-                        "Please check your input data - all required columns must have non-null values."
-                    )
             except Exception as e:
+                # Handle data reading errors (corrupted file, etc.)
                 if "read length must be non-negative or -1" in str(e):
                     raise ValueError(
                         "Error counting records after null filter. This may indicate:\n"
                         "1. The input file is corrupted or empty\n"
-                        "2. All records were filtered out\n"
-                        "3. There's an issue with the file system\n"
+                        "2. There's an issue with the file system\n"
                         f"Original error: {str(e)}"
                     ) from e
                 else:
                     raise
+            
+            # Then, validate the count (separate from data reading errors)
+            logger.info(f"After null filter: {after_null_filter:,} "
+                       f"(dropped {initial_count - after_null_filter:,})")
+            if after_null_filter == 0:
+                raise ValueError(
+                    "All records were filtered out after null filtering. "
+                    "Please check your input data - all required columns must have non-null values."
+                )
         
         # Create city-province lookup DataFrame (no UDFs!)
         city_province_data = [
