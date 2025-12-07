@@ -66,21 +66,24 @@ class ParquetWriter:
     
     def write(
         self,
-        histogram: TransactionHistogram,
+        histogram,  # Union[TransactionHistogram, SparkHistogram]
         output_path: Optional[str] = None
     ) -> str:
         """
         Write protected histogram to Parquet.
         
-        Uses fast pandas-based conversion when available.
+        Handles both TransactionHistogram (old) and SparkHistogram (new).
+        For SparkHistogram, writes directly without collecting to driver (100% Spark).
         
         Args:
-            histogram: Protected TransactionHistogram
+            histogram: Protected histogram (TransactionHistogram or SparkHistogram)
             output_path: Optional override for output path
             
         Returns:
             Path where data was written
         """
+        from schema.histogram_spark import SparkHistogram
+        
         output_path = output_path or self.config.data.output_path
         
         # Ensure output directory exists
@@ -88,30 +91,37 @@ class ParquetWriter:
         
         logger.info(f"Writing protected data to: {output_path}")
         
-        # Convert histogram to Spark DataFrame (always use Spark, no pandas)
-        try:
-            df = self._create_dataframe_fast(histogram)
+        # Check if this is a SparkHistogram (new 100% Spark path)
+        if isinstance(histogram, SparkHistogram):
+            logger.info("Writing SparkHistogram (100% Spark, ZERO collect)")
+            df = self._create_dataframe_from_spark_histogram(histogram)
+            # Count triggers action but doesn't collect data
             num_records = df.count()
-        except Exception as e:
-            logger.warning(f"Fast conversion failed, using fallback: {e}")
-            # Fallback to record-based conversion
-            records = histogram.to_records()
-            logger.info(f"Converting {len(records):,} records to DataFrame")
-            
-            if not records:
-                logger.warning("No records to write!")
-                return output_path
-            
-            df = self._create_dataframe(records)
-            num_records = len(records)
+        else:
+            # Old TransactionHistogram path (collects to driver)
+            logger.info("Writing TransactionHistogram (legacy numpy path)")
+            try:
+                df = self._create_dataframe_fast(histogram)
+                num_records = df.count()
+            except Exception as e:
+                logger.warning(f"Fast conversion failed, using fallback: {e}")
+                records = histogram.to_records()
+                logger.info(f"Converting {len(records):,} records to DataFrame")
+                
+                if not records:
+                    logger.warning("No records to write!")
+                    return output_path
+                
+                df = self._create_dataframe(records)
+                num_records = len(records)
         
         if num_records == 0:
             logger.warning("No records to write!")
             return output_path
         
-        logger.info(f"Writing {num_records:,} records to Parquet")
+        logger.info(f"Writing {num_records:,} records to Parquet (distributed write)")
         
-        # Write to Parquet
+        # Write to Parquet (distributed, no driver collection)
         parquet_path = os.path.join(output_path, "protected_data")
         
         writer = df.write.mode("overwrite")
@@ -127,6 +137,74 @@ class ParquetWriter:
         self._write_metadata(output_path, histogram, num_records)
         
         return output_path
+    
+    def _create_dataframe_from_spark_histogram(self, histogram) -> DataFrame:
+        """
+        Convert SparkHistogram to output DataFrame (100% Spark, NO collect).
+        
+        Args:
+            histogram: SparkHistogram with DP-protected data
+            
+        Returns:
+            Spark DataFrame ready for writing (data stays distributed)
+        """
+        from pyspark.sql import functions as F
+        
+        # SparkHistogram already contains a Spark DataFrame
+        # Just select and rename columns for output schema
+        df = histogram.df.select(
+            F.col('province_idx').cast('int').alias('province_code'),
+            # Get city_code from histogram metadata
+            F.col('city_idx').cast('int'),  # We'll join with city codes
+            F.col('mcc_idx').cast('int'),
+            F.col('day_idx').cast('int'),
+            F.col('transaction_count').cast('long'),
+            F.col('unique_cards').cast('long'),
+            F.col('total_amount').cast('long').alias('transaction_amount_sum')
+        )
+        
+        # Add city_code column (need to join with city code mapping)
+        # Create small city code DataFrame for broadcast join
+        if histogram.city_codes:
+            city_code_data = [
+                {'city_idx': idx, 'city_code': code}
+                for idx, code in enumerate(histogram.city_codes)
+            ]
+            city_code_df = self.spark.createDataFrame(city_code_data)
+            df = df.join(F.broadcast(city_code_df), on='city_idx', how='left')
+        else:
+            # Fallback: use city_idx as city_code
+            df = df.withColumn('city_code', F.col('city_idx'))
+        
+        # Add MCC label (get from histogram dimensions)
+        if 'mcc' in histogram.dimensions and histogram.dimensions['mcc'].labels:
+            mcc_labels = histogram.dimensions['mcc'].labels
+            mcc_data = [
+                {'mcc_idx': idx, 'mcc': label}
+                for idx, label in enumerate(mcc_labels)
+            ]
+            mcc_df = self.spark.createDataFrame(mcc_data)
+            df = df.join(F.broadcast(mcc_df), on='mcc_idx', how='left')
+        else:
+            df = df.withColumn('mcc', F.col('mcc_idx').cast('string'))
+        
+        # Add transaction_date (format day_idx as string for now)
+        df = df.withColumn('transaction_date', F.col('day_idx').cast('string'))
+        
+        # Select final columns in output schema order
+        df = df.select(
+            'province_code',
+            'city_code',
+            'mcc',
+            'day_idx',
+            'transaction_date',
+            'transaction_count',
+            'unique_cards',
+            'transaction_amount_sum'
+        )
+        
+        logger.info("SparkHistogram converted to output DataFrame (100% Spark, NO collect)")
+        return df
     
     def _create_dataframe_fast(self, histogram: TransactionHistogram) -> DataFrame:
         """

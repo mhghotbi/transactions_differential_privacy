@@ -465,16 +465,18 @@ class TransactionPreprocessor:
         
         return df
     
-    def _aggregate_to_histogram(self, df: DataFrame) -> TransactionHistogram:
+    def _aggregate_to_histogram(self, df: DataFrame):
         """
-        Aggregate data to histogram structure.
+        Aggregate data to SparkHistogram structure (100% Spark, ZERO collect).
         
         CRITICAL: Computes BOTH winsorized and original amounts:
         - total_amount (winsorized): For DP noise calibration
         - total_amount_original: For computing invariants that match public data
         
-        This single aggregation pass is memory-efficient (no extra shuffles).
+        Returns SparkHistogram that keeps all data distributed (no driver memory).
         """
+        from schema.histogram_spark import SparkHistogram, HistogramDimension
+        
         # Compute aggregations (4 queries: transaction_count, unique_cards, total_amount, total_amount_original)
         agg_df = df.groupBy(
             'province_code', 'city_idx', 'mcc_idx', 'day_idx'
@@ -485,17 +487,20 @@ class TransactionPreprocessor:
             F.sum('amount').alias('total_amount_original')             # Original (for invariants)
         )
         
+        # Rename province_code to province_idx for consistency
+        agg_df = agg_df.withColumnRenamed('province_code', 'province_idx')
+        
         # Get count first (for logging) - use count() instead of collect()
         num_cells = agg_df.count()
-        logger.info(f"Aggregated to {num_cells:,} non-zero cells")
+        logger.info(f"Aggregated to {num_cells:,} non-zero cells (Spark DataFrame, NO collect)")
         
-        # Create histogram
+        # Create dimension metadata (small lists in driver, ~1 KB total)
         num_provinces = max(self.geography.province_codes) + 1
         num_cities = len(self._city_to_idx)
         num_mccs = len(self._mcc_to_idx)
         num_days = self.config.data.num_days
         
-        # Create label lists
+        # Create label lists (small metadata)
         province_labels = [''] * num_provinces
         for code in self.geography.province_codes:
             province = self.geography.get_province(code)
@@ -503,10 +508,9 @@ class TransactionPreprocessor:
                 province_labels[code] = province.name
         
         city_labels = [''] * num_cities
-        city_codes = [0] * num_cities  # NEW: city codes list
+        city_codes = [0] * num_cities
         for city, idx in self._city_to_idx.items():
             city_labels[idx] = city
-            # Get city code from geography
             city_code = self.geography.get_city_code(city)
             city_codes[idx] = city_code if city_code is not None else Geography.UNKNOWN_CITY_CODE
         
@@ -514,43 +518,22 @@ class TransactionPreprocessor:
         for mcc, idx in self._mcc_to_idx.items():
             mcc_labels[idx] = mcc
         
-        histogram = TransactionHistogram(
-            province_dim=num_provinces,
-            city_dim=num_cities,
-            mcc_dim=num_mccs,
-            day_dim=num_days,
-            province_labels=province_labels,
-            city_labels=city_labels,
-            mcc_labels=mcc_labels,
-            city_codes=city_codes  # NEW: pass city codes
-        )
+        # Build dimensions dictionary
+        dimensions = {
+            'province': HistogramDimension('province', num_provinces, province_labels),
+            'city': HistogramDimension('city', num_cities, city_labels),
+            'mcc': HistogramDimension('mcc', num_mccs, mcc_labels),
+            'day': HistogramDimension('day', num_days, [str(i) for i in range(num_days)])
+        }
         
-        # Fill histogram using toLocalIterator() to stream rows instead of collecting all
-        # This is critical for large datasets (e.g., 30 days × 1500 cities × 300 MCCs)
-        cell_count = 0
-        for row in agg_df.toLocalIterator():
-            cell_count += 1
-            # Log progress every 100k cells for large datasets
-            if cell_count % 100000 == 0:
-                logger.info(f"  Processed {cell_count:,} / {num_cells:,} cells ({100*cell_count/num_cells:.1f}%)")
-            
-            p_idx = row.province_code
-            c_idx = row.city_idx
-            m_idx = row.mcc_idx
-            d_idx = row.day_idx
-            
-            if p_idx is not None and c_idx is not None and m_idx is not None and d_idx is not None:
-                if 0 <= p_idx < num_provinces and 0 <= c_idx < num_cities and \
-                   0 <= m_idx < num_mccs and 0 <= d_idx < num_days:
-                    
-                    histogram.set_value(p_idx, c_idx, m_idx, d_idx, 
-                                       'transaction_count', int(row.transaction_count))
-                    histogram.set_value(p_idx, c_idx, m_idx, d_idx,
-                                       'unique_cards', int(row.unique_cards))
-                    histogram.set_value(p_idx, c_idx, m_idx, d_idx,
-                                       'total_amount', int(row.total_amount))
-                    histogram.set_value(p_idx, c_idx, m_idx, d_idx,
-                                       'total_amount_original', int(row.total_amount_original))
+        # Create SparkHistogram (data stays in Spark, NO collection to driver)
+        logger.info("Creating SparkHistogram (100% Spark, data remains distributed)")
+        histogram = SparkHistogram(
+            spark=self.spark,
+            df=agg_df,
+            dimensions=dimensions,
+            city_codes=city_codes
+        )
         
         return histogram
     

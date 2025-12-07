@@ -193,9 +193,58 @@ class TopDownEngine:
             logger.info(f"  {name:20s}: {sens.l2_sensitivity:,.4f}")
         logger.info("=" * 60)
     
-    def run(self, histogram: TransactionHistogram) -> TransactionHistogram:
+    def run(self, histogram):
         """
         Apply top-down DP with PROVINCE-MONTH LEVEL INVARIANTS.
+        
+        Dispatcher that routes to appropriate engine based on histogram type:
+        - SparkHistogram → TopDownSparkEngine (100% Spark, ZERO collect)
+        - TransactionHistogram → Numpy engine (legacy, in-place modification)
+        
+        Args:
+            histogram: Original histogram (SparkHistogram or TransactionHistogram)
+            
+        Returns:
+            Histogram object with DP-protected values (same type as input)
+        """
+        # Check histogram type and dispatch to appropriate engine
+        from schema.histogram_spark import SparkHistogram
+        
+        if isinstance(histogram, SparkHistogram):
+            logger.info("=" * 60)
+            logger.info("Detected SparkHistogram → Using 100% Spark Engine")
+            logger.info("=" * 60)
+            
+            # Use Spark-native engine (ZERO numpy, ZERO collect)
+            from engine.topdown_spark import TopDownSparkEngine
+            
+            spark_engine = TopDownSparkEngine(
+                spark=self.spark,
+                config=self.config,
+                geography=self.geography,
+                budget=self.budget
+            )
+            
+            # Transfer user-level params to Spark engine
+            if self._d_max is not None:
+                K = self.config.privacy.computed_contribution_bound or 1
+                spark_engine.set_user_level_params(
+                    d_max=self._d_max,
+                    k_bound=K,
+                    winsorize_cap=self._winsorize_cap
+                )
+            
+            return spark_engine.run(histogram)
+        else:
+            # Legacy numpy path for TransactionHistogram
+            logger.info("=" * 60)
+            logger.info("Detected TransactionHistogram → Using NumPy Engine (Legacy)")
+            logger.info("=" * 60)
+            return self._run_numpy(histogram)
+    
+    def _run_numpy(self, histogram: TransactionHistogram) -> TransactionHistogram:
+        """
+        NumPy-based DP engine (legacy path for small datasets).
         
         IMPORTANT: This method modifies the histogram IN-PLACE for memory efficiency.
         This is safe for DP - guarantees depend on the algorithm, not memory management.
@@ -215,7 +264,7 @@ class TopDownEngine:
             The same histogram object with DP-protected values
         """
         logger.info("=" * 60)
-        logger.info("Top-Down DP with PROVINCE-MONTH LEVEL INVARIANTS")
+        logger.info("Top-Down DP with PROVINCE-MONTH LEVEL INVARIANTS (NumPy)")
         logger.info("=" * 60)
         logger.info(f"Total privacy budget (rho): {self.budget.total_rho}")
         logger.info(f"Epsilon at delta={self.budget.delta}: {self.budget.total_epsilon:.4f}")
@@ -323,6 +372,8 @@ class TopDownEngine:
         Output shape per query: (province_dim,)
         Per-group shape: (province_dim,) for each group
         """
+        import gc
+        
         # Use OUTPUT_QUERIES to process only the main queries (not temporary fields)
         queries_to_process = ['transaction_count', 'unique_cards', 'total_amount']
         
@@ -387,6 +438,9 @@ class TopDownEngine:
                     group_data = data[:, :, group_mcc_indices, :]  # (province, city, group_mccs, day)
                     group_totals = np.sum(group_data, axis=(1, 2, 3))  # (province,)
                     self._per_group_invariants[query][group_id] = group_totals.astype(np.int64)
+                    
+                    # Clean up group-specific arrays
+                    del group_data, group_totals
                 
                 # Verify: sum of group invariants should equal global invariant
                 group_sum = sum(self._per_group_invariants[query][g].sum() for g in group_ids)
@@ -394,6 +448,9 @@ class TopDownEngine:
                     logger.warning(f"  {query}: Per-group sum ({group_sum:,}) != global total ({total_value:,})")
                 else:
                     logger.info(f"  {query}: ✓ Per-group invariants verified (sum={group_sum:,})")
+            
+            # Force garbage collection after each query
+            gc.collect()
         
         logger.info("  [Province-month totals stored as PUBLIC INVARIANTS - from ORIGINAL amounts]")
     
@@ -592,20 +649,54 @@ class TopDownEngine:
             
             logger.info(f"[GROUP {group_idx}] {len(group_mcc_indices)} MCCs, cap={group_cap:,.0f}")
             
+            # CRITICAL MEMORY FIX: Pre-compute boolean mask for MCC dimension
+            # This avoids fancy indexing copies (90GB->200GB spike)
+            mcc_mask = np.zeros(n_mcc, dtype=bool)
+            mcc_mask[group_mcc_indices] = True
+            num_group_mccs = len(group_mcc_indices)
+            
+            # CRITICAL MEMORY FIX: Pre-compute province mask template
+            # Boolean indexing province_data[:, mcc_mask, :] creates copies!
+            # Instead, use flat indices approach like Step 1
+            province_mask_template = np.zeros((n_city, n_mcc, n_day), dtype=bool)
+            province_mask_template[:, mcc_mask, :] = True
+            group_flat_indices_in_province = np.where(province_mask_template.ravel())[0]
+            num_cells_per_province_group = len(group_flat_indices_in_province)
+            logger.info(f"[GROUP {group_idx}] Pre-computed flat indices: {num_cells_per_province_group:,} cells per province")
+            
             # ================================================================
             # STEP 1: Apply noise to this group's cells (all queries)
             # MEMORY OPTIMIZATION: Use flat indices, NOT full-sized masks
             # ================================================================
             logger.info(f"[GROUP {group_idx}] Step 1: Noise application")
             
-            # Pre-compute flat indices for this group's data cells ONCE
-            # This avoids creating full-sized masks for each query
-            group_has_data_mask = has_data_mask[:, :, group_mcc_indices, :]
-            num_group_cells = np.sum(group_has_data_mask)
+            # Pre-compute FLAT INDICES for this group's data cells ONCE
+            # This avoids creating full-sized masks/slices that double memory
+            mem_before_indices = psutil.virtual_memory().used / (1024**3)
+            
+            # Get all data cell flat indices from the mask
+            data_indices = np.where(has_data_mask.ravel())[0]
+            
+            # Compute MCC index for each data cell using flat index math
+            # flat_idx = prov * (n_city * n_mcc * n_day) + city * (n_mcc * n_day) + mcc * n_day + day
+            # mcc_idx = (flat_idx // n_day) % n_mcc
+            mcc_indices_for_data = (data_indices // n_day) % n_mcc
+            
+            # Find data cells whose MCC belongs to this group
+            group_mcc_set = set(group_mcc_indices)
+            group_cell_mask = np.isin(mcc_indices_for_data, list(group_mcc_set))
+            group_flat_indices = data_indices[group_cell_mask]
+            num_group_cells = len(group_flat_indices)
+            
+            # Clean up temporary arrays
+            del data_indices, mcc_indices_for_data, group_cell_mask
+            gc.collect()
+            
+            mem_after_indices = psutil.virtual_memory().used / (1024**3)
+            logger.info(f"[GROUP {group_idx}] Flat indices: {num_group_cells:,} cells (mem: {mem_before_indices:.2f} -> {mem_after_indices:.2f} GB)")
             
             if num_group_cells == 0:
                 logger.info(f"[GROUP {group_idx}] No data cells in this group, skipping noise")
-                del group_has_data_mask
             else:
                 for query_idx, query in enumerate(queries):
                     query_weight = self.config.privacy.query_split.get(query, 1.0 / total_queries)
@@ -621,31 +712,37 @@ class TopDownEngine:
                     
                     logger.info(f"  {query}: {num_group_cells:,} cells, ρ={float(rho):.4f}, Δ₂={sensitivity:.2f}, σ={sigma:.2f}")
                     
+                    # Memory before noise
+                    mem_before_noise = psutil.virtual_memory().used / (1024**3)
+                    logger.info(f"  [MEMORY] Before sampling: {mem_before_noise:.2f} GB")
+                    
                     # Convert to float64 if needed (in-place on full array, done once)
                     if histogram.data[query].dtype != np.float64:
                         histogram.data[query] = histogram.data[query].astype(np.float64)
                     
-                    # Extract group slice (creates a copy due to fancy indexing)
-                    group_slice = histogram.data[query][:, :, group_mcc_indices, :]
+                    # Flatten data array for direct indexing (VIEW, not copy)
+                    flat_data = histogram.data[query].ravel()
                     
-                    # Extract only cells with data (small array: just group's data cells)
-                    data_values = group_slice[group_has_data_mask].astype(np.int64)
+                    # Extract data values using flat indices (minimal memory: just group cells)
+                    data_values = flat_data[group_flat_indices].astype(np.int64)
                     
                     # Apply noise
                     noisy_values = add_discrete_gaussian_noise(
                         data_values, rho=rho, sensitivity=sensitivity, use_fast_sampling=True
                     )
                     
-                    # Write noisy values back to the group slice
-                    group_slice[group_has_data_mask] = noisy_values.astype(np.float64)
+                    # Write noisy values back using flat indices
+                    flat_data[group_flat_indices] = noisy_values.astype(np.float64)
                     
-                    # CRITICAL: Write the modified group slice back to original array
-                    # (fancy indexing creates a copy, so we must write back explicitly)
-                    histogram.data[query][:, :, group_mcc_indices, :] = group_slice
+                    # Clean up
+                    del data_values, noisy_values
                     
-                    del data_values, noisy_values, group_slice
+                    # Memory after noise
+                    mem_after_noise = psutil.virtual_memory().used / (1024**3)
+                    logger.info(f"  [MEMORY] After sampling: {mem_after_noise:.2f} GB (delta: {mem_after_noise - mem_before_noise:+.2f} GB)")
                 
-                del group_has_data_mask
+                # Clean up flat indices after all queries processed
+                del group_flat_indices
             
             gc.collect()
             mem_after_noise = psutil.virtual_memory().used / (1024**3)
@@ -653,8 +750,11 @@ class TopDownEngine:
             
             # ================================================================
             # STEP 2: NNLS post-processing for this group (per-group invariants)
+            # MEMORY OPTIMIZATION: Direct array access, no identity matrix
             # ================================================================
             logger.info(f"[GROUP {group_idx}] Step 2: NNLS post-processing")
+            
+            mem_before_nnls = psutil.virtual_memory().used / (1024**3)
             
             for query in queries:
                 if query not in self._per_group_invariants or group_id not in self._per_group_invariants[query]:
@@ -668,24 +768,32 @@ class TopDownEngine:
                 for p_idx in range(n_prov):
                     target_sum = float(group_invariants[p_idx])
                     
+                    # MEMORY FIX: Use flat indices to avoid boolean indexing copies
+                    # Get flat view of province data (view, not copy)
+                    province_data_flat = histogram.data[query][p_idx].ravel()
+                    
                     if target_sum <= 0:
                         # Set all cells in this group for this province to 0
-                        histogram.data[query][p_idx, :, group_mcc_indices, :] = 0
+                        # Flat indexing - no copy
+                        province_data_flat[group_flat_indices_in_province] = 0
                         continue
                     
-                    # Get province-group slice
-                    province_group_slice = histogram.data[query][p_idx, :, group_mcc_indices, :].flatten()
+                    # MEMORY FIX: Extract ONLY group cells using flat indices (minimal copy)
+                    province_group_slice = province_data_flat[group_flat_indices_in_province].copy()
                     n = len(province_group_slice)
                     
-                    # NNLS projection
-                    A = np.eye(n)
-                    x_nnls, _ = nnls(A, province_group_slice, maxiter=self._nnls_max_iterations)
+                    # CRITICAL OPTIMIZATION: NNLS with identity matrix A=I simplifies to clipping!
+                    # Original: A = np.eye(n); x_nnls, _ = nnls(A, province_group_slice)
+                    # Simplified: x_nnls = max(province_group_slice, 0)
+                    # This saves creating an n×n matrix (potentially 180 GB!)
+                    x_nnls = np.maximum(province_group_slice, 0)
                     
                     # Scale to match per-group invariant
                     current_sum = np.sum(x_nnls)
                     if current_sum > 0:
                         x_adjusted = x_nnls * (target_sum / current_sum)
                     else:
+                        # All values clipped to zero but we need positive sum
                         nonzero_mask = province_group_slice > 0
                         x_adjusted = np.zeros(n)
                         if np.sum(nonzero_mask) > 0:
@@ -695,7 +803,7 @@ class TopDownEngine:
                     
                     x_adjusted = np.maximum(x_adjusted, 0)
                     
-                    # Re-adjust if needed
+                    # Re-adjust if needed (ensure exact match to invariant)
                     adjusted_sum = np.sum(x_adjusted)
                     if adjusted_sum > 0 and abs(adjusted_sum - target_sum) > 1e-6:
                         x_adjusted = x_adjusted * (target_sum / adjusted_sum)
@@ -704,26 +812,37 @@ class TopDownEngine:
                     if np.sum(np.abs(x_adjusted - province_group_slice)) > 1e-6:
                         adjusted_count += 1
                     
-                    # Reshape and store
-                    new_shape = (n_city, len(group_mcc_indices), n_day)
-                    histogram.data[query][p_idx, :, group_mcc_indices, :] = x_adjusted.reshape(new_shape)
+                    # Write back using flat indices (writes to view, modifies original)
+                    province_data_flat[group_flat_indices_in_province] = x_adjusted
+                    
+                    # Clean up province-specific arrays
+                    del province_data_flat, province_group_slice, x_nnls, x_adjusted
                 
                 logger.info(f"  {query}: {adjusted_count}/{n_prov} provinces adjusted")
             
             gc.collect()
             mem_after_nnls = psutil.virtual_memory().used / (1024**3)
-            logger.info(f"[GROUP {group_idx}] Step 2 complete. Memory: {mem_after_nnls:.2f} GB")
+            logger.info(f"[GROUP {group_idx}] Step 2 complete. Memory: {mem_before_nnls:.2f} -> {mem_after_nnls:.2f} GB")
             
             # ================================================================
             # STEP 3: Controlled rounding for this group (per-group invariants)
+            # MEMORY OPTIMIZATION: Avoid full group data copy
             # ================================================================
             logger.info(f"[GROUP {group_idx}] Step 3: Controlled rounding")
             
+            mem_before_rounding = psutil.virtual_memory().used / (1024**3)
+            
             for query in queries:
                 if query not in self._per_group_invariants or group_id not in self._per_group_invariants[query]:
-                    # Just round without constraint
-                    group_data = histogram.data[query][:, :, group_mcc_indices, :]
-                    histogram.data[query][:, :, group_mcc_indices, :] = np.round(group_data).astype(np.float64)
+                    # MEMORY FIX: Use flat indices instead of boolean indexing
+                    for p_idx in range(n_prov):
+                        # Get flat view of province data (view, not copy)
+                        province_data_flat = histogram.data[query][p_idx].ravel()
+                        # Extract ONLY group cells (minimal copy)
+                        group_values = province_data_flat[group_flat_indices_in_province].copy()
+                        # Round and write back using flat indices
+                        province_data_flat[group_flat_indices_in_province] = np.round(group_values).astype(np.float64)
+                        del province_data_flat, group_values
                     continue
                 
                 group_invariants = self._per_group_invariants[query][group_id]
@@ -731,16 +850,22 @@ class TopDownEngine:
                 for p_idx in range(n_prov):
                     target_sum = int(group_invariants[p_idx])
                     
+                    # MEMORY FIX: Use flat indices to avoid boolean indexing copies
+                    # Get flat view of province data (view, not copy)
+                    province_data_flat = histogram.data[query][p_idx].ravel()
+                    
                     if target_sum <= 0:
-                        histogram.data[query][p_idx, :, group_mcc_indices, :] = 0
+                        # Flat indexing - no copy
+                        province_data_flat[group_flat_indices_in_province] = 0
                         continue
                     
-                    province_group_slice = histogram.data[query][p_idx, :, group_mcc_indices, :].flatten()
+                    # MEMORY FIX: Extract ONLY group cells using flat indices (minimal copy)
+                    province_group_slice = province_data_flat[group_flat_indices_in_province].copy()
                     n = len(province_group_slice)
                     
                     # Floor values
-                    floors = np.floor(province_group_slice).astype(np.int64)
-                    floors = np.maximum(floors, 0)
+                    # MEMORY OPTIMIZATION: Combine operations to avoid intermediate arrays
+                    floors = np.maximum(np.floor(province_group_slice).astype(np.int64), 0)
                     fractional_parts = np.maximum(province_group_slice - floors, 0)
                     
                     floor_sum = np.sum(floors)
@@ -774,14 +899,24 @@ class TopDownEngine:
                         rounded_values = floors.copy()
                         rounded_values[round_up_indices] += 1
                     
-                    # Reshape and store
-                    new_shape = (n_city, len(group_mcc_indices), n_day)
-                    histogram.data[query][p_idx, :, group_mcc_indices, :] = rounded_values.reshape(new_shape).astype(np.float64)
+                    # Write back using flat indices (writes to view, modifies original)
+                    province_data_flat[group_flat_indices_in_province] = rounded_values.astype(np.float64)
+                    
+                    # Clean up province-specific arrays
+                    del province_data_flat, province_group_slice, floors, fractional_parts, rounded_values
                 
                 logger.info(f"  {query}: rounded to match per-group invariants")
             
             # Convert to int64 after all groups are processed (done at the end)
             
+            gc.collect()
+            mem_after_rounding = psutil.virtual_memory().used / (1024**3)
+            logger.info(f"[GROUP {group_idx}] Step 3 complete. Memory: {mem_before_rounding:.2f} -> {mem_after_rounding:.2f} GB")
+            
+            # Clean up group-specific arrays
+            del group_mcc_indices
+            
+            # Final memory summary for this group
             gc.collect()
             mem_end = psutil.virtual_memory().used / (1024**3)
             logger.info(f"[GROUP {group_idx}] Complete. Memory: {mem_start:.2f} -> {mem_end:.2f} GB (delta: {mem_end - mem_start:+.2f} GB)")
@@ -1171,6 +1306,8 @@ class TopDownEngine:
         Args:
             histogram: Histogram with noisy values (modified in-place)
         """
+        import gc
+        
         queries = TransactionHistogram.OUTPUT_QUERIES
         num_provinces = histogram.shape[0]
         num_cities = histogram.shape[1]
@@ -1180,7 +1317,8 @@ class TopDownEngine:
         cells_per_province = num_cities * num_mccs * num_days
         
         for query in queries:
-            noisy_data = histogram.get_query_array(query).astype(np.float64)
+            # MEMORY OPTIMIZATION: Work directly on histogram.data[query] (already float64 from noise step)
+            # No need to create a copy with get_query_array().astype()
             province_invariants = self._province_month_invariants[query]
             
             total_adjusted = 0
@@ -1188,22 +1326,23 @@ class TopDownEngine:
             # Process each province independently
             for p_idx in range(num_provinces):
                 # Get the province slice: shape (city_dim, mcc_dim, day_dim)
-                province_slice = noisy_data[p_idx].flatten()
+                # MEMORY OPTIMIZATION: Use ravel() instead of flatten() to avoid copy when possible
+                province_slice = histogram.data[query][p_idx].ravel()
                 target_sum = float(province_invariants[p_idx])
                 
                 if target_sum <= 0:
                     # Province-month invariant is zero - set all cells to 0
-                    noisy_data[p_idx] = 0
+                    histogram.data[query][p_idx] = 0
                     continue
                 
                 n = len(province_slice)
                 
                 # Step 1: NNLS projection to non-negative orthant
-                # Solve: min ||x - z||² s.t. x ≥ 0
-                A = np.eye(n)
-                b = province_slice
-                
-                x_nnls, residual = nnls(A, b, maxiter=self._nnls_max_iterations)
+                # CRITICAL OPTIMIZATION: NNLS with identity matrix A=I simplifies to clipping!
+                # Original: A = np.eye(n); x_nnls, _ = nnls(A, province_slice)
+                # Simplified: x_nnls = max(province_slice, 0)
+                # This saves creating an n×n matrix (potentially 180 GB!)
+                x_nnls = np.maximum(province_slice, 0)
                 
                 # Step 2: Enforce sum constraint via proportional adjustment
                 current_sum = np.sum(x_nnls)
@@ -1247,14 +1386,19 @@ class TopDownEngine:
                 if diff > 1e-6:
                     total_adjusted += 1
                 
-                # Reshape and store
-                noisy_data[p_idx] = x_adjusted.reshape((num_cities, num_mccs, num_days))
+                # Reshape and store directly in histogram.data
+                histogram.data[query][p_idx] = x_adjusted.reshape((num_cities, num_mccs, num_days))
+                
+                # Clean up province-specific arrays
+                del province_slice, x_nnls, x_adjusted
             
-            # Store float64 data (will be rounded to int64 in next step)
-            histogram.data[query] = noisy_data.astype(np.float64)
+            # Data is already float64, no need to convert
             logger.info(
                 f"  {query}: {total_adjusted}/{num_provinces} provinces adjusted via NNLS"
             )
+            
+            # Force garbage collection after each query
+            gc.collect()
     
     def _controlled_rounding(self, histogram: TransactionHistogram) -> None:
         """
@@ -1276,6 +1420,8 @@ class TopDownEngine:
         Args:
             histogram: Histogram with float values (modified in-place to int64)
         """
+        import gc
+        
         queries = TransactionHistogram.OUTPUT_QUERIES
         num_provinces = histogram.shape[0]
         num_cities = histogram.shape[1]
@@ -1283,14 +1429,17 @@ class TopDownEngine:
         num_days = histogram.shape[3]
         
         for query in queries:
-            data = histogram.get_query_array(query).astype(np.float64)
+            # MEMORY OPTIMIZATION: Work directly on histogram.data[query] (already float64)
+            # No need to create a copy with get_query_array().astype()
             province_invariants = self._province_month_invariants[query]
             
-            rounded_data = np.zeros_like(data, dtype=np.int64)
+            # MEMORY OPTIMIZATION: Allocate rounded_data once
+            rounded_data = np.zeros(histogram.data[query].shape, dtype=np.int64)
             
             for p_idx in range(num_provinces):
                 target_sum = int(province_invariants[p_idx])
-                province_slice = data[p_idx].flatten()
+                # MEMORY OPTIMIZATION: Use ravel() instead of flatten() to avoid copy when possible
+                province_slice = histogram.data[query][p_idx].ravel()
                 n = len(province_slice)
                 
                 if target_sum <= 0:
@@ -1298,10 +1447,9 @@ class TopDownEngine:
                     continue
                 
                 # Floor all values
-                floors = np.floor(province_slice).astype(np.int64)
-                floors = np.maximum(floors, 0)  # Ensure non-negative
-                fractional_parts = province_slice - floors
-                fractional_parts = np.maximum(fractional_parts, 0)  # Handle negative values
+                # MEMORY OPTIMIZATION: Combine operations to avoid intermediate arrays
+                floors = np.maximum(np.floor(province_slice).astype(np.int64), 0)
+                fractional_parts = np.maximum(province_slice - floors, 0)
                 
                 # Compute how many need to round up to match PUBLIC invariant
                 floor_sum = np.sum(floors)
@@ -1385,13 +1533,21 @@ class TopDownEngine:
                         rounded_province[idx] -= 1
                 
                 rounded_data[p_idx] = rounded_province.reshape((num_cities, num_mccs, num_days))
+                
+                # Clean up province-specific arrays
+                del province_slice, floors, fractional_parts, rounded_province
             
-            histogram.set_query_array(query, rounded_data)
+            # MEMORY OPTIMIZATION: Write directly to histogram.data
+            histogram.data[query] = rounded_data.astype(np.int64)
             
             # Verify totals match PUBLIC invariants
             final_total = np.sum(rounded_data)
             invariant_total = np.sum(province_invariants)
             logger.info(f"  {query}: rounded total={final_total:,} (public invariant={invariant_total:,})")
+            
+            # Force garbage collection after each query
+            del rounded_data
+            gc.collect()
     
     def _verify_invariants(self, histogram: TransactionHistogram) -> None:
         """
