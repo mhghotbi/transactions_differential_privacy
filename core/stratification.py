@@ -539,7 +539,7 @@ class StratumManager:
             cells_per_card = stratum_df.groupBy(card_col).agg(
                 F.countDistinct(city_col, mcc_col, day_idx_col).alias("num_cells")
             )
-            max_cells = cells_per_card.agg(F.max("num_cells")).first()[0] or 1
+            max_cells = cells_per_card.agg(F.max(F.col("num_cells"))).first()[0] or 1
             
             # Create stratum
             stratum = Stratum(

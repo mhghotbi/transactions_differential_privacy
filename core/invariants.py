@@ -168,7 +168,7 @@ class InvariantManager:
         
         # National monthly totals (sum across all provinces and days)
         national_agg = df.agg(
-            *[F.sum(q).alias(q) for q in self.QUERIES]
+            *[F.sum(F.col(q)).alias(q) for q in self.QUERIES]
         ).first()
         
         for query in self.QUERIES:
@@ -178,7 +178,7 @@ class InvariantManager:
         
         # Province monthly totals (sum across days within each province)
         province_agg = df.groupBy(province_col).agg(
-            *[F.sum(q).alias(q) for q in self.QUERIES]
+            *[F.sum(F.col(q)).alias(q) for q in self.QUERIES]
         ).collect()
         
         for row in province_agg:

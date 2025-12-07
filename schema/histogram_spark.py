@@ -141,7 +141,7 @@ class SparkHistogram:
             DataFrame with columns: province_idx, <query>_sum
         """
         return self._df.groupBy('province_idx').agg(
-            F.sum(query).alias(f'{query}_sum')
+            F.sum(F.col(query)).alias(f'{query}_sum')
         )
     
     def drop_column(self, col_name: str) -> 'SparkHistogram':
@@ -182,7 +182,7 @@ class SparkHistogram:
         agg_exprs = []
         for query in self.QUERIES:
             if query in self._df.columns:
-                agg_exprs.append(F.sum(query).alias(f'{query}_total'))
+                agg_exprs.append(F.sum(F.col(query)).alias(f'{query}_total'))
         
         # Count is separate (distinct from sum)
         result = self._df.agg(
@@ -277,10 +277,10 @@ class SparkHistogram:
         # Infer dimensions from data (requires small aggregation, not full collect)
         # Use approxCountDistinct for large datasets (faster than countDistinct)
         dims_result = df.agg(
-            F.countDistinct('province_idx').alias('n_prov'),
-            F.countDistinct('city_idx').alias('n_city'),
-            F.countDistinct('mcc_idx').alias('n_mcc'),
-            F.countDistinct('day_idx').alias('n_day')
+            F.countDistinct(F.col('province_idx')).alias('n_prov'),
+            F.countDistinct(F.col('city_idx')).alias('n_city'),
+            F.countDistinct(F.col('mcc_idx')).alias('n_mcc'),
+            F.countDistinct(F.col('day_idx')).alias('n_day')
         ).first()
         
         n_prov = dims_result['n_prov'] if dims_result else 32

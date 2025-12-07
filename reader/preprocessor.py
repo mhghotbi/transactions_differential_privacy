@@ -225,7 +225,7 @@ class TransactionPreprocessor:
         )
         
         # Need day_idx for cell definition, compute it temporarily
-        date_stats = df.agg(F.min('transaction_date').alias('min_date')).first()
+        date_stats = df.agg(F.min(F.col('transaction_date')).alias('min_date')).first()
         min_date = date_stats.min_date
         
         df_with_day = df.withColumn(
@@ -335,8 +335,8 @@ class TransactionPreprocessor:
         # Statistics after winsorization
         stats = df.agg(
             F.count(F.when(F.col('amount') > self._winsorize_cap, 1)).alias('capped_count'),
-            F.sum('amount').alias('original_sum'),
-            F.sum('amount_winsorized').alias('winsorized_sum')
+            F.sum(F.col('amount')).alias('original_sum'),
+            F.sum(F.col('amount_winsorized')).alias('winsorized_sum')
         ).first()
         
         logger.info(f"Global Winsorization: {stats.capped_count:,} transactions capped")
@@ -397,8 +397,8 @@ class TransactionPreprocessor:
         """Create numeric indices for dimensions using Spark SQL (no UDFs)."""
         # Get date range
         date_stats = df.agg(
-            F.min('transaction_date').alias('min_date'),
-            F.max('transaction_date').alias('max_date')
+            F.min(F.col('transaction_date')).alias('min_date'),
+            F.max(F.col('transaction_date')).alias('max_date')
         ).first()
         
         self._min_date = date_stats.min_date
@@ -483,9 +483,9 @@ class TransactionPreprocessor:
             'province_code', 'city_idx', 'mcc_idx', 'day_idx'
         ).agg(
             F.count('*').cast('long').alias('transaction_count'),
-            F.countDistinct('card_number').cast('long').alias('unique_cards'),
-            F.sum('amount_winsorized').cast('long').alias('total_amount'),         # Winsorized (for DP sensitivity)
-            F.sum('amount').cast('long').alias('total_amount_original')             # Original (for invariants)
+            F.countDistinct(F.col('card_number')).cast('long').alias('unique_cards'),
+            F.sum(F.col('amount_winsorized')).cast('long').alias('total_amount'),         # Winsorized (for DP sensitivity)
+            F.sum(F.col('amount')).cast('long').alias('total_amount_original')             # Original (for invariants)
         )
         
         # Rename province_code to province_idx for consistency

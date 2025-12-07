@@ -214,7 +214,7 @@ class GlobalSensitivityCalculator:
         
         # Get max and percentiles
         stats = cells_per_individual.agg(
-            F.max("num_cells").alias("max"),
+            F.max(F.col("num_cells")).alias("max"),
             F.expr("percentile_approx(num_cells, 0.5)").alias("p50"),
             F.expr("percentile_approx(num_cells, 0.9)").alias("p90"),
             F.expr("percentile_approx(num_cells, 0.95)").alias("p95"),
@@ -768,7 +768,7 @@ class StratumSensitivityCalculator:
             cells_per_card = stratum_df.groupBy(card_col).agg(
                 F.countDistinct(*cell_columns).alias("num_cells")
             )
-            max_cells = cells_per_card.agg(F.max("num_cells")).first()[0] or 1
+            max_cells = cells_per_card.agg(F.max(F.col("num_cells"))).first()[0] or 1
             
             # Create stratum sensitivity
             stratum_sens = StratumSensitivity(

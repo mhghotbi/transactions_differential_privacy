@@ -220,7 +220,7 @@ class DistributedPreprocessor:
         )
         
         # Need day_idx for cell definition - compute temporarily
-        date_stats = df.agg(F.min('transaction_date').alias('min_date')).first()
+        date_stats = df.agg(F.min(F.col('transaction_date')).alias('min_date')).first()
         min_date = date_stats.min_date
         
         df = df.withColumn(
@@ -292,7 +292,7 @@ class DistributedPreprocessor:
     def _create_time_index(self, df: DataFrame) -> DataFrame:
         """Create day index from transaction date."""
         # Get min date (single aggregation)
-        min_date = df.agg(F.min('transaction_date')).first()[0]
+        min_date = df.agg(F.min(F.col('transaction_date'))).first()[0]
         
         # Create day index using datediff (pure Spark SQL)
         df = df.withColumn(

@@ -365,7 +365,7 @@ class AdaptiveClipping:
         
         # Compute per-card-per-cell contribution
         card_cell_amounts = df.groupBy([card_col] + cell_cols).agg(
-            F.sum(amount_col).alias("cell_amount")
+            F.sum(F.col(amount_col)).alias("cell_amount")
         )
         
         # Get approximate quantile

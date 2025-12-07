@@ -229,8 +229,8 @@ class SparkTransactionReader:
     def get_date_range(self, df: DataFrame) -> tuple:
         """Get min and max dates from data."""
         stats = df.agg(
-            F.min('transaction_date').alias('min_date'),
-            F.max('transaction_date').alias('max_date')
+            F.min(F.col('transaction_date')).alias('min_date'),
+            F.max(F.col('transaction_date')).alias('max_date')
         ).first()
         
         return stats.min_date, stats.max_date
@@ -244,15 +244,15 @@ class SparkTransactionReader:
         """
         stats = df.agg(
             F.count('*').alias('total_transactions'),
-            F.countDistinct('card_number').alias('unique_cards'),
-            F.countDistinct('acceptor_city').alias('unique_cities'),
-            F.countDistinct('mcc').alias('unique_mccs'),
-            F.sum('amount').alias('total_amount'),
-            F.avg('amount').alias('avg_amount'),
-            F.min('amount').alias('min_amount'),
-            F.max('amount').alias('max_amount'),
-            F.min('transaction_date').alias('min_date'),
-            F.max('transaction_date').alias('max_date')
+            F.countDistinct(F.col('card_number')).alias('unique_cards'),
+            F.countDistinct(F.col('acceptor_city')).alias('unique_cities'),
+            F.countDistinct(F.col('mcc')).alias('unique_mccs'),
+            F.sum(F.col('amount')).alias('total_amount'),
+            F.avg(F.col('amount')).alias('avg_amount'),
+            F.min(F.col('amount')).alias('min_amount'),
+            F.max(F.col('amount')).alias('max_amount'),
+            F.min(F.col('transaction_date')).alias('min_date'),
+            F.max(F.col('transaction_date')).alias('max_date')
         ).first()
         
         return {

@@ -256,13 +256,13 @@ class TopDownSparkEngine:
             # Aggregate to province level (returns ~32 rows)
             # Cast to long to avoid Decimal/BigDecimal reflection warnings
             inv_df = histogram.df.groupBy('province_idx').agg(
-                F.sum(query_col).cast('long').alias('invariant')
+                F.sum(F.col(query_col)).cast('long').alias('invariant')
             ).cache()  # Cache small result (~32 rows = ~1 KB)
             
             self._province_invariants[query] = inv_df
             
             # Log total (triggers cache materialization, but only 32 rows)
-            total_row = inv_df.agg(F.sum('invariant').alias('total')).first()
+            total_row = inv_df.agg(F.sum(F.col('invariant')).alias('total')).first()
             total = total_row['total'] if total_row and total_row['total'] is not None else 0
             num_provinces = inv_df.count()
             
@@ -465,7 +465,7 @@ class TopDownSparkEngine:
                 F.greatest(F.col(query).cast('double'), F.lit(0.0))
             ).withColumn(
                 f'{query}_province_sum',
-                F.sum(f'{query}_clipped').cast('double').over(window)
+                F.sum(F.col(f'{query}_clipped')).over(window).cast('double')
             ).withColumn(
                 adjusted_col,
                 F.when(
@@ -641,7 +641,7 @@ class TopDownSparkEngine:
         
         # Apply rounding per province (distributed)
         logger.info("  Applying controlled rounding per province (distributed)")
-        rounded_df = df.groupby('province_idx').applyInPandas(
+        rounded_df = df.groupBy('province_idx').applyInPandas(
             round_province_group,
             schema=output_schema
         )
@@ -665,7 +665,7 @@ class TopDownSparkEngine:
             # Compute actual province sums
             # Cast to long to avoid Decimal/BigDecimal reflection warnings
             actual = histogram.df.groupBy('province_idx').agg(
-                F.sum(query).cast('long').alias('actual_sum')
+                F.sum(F.col(query)).cast('long').alias('actual_sum')
             )
             
             # Join with expected invariants

@@ -165,8 +165,8 @@ class BoundedContributionCalculator:
         
         # Compute statistics
         stats = cell_counts.select(
-            F.min('tx_count').alias('min'),
-            F.max('tx_count').alias('max'),
+            F.min(F.col('tx_count')).alias('min'),
+            F.max(F.col('tx_count')).alias('max'),
             F.mean('tx_count').alias('mean'),
             F.stddev('tx_count').alias('stddev'),
             F.expr('percentile_approx(tx_count, 0.25)').alias('q1'),
@@ -342,8 +342,8 @@ class BoundedContributionCalculator:
             else:
                 # Compute statistics for this group
                 stats = cell_counts.select(
-                    F.min('tx_count').alias('min'),
-                    F.max('tx_count').alias('max'),
+                    F.min(F.col('tx_count')).alias('min'),
+                    F.max(F.col('tx_count')).alias('max'),
                     F.mean('tx_count').alias('mean'),
                     F.stddev('tx_count').alias('stddev'),
                     F.expr('percentile_approx(tx_count, 0.25)').alias('q1'),
