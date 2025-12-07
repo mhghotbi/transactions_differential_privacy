@@ -266,29 +266,65 @@ def discrete_gaussian_vector(
     Returns:
         List or array of Discrete Gaussian samples
     """
+    import psutil
+    logger.info(f"[DG_VECTOR] Entry: size={size:,}, sigma^2={float(sigma_sq):.4f}, use_fast={use_fast_approximation}")
+    
     sigma_sq_float = float(sigma_sq)
     
     # For large arrays OR large sigma, use fast approximation
     # The Discrete Gaussian converges to continuous Gaussian for large sigma
     # For sigma^2 > 1, the approximation error is negligible
     if use_fast_approximation and (size > 1000 or sigma_sq_float > 1.0):
+        logger.info(f"[DG_VECTOR] Using FAST approximation (size={size:,} > 1000 or sigma^2={sigma_sq_float:.4f} > 1.0)")
+        
         # Use NumPy for fast vectorized sampling
         # Sample from continuous Gaussian and round to nearest integer
+        mem_before = psutil.virtual_memory().percent
+        logger.info(f"[DG_VECTOR] Computing sigma = sqrt({sigma_sq_float:.4f})...")
         sigma = np.sqrt(sigma_sq_float)
+        logger.info(f"[DG_VECTOR] ✓ sigma = {sigma:.4f}")
+        
+        logger.info(f"[DG_VECTOR] Sampling {size:,} values from N(0, {sigma:.4f})...")
         samples = np.random.normal(0, sigma, size)
-        return np.round(samples).astype(np.int64)
+        samples_size_mb = samples.nbytes / (1024**2)
+        logger.info(f"[DG_VECTOR] ✓ Samples created ({samples_size_mb:.1f} MB)")
+        
+        mem_after_sample = psutil.virtual_memory().percent
+        logger.info(f"[DG_VECTOR] Memory after sampling: {mem_after_sample:.1f}% (+{mem_after_sample - mem_before:.1f}%)")
+        
+        logger.info(f"[DG_VECTOR] Rounding and converting to int64...")
+        result = np.round(samples).astype(np.int64)
+        result_size_mb = result.nbytes / (1024**2)
+        logger.info(f"[DG_VECTOR] ✓ Rounded to int64 ({result_size_mb:.1f} MB)")
+        
+        mem_final = psutil.virtual_memory().percent
+        logger.info(f"[DG_VECTOR] Final memory: {mem_final:.1f}% (total delta: +{mem_final - mem_before:.1f}%)")
+        logger.info(f"[DG_VECTOR] Returning {size:,} samples")
+        
+        return result
     
     # For small arrays with small sigma, use exact sampling
+    logger.info(f"[DG_VECTOR] Using EXACT sampling (size={size:,} <= 1000 and sigma^2={sigma_sq_float:.4f} <= 1.0)")
+    
     if rng is None:
+        logger.info(f"[DG_VECTOR] Initializing RNG...")
         rng = get_rng()
+        logger.info(f"[DG_VECTOR] ✓ RNG initialized")
     
     # Convert to fraction if needed
     if isinstance(sigma_sq, float):
+        logger.info(f"[DG_VECTOR] Converting sigma^2 to fraction...")
         sigma_sq = Fraction(sigma_sq).limit_denominator(1000000)
+        logger.info(f"[DG_VECTOR] ✓ sigma^2 = {sigma_sq.numerator}/{sigma_sq.denominator}")
     
     n, d = sigma_sq.numerator, sigma_sq.denominator
     
-    return [discrete_gaussian_scalar((n, d), rng) for _ in range(size)]
+    logger.info(f"[DG_VECTOR] Sampling {size:,} values using exact discrete_gaussian_scalar...")
+    logger.info(f"[DG_VECTOR] WARNING: This may be SLOW for large size!")
+    result = [discrete_gaussian_scalar((n, d), rng) for _ in range(size)]
+    logger.info(f"[DG_VECTOR] ✓ Exact sampling complete")
+    
+    return result
 
 
 # ============================================================================
@@ -396,23 +432,46 @@ class DiscreteGaussianMechanism(DPMechanism):
         shape = true_answer.shape
         size = int(np.prod(shape))
         
-        logger.info(f"Sampling {size:,} Discrete Gaussian values with sigma^2={float(sigma_sq):.4f}")
+        logger.info(f"[NOISE INIT] Preparing to sample {size:,} Discrete Gaussian values")
+        logger.info(f"[NOISE INIT] sigma^2={float(sigma_sq):.4f}, use_fast_sampling={use_fast_sampling}")
+        
+        # Memory checkpoint before sampling
+        import psutil
+        mem_before = psutil.virtual_memory().percent
+        mem_before_gb = psutil.virtual_memory().used / (1024**3)
+        logger.info(f"[NOISE MEMORY] Before sampling: {mem_before:.1f}% used ({mem_before_gb:.2f} GB)")
         
         # Use fast sampling for large arrays
+        logger.info(f"[NOISE SAMPLING] Starting discrete_gaussian_vector()...")
         perturbations = discrete_gaussian_vector(
             sigma_sq, size, 
             rng=None,
             use_fast_approximation=use_fast_sampling
         )
+        logger.info(f"[NOISE SAMPLING] ✓ Sampling complete")
         
+        # Memory checkpoint after sampling
+        mem_after = psutil.virtual_memory().percent
+        mem_after_gb = psutil.virtual_memory().used / (1024**3)
+        mem_delta_gb = mem_after_gb - mem_before_gb
+        logger.info(f"[NOISE MEMORY] After sampling: {mem_after:.1f}% used ({mem_after_gb:.2f} GB, +{mem_delta_gb:.2f} GB)")
+        
+        logger.info(f"[NOISE RESHAPE] Reshaping perturbations to {shape}...")
         if isinstance(perturbations, list):
             perturbations = np.array(perturbations)
         perturbations = perturbations.reshape(shape)
+        logger.info(f"[NOISE RESHAPE] ✓ Reshape complete")
         
         # Apply noise
+        logger.info(f"[NOISE APPLY] Adding noise to true answer...")
         protected_answer = true_answer + perturbations
+        logger.info(f"[NOISE APPLY] ✓ Noise applied")
         
-        logger.info(f"Noise sampling complete")
+        # Final memory checkpoint
+        mem_final = psutil.virtual_memory().percent
+        mem_final_gb = psutil.virtual_memory().used / (1024**3)
+        logger.info(f"[NOISE MEMORY] After applying noise: {mem_final:.1f}% used ({mem_final_gb:.2f} GB)")
+        logger.info(f"[NOISE COMPLETE] ✓ DiscreteGaussianMechanism initialization complete")
         
         # Initialize base class
         super().__init__(

@@ -229,6 +229,14 @@ class Config:
                 config.privacy.sensitivity_method = sec['sensitivity_method']
             if 'fixed_max_cells_per_card' in sec:
                 config.privacy.fixed_max_cells_per_card = int(sec['fixed_max_cells_per_card'])
+            
+            # Parse MCC grouping settings
+            if 'mcc_grouping_enabled' in sec:
+                config.privacy.mcc_grouping_enabled = sec.getboolean('mcc_grouping_enabled')
+            if 'mcc_num_groups' in sec:
+                config.privacy.mcc_num_groups = int(sec['mcc_num_groups'])
+            if 'mcc_group_cap_percentile' in sec:
+                config.privacy.mcc_group_cap_percentile = float(sec['mcc_group_cap_percentile'])
         
         # Load data section
         if 'data' in parser:

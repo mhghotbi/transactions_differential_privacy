@@ -34,6 +34,7 @@ from typing import Dict, Optional, Any, Tuple
 from fractions import Fraction
 
 import numpy as np
+import psutil  # For memory monitoring
 from scipy.optimize import nnls
 from pyspark.sql import SparkSession
 
@@ -363,51 +364,99 @@ class TopDownEngine:
         total_rho = float(self.budget.total_rho)
         
         for idx, query in enumerate(queries):
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Processing query [{idx+1}/{total_queries}]: {query}")
+            logger.info(f"{'='*60}")
+            
+            # Memory checkpoint 1
+            mem_pct = psutil.virtual_memory().percent
+            mem_used_gb = psutil.virtual_memory().used / (1024**3)
+            logger.info(f"[MEMORY] Start of query: {mem_pct:.1f}% used ({mem_used_gb:.2f} GB)")
+            
             # Get query's share of budget
             query_weight = self.config.privacy.query_split.get(query, 1.0 / total_queries)
             rho = Fraction(total_rho * query_weight).limit_denominator(10000)
+            logger.info(f"[BUDGET] Query budget: ρ={float(rho):.6f}")
             
-            # Get original data before modification
-            original_data = histogram.get_query_array(query).copy()
+            # Store original total before modification (for both stratified and standard paths)
+            original_total = np.sum(histogram.data[query])
             
             # Use stratified noise for total_amount if MCC grouping enabled
             if query == 'total_amount' and self._mcc_grouping_enabled:
-                logger.info(f"  [{idx+1}/{total_queries}] {query}: Stratified noise by MCC group")
-                noisy_data = self._apply_stratified_amount_noise(
-                    histogram, original_data, rho, has_data_mask
+                logger.info(f"[STEP 1] Applying stratified noise by MCC group (in-place)...")
+                self._apply_stratified_amount_noise_inplace(
+                    histogram, query, rho, has_data_mask
                 )
+                logger.info(f"[STEP 1] ✓ Stratified noise applied")
             else:
-                # Standard noise for counting queries
+                # Standard noise for counting queries (PER-PROVINCE to avoid OOM)
+                logger.info(f"[STEP 1] Computing sensitivity...")
                 sensitivity = self._get_sensitivity(query)
                 sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
+                logger.info(f"[STEP 1] ✓ Δ₂={sensitivity:.2f}, σ={sigma:.2f}")
                 
-                logger.info(
-                    f"  [{idx+1}/{total_queries}] {query}: "
-                    f"ρ={float(rho):.6f}, Δ₂={sensitivity:.2f}, σ={sigma:.2f}"
-                )
+                # Memory checkpoint before processing
+                mem_pct = psutil.virtual_memory().percent
+                mem_used_gb = psutil.virtual_memory().used / (1024**3)
+                logger.info(f"[MEMORY] Before per-province processing: {mem_pct:.1f}% used ({mem_used_gb:.2f} GB)")
                 
-                # Create output array (copy of original for noise addition)
-                noisy_data = original_data.astype(np.float64).copy()
+                # PROCESS EACH PROVINCE SEPARATELY to avoid OOM (108 MB vs 93 GB)
+                num_provinces = histogram.shape[0]
+                logger.info(f"[STEP 2] Processing {num_provinces} provinces separately (avoids 93 GB allocation)...")
                 
-                # Only add noise to cells with actual data
-                if num_data_cells > 0:
-                    data_values = original_data[has_data_mask].astype(np.float64)
+                for p_idx in range(num_provinces):
+                    # Extract province slice (108 MB for 1500 cities × 300 MCCs × 30 days)
+                    province_data = histogram.data[query][p_idx].copy()
+                    province_mask = has_data_mask[p_idx]
+                    province_cells = np.sum(province_mask)
+                    
+                    if province_cells == 0:
+                        # No data in this province, skip
+                        continue
+                    
+                    logger.info(f"[PROVINCE {p_idx+1}/{num_provinces}] Processing {province_cells:,} cells...")
+                    
+                    # Convert this small province slice to float64 (108 MB)
+                    province_data = province_data.astype(np.float64)
+                    
+                    # Extract sparse data for this province only
+                    data_values = province_data[province_mask].astype(np.int64)
+                    
+                    # Sample noise for this province
                     noisy_values = add_discrete_gaussian_noise(
-                        data_values.astype(np.int64),
+                        data_values,
                         rho=rho,
                         sensitivity=sensitivity,
                         use_fast_sampling=True
                     )
-                    noisy_data[has_data_mask] = noisy_values
+                    
+                    # Write back to province slice
+                    province_data[province_mask] = noisy_values.astype(np.float64)
+                    
+                    # Write province back to histogram
+                    histogram.data[query][p_idx] = province_data
+                    
+                    # Clean up
+                    del province_data, data_values, noisy_values
+                    
+                    logger.info(f"[PROVINCE {p_idx+1}/{num_provinces}] ✓ Complete")
+                
+                logger.info(f"[STEP 2] ✓ All {num_provinces} provinces processed")
+                
+                # Memory checkpoint after processing
+                mem_pct = psutil.virtual_memory().percent
+                mem_used_gb = psutil.virtual_memory().used / (1024**3)
+                logger.info(f"[MEMORY] After per-province processing: {mem_pct:.1f}% used ({mem_used_gb:.2f} GB)")
             
-            # Update histogram in-place (keep as float for NNLS)
-            # Note: We store float64 temporarily for NNLS processing
-            # This will be converted to int64 after controlled rounding
-            histogram.data[query] = noisy_data.astype(np.float64)
+            # Compute totals
+            noisy_total = np.sum(histogram.data[query])
+            logger.info(f"[RESULT] Total: {original_total:,} -> {noisy_total:,.0f}")
             
-            original_total = np.sum(original_data)
-            noisy_total = np.sum(noisy_data)
-            logger.info(f"    Total: {original_total:,} -> {noisy_total:,.0f}")
+            # Memory checkpoint 6
+            mem_pct = psutil.virtual_memory().percent
+            mem_used_gb = psutil.virtual_memory().used / (1024**3)
+            logger.info(f"[MEMORY] End of query: {mem_pct:.1f}% used ({mem_used_gb:.2f} GB)")
+            logger.info(f"{'='*60}\n")
     
     def _apply_stratified_amount_noise(
         self,
@@ -421,11 +470,21 @@ class TopDownEngine:
         
         Uses parallel composition: each MCC group gets full budget rho.
         """
+        logger.info(f"[STRATIFIED] Starting stratified noise for total_amount...")
+        
+        mem_pct = psutil.virtual_memory().percent
+        mem_used_gb = psutil.virtual_memory().used / (1024**3)
+        logger.info(f"[STRATIFIED MEMORY] Entry: {mem_pct:.1f}% used ({mem_used_gb:.2f} GB)")
+        
+        logger.info(f"[STRATIFIED] Creating noisy_data copy (float64)...")
         noisy_data = original_data.astype(np.float64).copy()
+        logger.info(f"[STRATIFIED] ✓ Noisy data created: {noisy_data.shape}")
         
         mcc_labels = histogram.dimensions['mcc'].labels or []
+        logger.info(f"[STRATIFIED] Processing {len(mcc_labels)} MCC codes across {len(self._mcc_group_caps)} groups")
         
         # Build MCC index to group mapping
+        logger.info(f"[STRATIFIED] Building MCC index to group mapping...")
         mcc_idx_to_group = {}
         for mcc_idx, mcc_code in enumerate(mcc_labels):
             if mcc_code in self._mcc_to_group:
@@ -435,49 +494,178 @@ class TopDownEngine:
         
         d_max = self._d_max or 1
         sqrt_d = math.sqrt(d_max)
+        logger.info(f"[STRATIFIED] ✓ MCC mapping complete: {len(mcc_idx_to_group)} MCC indices mapped")
+        logger.info(f"[STRATIFIED] User-level D_max={d_max}, sqrt(D_max)={sqrt_d:.2f}")
         
-        for group_id, group_cap in self._mcc_group_caps.items():
+        total_groups = len(self._mcc_group_caps)
+        logger.info(f"[STRATIFIED] Processing {total_groups} MCC groups...")
+        
+        for group_idx, (group_id, group_cap) in enumerate(self._mcc_group_caps.items()):
+            logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] Group ID={group_id}")
+            
             group_mcc_indices = [
                 mcc_idx for mcc_idx, g_id in mcc_idx_to_group.items()
                 if g_id == group_id
             ]
             
             if not group_mcc_indices:
+                logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] No MCCs in this group, skipping")
                 continue
             
             sensitivity = sqrt_d * group_cap
             sigma = math.sqrt(sensitivity**2 / (2 * float(rho)))
             
+            logger.info(f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] Counting data cells...")
             group_data_cells = sum(
                 np.sum(has_data_mask[:, :, mcc_idx, :])
                 for mcc_idx in group_mcc_indices
             )
             
             logger.info(
-                f"    Group {group_id}: {len(group_mcc_indices)} MCCs, "
-                f"cap={group_cap:,.0f}, Δ₂={sensitivity:,.0f}, σ={sigma:,.0f}"
+                f"[STRATIFIED GROUP {group_idx+1}/{total_groups}] {len(group_mcc_indices)} MCCs, "
+                f"{group_data_cells:,} data cells, cap={group_cap:,.0f}, Δ₂={sensitivity:,.0f}, σ={sigma:,.0f}"
             )
             
-            for mcc_idx in group_mcc_indices:
+            mem_pct = psutil.virtual_memory().percent
+            logger.info(f"[STRATIFIED MEMORY] Before group {group_id} MCC loop: {mem_pct:.1f}%")
+            
+            for mcc_num, mcc_idx in enumerate(group_mcc_indices):
+                logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] Processing MCC index {mcc_idx}...")
+                
                 mcc_mask = has_data_mask[:, :, mcc_idx, :]
-                if np.sum(mcc_mask) == 0:
+                mcc_cells = np.sum(mcc_mask)
+                
+                if mcc_cells == 0:
+                    logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] No data cells, skipping")
                     continue
                 
+                logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] {mcc_cells:,} data cells found")
+                
                 # Get the slice first to avoid chained indexing issues
+                logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] Extracting data slice...")
                 data_slice = original_data[:, :, mcc_idx, :]
                 noisy_slice = noisy_data[:, :, mcc_idx, :]
+                logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] ✓ Slices extracted")
                 
                 # Apply DISCRETE Gaussian noise (Census 2020 DAS requirement)
+                logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] Converting {mcc_cells:,} values to int64...")
                 data_values = data_slice[mcc_mask].astype(np.int64)
+                logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] ✓ Converted to int64")
+                
+                logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] Sampling noise for {mcc_cells:,} values...")
                 noisy_values = add_discrete_gaussian_noise(
                     data_values,
                     rho=rho,
                     sensitivity=sensitivity,
                     use_fast_sampling=True
                 )
+                logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] ✓ Noise sampled")
+                
+                logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] Writing noisy values back...")
                 noisy_slice[mcc_mask] = noisy_values
+                logger.info(f"[STRATIFIED MCC {mcc_num+1}/{len(group_mcc_indices)}] ✓ Complete")
         
+        logger.info(f"[STRATIFIED] ✓ All groups processed, returning noisy data")
         return noisy_data
+    
+    def _apply_stratified_amount_noise_inplace(
+        self,
+        histogram: TransactionHistogram,
+        query: str,
+        rho: Fraction,
+        has_data_mask: np.ndarray
+    ) -> None:
+        """
+        Apply stratified noise to total_amount by MCC group (PER-PROVINCE).
+        
+        Uses parallel composition: each MCC group gets full budget rho.
+        Processes each province separately to avoid OOM.
+        """
+        logger.info(f"[STRATIFIED] Starting stratified noise for {query} (per-province)...")
+        
+        mem_pct = psutil.virtual_memory().percent
+        mem_used_gb = psutil.virtual_memory().used / (1024**3)
+        logger.info(f"[STRATIFIED MEMORY] Entry: {mem_pct:.1f}% used ({mem_used_gb:.2f} GB)")
+        
+        mcc_labels = histogram.dimensions['mcc'].labels or []
+        logger.info(f"[STRATIFIED] Processing {len(mcc_labels)} MCC codes across {len(self._mcc_group_caps)} groups")
+        
+        # Build MCC index to group mapping
+        logger.info(f"[STRATIFIED] Building MCC index to group mapping...")
+        mcc_idx_to_group = {}
+        for mcc_idx, mcc_code in enumerate(mcc_labels):
+            if mcc_code in self._mcc_to_group:
+                mcc_idx_to_group[mcc_idx] = self._mcc_to_group[mcc_code]
+            else:
+                mcc_idx_to_group[mcc_idx] = max(self._mcc_group_caps.keys()) if self._mcc_group_caps else 0
+        
+        d_max = self._d_max or 1
+        sqrt_d = math.sqrt(d_max)
+        logger.info(f"[STRATIFIED] ✓ MCC mapping complete: {len(mcc_idx_to_group)} MCC indices mapped")
+        logger.info(f"[STRATIFIED] User-level D_max={d_max}, sqrt(D_max)={sqrt_d:.2f}")
+        
+        # PROCESS EACH PROVINCE SEPARATELY to avoid OOM
+        num_provinces = histogram.shape[0]
+        logger.info(f"[STRATIFIED] Processing {num_provinces} provinces separately...")
+        
+        for p_idx in range(num_provinces):
+            province_mask = has_data_mask[p_idx]
+            if not np.any(province_mask):
+                continue
+            
+            logger.info(f"[STRATIFIED PROVINCE {p_idx+1}/{num_provinces}] Processing...")
+            
+            # Extract province slice (108 MB)
+            province_data = histogram.data[query][p_idx].copy()
+            
+            # Convert to float64
+            province_data = province_data.astype(np.float64)
+            
+            # Process each MCC group for this province
+            for group_id, group_cap in self._mcc_group_caps.items():
+                group_mcc_indices = [
+                    mcc_idx for mcc_idx, g_id in mcc_idx_to_group.items()
+                    if g_id == group_id
+                ]
+                
+                if not group_mcc_indices:
+                    continue
+                
+                sensitivity = sqrt_d * group_cap
+                
+                # Process each MCC in this group
+                for mcc_idx in group_mcc_indices:
+                    mcc_mask = province_mask[:, mcc_idx, :]
+                    mcc_cells = np.sum(mcc_mask)
+                    
+                    if mcc_cells == 0:
+                        continue
+                    
+                    # Extract sparse data for this MCC in this province
+                    data_values = province_data[:, mcc_idx, :][mcc_mask].astype(np.int64)
+                    
+                    # Sample noise
+                    noisy_values = add_discrete_gaussian_noise(
+                        data_values,
+                        rho=rho,
+                        sensitivity=sensitivity,
+                        use_fast_sampling=True
+                    )
+                    
+                    # Write back to province slice (avoid chained indexing)
+                    mcc_slice = province_data[:, mcc_idx, :]
+                    mcc_slice[mcc_mask] = noisy_values.astype(np.float64)
+                    province_data[:, mcc_idx, :] = mcc_slice
+                    
+                    del data_values, noisy_values, mcc_slice
+            
+            # Write province back to histogram
+            histogram.data[query][p_idx] = province_data
+            del province_data
+            
+            logger.info(f"[STRATIFIED PROVINCE {p_idx+1}/{num_provinces}] ✓ Complete")
+        
+        logger.info(f"[STRATIFIED] ✓ All {num_provinces} provinces processed")
     
     def _nnls_post_process(self, histogram: TransactionHistogram) -> None:
         """
