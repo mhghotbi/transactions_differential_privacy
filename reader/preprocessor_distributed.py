@@ -159,20 +159,40 @@ class DistributedPreprocessor:
         """
         Compute MCC groups for stratified sensitivity and per-group processing.
         
-        Groups MCCs by order of magnitude of typical transaction amounts.
+        Uses either:
+        - median_only: Groups by log10(median_amount) only (original method)
+        - multifactor: Groups using multiple features with hierarchical clustering
+        
         Uses parallel composition - each group gets full privacy budget.
         """
-        from core.mcc_groups import compute_mcc_groups_spark
+        from core.mcc_groups import compute_mcc_groups_spark, compute_mcc_groups_multifactor
         
         logger.info("Computing MCC groups for stratified sensitivity...")
+        logger.info(f"Method: {self.config.privacy.mcc_grouping_method}")
         
-        self._mcc_grouping = compute_mcc_groups_spark(
-            df=df,
-            mcc_col='mcc',
-            amount_col='amount',
-            num_groups=self.config.privacy.mcc_num_groups,
-            cap_percentile=self.config.privacy.mcc_group_cap_percentile
-        )
+        if self.config.privacy.mcc_grouping_method == 'multifactor':
+            # Multi-factor grouping with hierarchical clustering
+            self._mcc_grouping = compute_mcc_groups_multifactor(
+                df=df,
+                mcc_col='mcc',
+                amount_col='amount',
+                date_col=self.config.data.date_column,
+                num_groups=self.config.privacy.mcc_num_groups,
+                adaptive=self.config.privacy.mcc_grouping_adaptive,
+                min_groups=self.config.privacy.mcc_min_groups,
+                max_groups=self.config.privacy.mcc_max_groups,
+                min_mccs_per_group=self.config.privacy.mcc_min_mccs_per_group,
+                cap_percentile=self.config.privacy.mcc_group_cap_percentile
+            )
+        else:
+            # Original median-only grouping
+            self._mcc_grouping = compute_mcc_groups_spark(
+                df=df,
+                mcc_col='mcc',
+                amount_col='amount',
+                num_groups=self.config.privacy.mcc_num_groups,
+                cap_percentile=self.config.privacy.mcc_group_cap_percentile
+            )
         
         # Store in config for use by TopDownEngine
         self.config.privacy.mcc_to_group = self._mcc_grouping.mcc_to_group

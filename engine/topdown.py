@@ -577,22 +577,25 @@ class TopDownEngine:
     
     def _process_per_mcc_group(self, histogram: TransactionHistogram) -> None:
         """
-        Process each MCC group through ALL steps before moving to next group.
+        Process each (province, MCC group) combination through ALL steps.
         
-        PARALLEL COMPOSITION MEMORY OPTIMIZATION:
-        Each MCC group goes through: Noise → NNLS → Rounding completely
-        before the next group is processed.
+        PARALLEL COMPOSITION AT (PROVINCE, MCC_GROUP) LEVEL:
+        Each (province, mcc_group) is FULLY DISJOINT - a transaction belongs to:
+        - Exactly ONE province
+        - Exactly ONE MCC group
+        
+        Therefore each (province, mcc_group) pair gets FULL privacy budget ρ.
         
         This ensures:
-        1. Memory for temporary arrays is freed between groups
-        2. Each group uses FULL privacy budget (parallel composition)
-        3. Per-group invariants ensure province sums match public data
+        1. Parallel composition: each (p, g) gets full budget independently
+        2. Province invariants automatically preserved within each group
+        3. Memory efficient: process group-by-group, province-by-province
         
         MATHEMATICAL JUSTIFICATION:
-        - MCC groups are DISJOINT: each transaction belongs to exactly ONE group
+        - (province, mcc_group) pairs are DISJOINT
         - Per-group invariants: Y_p^g = Σ_{city,mcc∈g,day} x_{p,city,mcc,day}
         - Global invariant: Y_p = Σ_g Y_p^g (automatically satisfied)
-        - Each group processed independently with full budget ρ
+        - Each (province, group) processed independently with full budget ρ
         """
         import gc
         
@@ -603,6 +606,9 @@ class TopDownEngine:
         
         # Get histogram dimensions
         n_prov, n_city, n_mcc, n_day = histogram.shape
+        
+        # Get province labels for logging
+        province_labels = histogram.dimensions['province'].labels or [str(i) for i in range(n_prov)]
         
         # Build MCC index to group mapping
         mcc_labels = histogram.dimensions['mcc'].labels or []
@@ -616,23 +622,21 @@ class TopDownEngine:
         group_ids = sorted(set(mcc_idx_to_group.values()))
         num_groups = len(group_ids)
         
-        logger.info(f"Processing {num_groups} MCC groups through ALL steps")
-        logger.info(f"Each group: Noise → NNLS → Rounding (full pipeline)")
+        logger.info(f"Processing {num_groups} MCC groups × {n_prov} provinces = {num_groups * n_prov} (province, group) pairs")
+        logger.info(f"Each (province, group): Noise → NNLS → Rounding (full pipeline)")
+        logger.info(f"Each (province, group) gets FULL budget ρ via parallel composition")
         
         # Get contribution bound K
         K = self.config.privacy.computed_contribution_bound or 1
         d_max = self._d_max or 1
         sqrt_d = math.sqrt(d_max)
         
-        # Process each MCC group through ALL steps
+        # Process each MCC group
         for group_idx, group_id in enumerate(group_ids, 1):
             logger.info("")
             logger.info("=" * 70)
-            logger.info(f"MCC GROUP {group_idx}/{num_groups} (ID={group_id}): Starting full pipeline")
+            logger.info(f"MCC GROUP {group_idx}/{num_groups} (ID={group_id})")
             logger.info("=" * 70)
-            
-            mem_start = psutil.virtual_memory().used / (1024**3)
-            logger.info(f"[MEMORY] Group start: {mem_start:.2f} GB")
             
             # Find MCC indices in this group
             group_mcc_indices = np.array([
@@ -657,7 +661,7 @@ class TopDownEngine:
             
             # CRITICAL MEMORY FIX: Pre-compute province mask template
             # Boolean indexing province_data[:, mcc_mask, :] creates copies!
-            # Instead, use flat indices approach like Step 1
+            # Instead, use flat indices approach
             province_mask_template = np.zeros((n_city, n_mcc, n_day), dtype=bool)
             province_mask_template[:, mcc_mask, :] = True
             group_flat_indices_in_province = np.where(province_mask_template.ravel())[0]
@@ -665,127 +669,131 @@ class TopDownEngine:
             logger.info(f"[GROUP {group_idx}] Pre-computed flat indices: {num_cells_per_province_group:,} cells per province")
             
             # ================================================================
-            # STEP 1: Apply noise to this group's cells (all queries)
-            # MEMORY OPTIMIZATION: Use flat indices, NOT full-sized masks
+            # Process each PROVINCE within this MCC group
+            # Each (province, group) gets FULL budget via parallel composition
             # ================================================================
-            logger.info(f"[GROUP {group_idx}] Step 1: Noise application")
             
-            # Pre-compute FLAT INDICES for this group's data cells ONCE
-            # This avoids creating full-sized masks/slices that double memory
-            mem_before_indices = psutil.virtual_memory().used / (1024**3)
-            
-            # Get all data cell flat indices from the mask
-            data_indices = np.where(has_data_mask.ravel())[0]
-            
-            # Compute MCC index for each data cell using flat index math
-            # flat_idx = prov * (n_city * n_mcc * n_day) + city * (n_mcc * n_day) + mcc * n_day + day
-            # mcc_idx = (flat_idx // n_day) % n_mcc
-            mcc_indices_for_data = (data_indices // n_day) % n_mcc
-            
-            # Find data cells whose MCC belongs to this group
-            group_mcc_set = set(group_mcc_indices)
-            group_cell_mask = np.isin(mcc_indices_for_data, list(group_mcc_set))
-            group_flat_indices = data_indices[group_cell_mask]
-            num_group_cells = len(group_flat_indices)
-            
-            # Clean up temporary arrays
-            del data_indices, mcc_indices_for_data, group_cell_mask
-            gc.collect()
-            
-            mem_after_indices = psutil.virtual_memory().used / (1024**3)
-            logger.info(f"[GROUP {group_idx}] Flat indices: {num_group_cells:,} cells (mem: {mem_before_indices:.2f} -> {mem_after_indices:.2f} GB)")
-            
-            if num_group_cells == 0:
-                logger.info(f"[GROUP {group_idx}] No data cells in this group, skipping noise")
-            else:
+            # ================================================================
+            # Process each PROVINCE within this group
+            # Each (province, group) gets FULL budget via parallel composition
+            # ================================================================
+            for p_idx in range(n_prov):
+                province_name = province_labels[p_idx] if p_idx < len(province_labels) else str(p_idx)
+                
+                logger.info(f"[GROUP {group_idx}, PROVINCE {p_idx+1}/{n_prov}: {province_name}]")
+                
+                mem_start_prov = psutil.virtual_memory().used / (1024**3)
+                
+                # Get per-group invariant for this province
+                group_invariants = {}
+                for query in queries:
+                    if query in self._per_group_invariants and group_id in self._per_group_invariants[query]:
+                        group_invariants[query] = float(self._per_group_invariants[query][group_id][p_idx])
+                    else:
+                        group_invariants[query] = 0.0
+                
+                # Skip if no data in this (province, group)
+                if all(inv <= 0 for inv in group_invariants.values()):
+                    logger.info(f"  No data in this (province, group), skipping")
+                    continue
+                
+                # ================================================================
+                # STEP 1: Apply noise to cells in this (province, group)
+                # Each (province, group) gets FULL privacy budget ρ
+                # ================================================================
+                
+                # Get flat indices for cells in this (province, group)
+                # Province slice: p_idx * (n_city * n_mcc * n_day)
+                province_offset = p_idx * (n_city * n_mcc * n_day)
+                province_flat_indices = province_offset + group_flat_indices_in_province
+                
+                # Filter to only cells with data
+                province_has_data = has_data_mask[p_idx].ravel()[group_flat_indices_in_province]
+                province_group_data_indices = group_flat_indices_in_province[province_has_data]
+                num_data_cells = len(province_group_data_indices)
+                
+                if num_data_cells == 0:
+                    logger.info(f"  No data cells, skipping noise")
+                    # Set all cells to 0
+                    for query in queries:
+                        histogram.data[query][p_idx].ravel()[group_flat_indices_in_province] = 0.0
+                    continue
+                
+                logger.info(f"  {num_data_cells:,} data cells in this (province, group)")
+                
+                # Compute D_max for this (province, group) - conservative estimate
+                # D_max_prov_group = min(global d_max, num_data_cells in this province-group)
+                global_d_max = self._d_max or 1
+                province_group_d_max = min(global_d_max, num_data_cells)
+                province_group_d_max = max(1, province_group_d_max)
+                sqrt_d_prov_group = math.sqrt(province_group_d_max)
+                
+                # Apply noise to each query
                 for query_idx, query in enumerate(queries):
                     query_weight = self.config.privacy.query_split.get(query, 1.0 / total_queries)
                     rho = Fraction(total_rho * query_weight).limit_denominator(10000)
                     
-                    # Compute sensitivity for this group
+                    # Compute sensitivity for this (province, group)
                     if query == 'total_amount':
-                        sensitivity = sqrt_d * group_cap
+                        sensitivity = sqrt_d_prov_group * group_cap
                     else:
-                        sensitivity = sqrt_d * K
+                        sensitivity = sqrt_d_prov_group * K
                     
                     sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
                     
-                    logger.info(f"  {query}: {num_group_cells:,} cells, ρ={float(rho):.4f}, Δ₂={sensitivity:.2f}, σ={sigma:.2f}")
-                    
-                    # Memory before noise
-                    mem_before_noise = psutil.virtual_memory().used / (1024**3)
-                    logger.info(f"  [MEMORY] Before sampling: {mem_before_noise:.2f} GB")
+                    logger.info(f"  {query}: ρ={float(rho):.4f}, D_max={province_group_d_max}, Δ₂={sensitivity:.2f}, σ={sigma:.2f}")
                     
                     # Convert to float64 if needed (in-place on full array, done once)
                     if histogram.data[query].dtype != np.float64:
                         histogram.data[query] = histogram.data[query].astype(np.float64)
                     
-                    # Flatten data array for direct indexing (VIEW, not copy)
-                    flat_data = histogram.data[query].ravel()
+                    # Get province data view
+                    province_data_flat = histogram.data[query][p_idx].ravel()
                     
-                    # Extract data values using flat indices (minimal memory: just group cells)
-                    data_values = flat_data[group_flat_indices].astype(np.int64)
+                    # Extract data values using flat indices (only data cells)
+                    data_values = province_data_flat[province_group_data_indices].astype(np.int64)
                     
-                    # Apply noise
+                    # Apply noise with FULL budget (parallel composition)
                     noisy_values = add_discrete_gaussian_noise(
                         data_values, rho=rho, sensitivity=sensitivity, use_fast_sampling=True
                     )
                     
-                    # Write noisy values back using flat indices
-                    flat_data[group_flat_indices] = noisy_values.astype(np.float64)
+                    # Write noisy values back
+                    province_data_flat[province_group_data_indices] = noisy_values.astype(np.float64)
+                    
+                    # Set non-data cells to 0
+                    non_data_indices = group_flat_indices_in_province[~province_has_data]
+                    province_data_flat[non_data_indices] = 0.0
                     
                     # Clean up
                     del data_values, noisy_values
-                    
-                    # Memory after noise
-                    mem_after_noise = psutil.virtual_memory().used / (1024**3)
-                    logger.info(f"  [MEMORY] After sampling: {mem_after_noise:.2f} GB (delta: {mem_after_noise - mem_before_noise:+.2f} GB)")
                 
-                # Clean up flat indices after all queries processed
-                del group_flat_indices
+                gc.collect()
+                mem_after_noise = psutil.virtual_memory().used / (1024**3)
+                logger.info(f"  Noise complete (mem: {mem_start_prov:.2f} -> {mem_after_noise:.2f} GB)")
             
-            gc.collect()
-            mem_after_noise = psutil.virtual_memory().used / (1024**3)
-            logger.info(f"[GROUP {group_idx}] Step 1 complete. Memory: {mem_after_noise:.2f} GB")
-            
-            # ================================================================
-            # STEP 2: NNLS post-processing for this group (per-group invariants)
-            # MEMORY OPTIMIZATION: Direct array access, no identity matrix
-            # ================================================================
-            logger.info(f"[GROUP {group_idx}] Step 2: NNLS post-processing")
-            
-            mem_before_nnls = psutil.virtual_memory().used / (1024**3)
-            
-            for query in queries:
-                if query not in self._per_group_invariants or group_id not in self._per_group_invariants[query]:
-                    logger.warning(f"  {query}: No per-group invariant, skipping NNLS")
-                    continue
+                # ================================================================
+                # STEP 2: NNLS post-processing for this (province, group)
+                # Ensures sum matches per-group invariant Y_p^g
+                # ================================================================
                 
-                group_invariants = self._per_group_invariants[query][group_id]
-                
-                # Process each province
-                adjusted_count = 0
-                for p_idx in range(n_prov):
-                    target_sum = float(group_invariants[p_idx])
-                    
-                    # MEMORY FIX: Use flat indices to avoid boolean indexing copies
-                    # Get flat view of province data (view, not copy)
-                    province_data_flat = histogram.data[query][p_idx].ravel()
+                for query in queries:
+                    target_sum = group_invariants.get(query, 0.0)
                     
                     if target_sum <= 0:
-                        # Set all cells in this group for this province to 0
-                        # Flat indexing - no copy
-                        province_data_flat[group_flat_indices_in_province] = 0
+                        # Already set to 0 above
                         continue
                     
-                    # MEMORY FIX: Extract ONLY group cells using flat indices (minimal copy)
+                    # Get province data view
+                    province_data_flat = histogram.data[query][p_idx].ravel()
+                    
+                    # Extract ONLY group cells using flat indices (minimal copy)
                     province_group_slice = province_data_flat[group_flat_indices_in_province].copy()
                     n = len(province_group_slice)
                     
                     # CRITICAL OPTIMIZATION: NNLS with identity matrix A=I simplifies to clipping!
                     # Original: A = np.eye(n); x_nnls, _ = nnls(A, province_group_slice)
                     # Simplified: x_nnls = max(province_group_slice, 0)
-                    # This saves creating an n×n matrix (potentially 180 GB!)
                     x_nnls = np.maximum(province_group_slice, 0)
                     
                     # Scale to match per-group invariant
@@ -808,63 +816,34 @@ class TopDownEngine:
                     if adjusted_sum > 0 and abs(adjusted_sum - target_sum) > 1e-6:
                         x_adjusted = x_adjusted * (target_sum / adjusted_sum)
                     
-                    # Check if adjustment was made
-                    if np.sum(np.abs(x_adjusted - province_group_slice)) > 1e-6:
-                        adjusted_count += 1
-                    
                     # Write back using flat indices (writes to view, modifies original)
                     province_data_flat[group_flat_indices_in_province] = x_adjusted
                     
-                    # Clean up province-specific arrays
-                    del province_data_flat, province_group_slice, x_nnls, x_adjusted
+                    # Clean up
+                    del province_group_slice, x_nnls, x_adjusted
                 
-                logger.info(f"  {query}: {adjusted_count}/{n_prov} provinces adjusted")
+                logger.info(f"  NNLS complete, sum matches invariant Y_p^g")
             
-            gc.collect()
-            mem_after_nnls = psutil.virtual_memory().used / (1024**3)
-            logger.info(f"[GROUP {group_idx}] Step 2 complete. Memory: {mem_before_nnls:.2f} -> {mem_after_nnls:.2f} GB")
-            
-            # ================================================================
-            # STEP 3: Controlled rounding for this group (per-group invariants)
-            # MEMORY OPTIMIZATION: Avoid full group data copy
-            # ================================================================
-            logger.info(f"[GROUP {group_idx}] Step 3: Controlled rounding")
-            
-            mem_before_rounding = psutil.virtual_memory().used / (1024**3)
-            
-            for query in queries:
-                if query not in self._per_group_invariants or group_id not in self._per_group_invariants[query]:
-                    # MEMORY FIX: Use flat indices instead of boolean indexing
-                    for p_idx in range(n_prov):
-                        # Get flat view of province data (view, not copy)
-                        province_data_flat = histogram.data[query][p_idx].ravel()
-                        # Extract ONLY group cells (minimal copy)
-                        group_values = province_data_flat[group_flat_indices_in_province].copy()
-                        # Round and write back using flat indices
-                        province_data_flat[group_flat_indices_in_province] = np.round(group_values).astype(np.float64)
-                        del province_data_flat, group_values
-                    continue
+                # ================================================================
+                # STEP 3: Controlled rounding for this (province, group)
+                # Maintains integer consistency with invariant Y_p^g
+                # ================================================================
                 
-                group_invariants = self._per_group_invariants[query][group_id]
-                
-                for p_idx in range(n_prov):
-                    target_sum = int(group_invariants[p_idx])
+                for query in queries:
+                    target_sum = int(group_invariants.get(query, 0.0))
                     
-                    # MEMORY FIX: Use flat indices to avoid boolean indexing copies
-                    # Get flat view of province data (view, not copy)
+                    # Get province data view
                     province_data_flat = histogram.data[query][p_idx].ravel()
                     
                     if target_sum <= 0:
-                        # Flat indexing - no copy
-                        province_data_flat[group_flat_indices_in_province] = 0
+                        # Already set to 0 above
                         continue
                     
-                    # MEMORY FIX: Extract ONLY group cells using flat indices (minimal copy)
+                    # Extract ONLY group cells using flat indices (minimal copy)
                     province_group_slice = province_data_flat[group_flat_indices_in_province].copy()
                     n = len(province_group_slice)
                     
                     # Floor values
-                    # MEMORY OPTIMIZATION: Combine operations to avoid intermediate arrays
                     floors = np.maximum(np.floor(province_group_slice).astype(np.int64), 0)
                     fractional_parts = np.maximum(province_group_slice - floors, 0)
                     
@@ -902,24 +881,20 @@ class TopDownEngine:
                     # Write back using flat indices (writes to view, modifies original)
                     province_data_flat[group_flat_indices_in_province] = rounded_values.astype(np.float64)
                     
-                    # Clean up province-specific arrays
-                    del province_data_flat, province_group_slice, floors, fractional_parts, rounded_values
+                    # Clean up
+                    del province_group_slice, floors, fractional_parts, rounded_values
                 
-                logger.info(f"  {query}: rounded to match per-group invariants")
+                logger.info(f"  Rounding complete, sum={target_sum}")
+                
+                # Memory summary for this (province, group)
+                gc.collect()
+                mem_end_prov = psutil.virtual_memory().used / (1024**3)
+                logger.info(f"  Complete (mem: {mem_start_prov:.2f} -> {mem_end_prov:.2f} GB)")
             
-            # Convert to int64 after all groups are processed (done at the end)
-            
-            gc.collect()
-            mem_after_rounding = psutil.virtual_memory().used / (1024**3)
-            logger.info(f"[GROUP {group_idx}] Step 3 complete. Memory: {mem_before_rounding:.2f} -> {mem_after_rounding:.2f} GB")
-            
+            # End of province loop
             # Clean up group-specific arrays
-            del group_mcc_indices
-            
-            # Final memory summary for this group
+            del group_mcc_indices, mcc_mask, province_mask_template, group_flat_indices_in_province
             gc.collect()
-            mem_end = psutil.virtual_memory().used / (1024**3)
-            logger.info(f"[GROUP {group_idx}] Complete. Memory: {mem_start:.2f} -> {mem_end:.2f} GB (delta: {mem_end - mem_start:+.2f} GB)")
         
         # Final conversion to int64 for all queries
         logger.info("")
@@ -1081,26 +1056,26 @@ class TopDownEngine:
         has_data_mask: np.ndarray
     ) -> None:
         """
-        Apply noise per MCC group for counting queries (memory efficiency).
+        Apply noise per (province, MCC group) for counting queries.
         
-        Uses parallel composition: MCC groups are DISJOINT, so each group
-        gets the FULL privacy budget rho independently.
+        Uses parallel composition: (province, MCC group) pairs are FULLY DISJOINT,
+        so each pair gets the FULL privacy budget rho independently.
         
         MATHEMATICAL JUSTIFICATION (Parallel Composition Theorem):
-        - MCC groups are DISJOINT: each transaction belongs to exactly ONE group
+        - (province, MCC group) pairs are DISJOINT: each transaction belongs to
+          exactly ONE province and exactly ONE MCC group
         - For disjoint datasets D₁, D₂, ..., Dₙ:
           If Mᵢ satisfies ρ-zCDP on Dᵢ, then (M₁, M₂, ..., Mₙ) satisfies ρ-zCDP on D₁ ∪ D₂ ∪ ... ∪ Dₙ
-        - Privacy cost: ρ (NOT ρ × num_groups, that would be sequential composition)
+        - Privacy cost: ρ (NOT ρ × num_groups × num_provinces)
         
         MEMORY OPTIMIZATION:
-        - Pre-compute flat indices per group ONCE (not full masks per group)
-        - Use direct flat indexing instead of boolean masks
-        - Avoids allocating num_groups × histogram_size memory
+        - Process per province to avoid loading all data at once
+        - Use flat indexing instead of boolean masks
         
         Args:
             histogram: TransactionHistogram (modified in-place)
             query: Query name (e.g., 'transaction_count', 'unique_cards')
-            rho: Privacy budget (FULL budget for each group - parallel composition)
+            rho: Privacy budget (FULL budget for each (province, group) - parallel composition)
             has_data_mask: Boolean mask of cells with data
         """
         import psutil
@@ -1123,7 +1098,7 @@ class TopDownEngine:
             return
         
         # Build MCC index to group mapping
-        logger.info(f"[PER-GROUP] Building MCC index to group mapping for {len(mcc_labels)} MCCs...")
+        logger.info(f"[PER-PROVINCE-GROUP] Building MCC index to group mapping for {len(mcc_labels)} MCCs...")
         mcc_idx_to_group = {}
         for mcc_idx, mcc_code in enumerate(mcc_labels):
             if mcc_code in self._mcc_to_group:
@@ -1133,114 +1108,91 @@ class TopDownEngine:
                 mcc_idx_to_group[mcc_idx] = max(self._mcc_group_caps.keys()) if self._mcc_group_caps else 0
         
         num_groups = len(set(mcc_idx_to_group.values()))
+        group_ids = sorted(set(mcc_idx_to_group.values()))
         
-        logger.info(f"[PER-GROUP] Processing query '{query}' with {num_groups} MCC groups")
-        logger.info(f"[PER-GROUP] Using PARALLEL composition (disjoint groups, each gets full rho={float(rho):.4f})")
-        
-        # Get contribution bound K
-        K = self.config.privacy.computed_contribution_bound or 1
-        
-        # MEMORY OPTIMIZATION: Pre-compute flat indices per group ONCE
-        # Instead of creating full-sized masks per group, we compute flat indices
-        # This reduces memory from O(num_groups * histogram_size) to O(total_data_cells)
-        logger.info(f"[PER-GROUP] Pre-computing flat indices per group (memory optimization)...")
-        mem_before_precompute = psutil.virtual_memory().used / (1024**3)
-        
-        # Get histogram shape for flat index conversion
+        # Get histogram shape
         shape = histogram.data[query].shape
         n_prov, n_city, n_mcc, n_day = shape
         
-        # Get all data cell indices from the mask
-        data_indices = np.where(has_data_mask.ravel())[0]
-        logger.info(f"[PER-GROUP] Total data cells: {len(data_indices):,}")
+        logger.info(f"[PER-PROVINCE-GROUP] Processing query '{query}' with {num_groups} MCC groups × {n_prov} provinces")
+        logger.info(f"[PER-PROVINCE-GROUP] Using PARALLEL composition (each (province, group) gets full rho={float(rho):.4f})")
         
-        # Compute MCC index for each data cell using flat index math
-        # flat_idx = prov * (n_city * n_mcc * n_day) + city * (n_mcc * n_day) + mcc * n_day + day
-        # mcc_idx = (flat_idx // n_day) % n_mcc
-        mcc_indices_for_data = (data_indices // n_day) % n_mcc
-        
-        # Group data cell indices by MCC group
-        group_to_flat_indices: Dict[int, np.ndarray] = {}
-        group_ids = sorted(set(mcc_idx_to_group.values()))
-        
-        for group_id in group_ids:
-            # Find which MCC indices belong to this group
-            group_mcc_set = set(
-                mcc_idx for mcc_idx, g_id in mcc_idx_to_group.items()
-                if g_id == group_id
-            )
-            # Find data cells whose MCC belongs to this group
-            group_cell_mask = np.isin(mcc_indices_for_data, list(group_mcc_set))
-            group_to_flat_indices[group_id] = data_indices[group_cell_mask]
-        
-        # Clean up temporary arrays
-        del data_indices, mcc_indices_for_data
-        gc.collect()
-        
-        mem_after_precompute = psutil.virtual_memory().used / (1024**3)
-        logger.info(f"[PER-GROUP] ✓ Pre-computed indices in {mem_after_precompute - mem_before_precompute:.2f} GB")
+        # Get contribution bound K
+        K = self.config.privacy.computed_contribution_bound or 1
+        global_d_max = self._d_max or 1
         
         # Convert to float64 for noise application (in-place)
         histogram.data[query] = histogram.data[query].astype(np.float64)
         
-        # Flatten the data array for direct indexing (VIEW, not copy)
-        flat_data = histogram.data[query].ravel()
+        # Pre-compute MCC masks for each group
+        group_mcc_masks = {}
+        for group_id in group_ids:
+            group_mcc_indices = [
+                mcc_idx for mcc_idx, g_id in mcc_idx_to_group.items()
+                if g_id == group_id
+            ]
+            mcc_mask = np.zeros(n_mcc, dtype=bool)
+            mcc_mask[group_mcc_indices] = True
+            group_mcc_masks[group_id] = mcc_mask
         
-        # Process each MCC group independently using pre-computed indices
-        for group_idx, group_id in enumerate(group_ids, 1):
-            group_flat_indices = group_to_flat_indices[group_id]
-            group_data_cells = len(group_flat_indices)
-            
-            if group_data_cells == 0:
-                logger.info(f"[PER-GROUP {group_idx}/{num_groups}] Group {group_id}: No data cells, skipping")
-                continue
-            
-            # Count MCCs in this group
-            group_mcc_count = sum(1 for g_id in mcc_idx_to_group.values() if g_id == group_id)
-            
-            # CRITICAL: Compute D_max for THIS GROUP ONLY
-            # Conservative approximation: min(global_d_max, cells_in_group)
-            global_d_max = self._d_max or 1
-            group_d_max = min(global_d_max, group_data_cells)
-            group_d_max = max(1, group_d_max)
-            sqrt_d_group = math.sqrt(group_d_max)
-            sensitivity = sqrt_d_group * K
-            sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
-            
-            logger.info(
-                f"[PER-GROUP {group_idx}/{num_groups}] Group {group_id}: {group_mcc_count} MCCs, "
-                f"{group_data_cells:,} cells, D_max={group_d_max}, Δ₂={sensitivity:.2f}, σ={sigma:.2f}"
-            )
-            
-            # Memory checkpoint
-            mem_before = psutil.virtual_memory().used / (1024**3)
-            
-            # Extract data values using flat indices (minimal memory: just group cells)
-            data_values = flat_data[group_flat_indices].astype(np.int64)
-            
-            # Sample noise for this group (FULL budget - parallel composition)
-            noisy_values = add_discrete_gaussian_noise(
-                data_values,
-                rho=rho,  # FULL budget for this group
-                sensitivity=sensitivity,
-                use_fast_sampling=True
-            )
-            
-            # Write noisy values back using flat indices
-            flat_data[group_flat_indices] = noisy_values.astype(np.float64)
-            
-            # Clean up this iteration's arrays
-            del data_values, noisy_values
-            
-            # Memory checkpoint
-            mem_after = psutil.virtual_memory().used / (1024**3)
-            logger.info(f"[PER-GROUP {group_idx}/{num_groups}] ✓ Complete (mem: {mem_before:.2f} -> {mem_after:.2f} GB)")
+        # Process each (province, group) pair
+        total_pairs = n_prov * num_groups
+        pair_idx = 0
         
-        # Clean up pre-computed indices
-        del group_to_flat_indices
+        for p_idx in range(n_prov):
+            for group_id in group_ids:
+                pair_idx += 1
+                mcc_mask = group_mcc_masks[group_id]
+                
+                # Create mask for this (province, group)
+                province_group_mask = np.zeros((n_city, n_mcc, n_day), dtype=bool)
+                province_group_mask[:, mcc_mask, :] = True
+                
+                # Apply to has_data_mask for this province
+                province_has_data = has_data_mask[p_idx] & province_group_mask
+                num_data_cells = np.sum(province_has_data)
+                
+                if num_data_cells == 0:
+                    continue
+                
+                # Compute D_max for this (province, group)
+                province_group_d_max = min(global_d_max, num_data_cells)
+                province_group_d_max = max(1, province_group_d_max)
+                sqrt_d_prov_group = math.sqrt(province_group_d_max)
+                sensitivity = sqrt_d_prov_group * K
+                sigma = np.sqrt(sensitivity**2 / (2 * float(rho)))
+                
+                if pair_idx % 50 == 0 or pair_idx <= 5:
+                    logger.info(
+                        f"[PAIR {pair_idx}/{total_pairs}] Province {p_idx}, Group {group_id}: "
+                        f"{num_data_cells:,} cells, D_max={province_group_d_max}, Δ₂={sensitivity:.2f}, σ={sigma:.2f}"
+                    )
+                
+                # Get province data
+                province_data = histogram.data[query][p_idx]
+                
+                # Extract data values using mask
+                data_values = province_data[province_has_data].astype(np.int64)
+                
+                # Sample noise for this (province, group) - FULL budget
+                noisy_values = add_discrete_gaussian_noise(
+                    data_values,
+                    rho=rho,  # FULL budget for this (province, group)
+                    sensitivity=sensitivity,
+                    use_fast_sampling=True
+                )
+                
+                # Write noisy values back
+                province_data[province_has_data] = noisy_values.astype(np.float64)
+                
+                # Clean up
+                del data_values, noisy_values, province_has_data
+        
+        # Clean up
+        del group_mcc_masks
         gc.collect()
         
-        logger.info(f"[PER-GROUP] ✓ All {num_groups} groups processed")
+        logger.info(f"[PER-PROVINCE-GROUP] ✓ All {total_pairs} (province, group) pairs processed")
     
     def _compute_group_d_max(self, histogram: TransactionHistogram, group_mask: np.ndarray) -> int:
         """
