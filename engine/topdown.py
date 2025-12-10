@@ -780,12 +780,14 @@ class TopDownEngine:
                 for query in queries:
                     target_sum = group_invariants.get(query, 0.0)
                     
-                    if target_sum <= 0:
-                        # Already set to 0 above
-                        continue
-                    
                     # Get province data view
                     province_data_flat = histogram.data[query][p_idx].ravel()
+                    
+                    if target_sum <= 0:
+                        # CRITICAL: Set all cells in this (province, group) to 0
+                        # Cells contain noisy values from STEP 1, must be zeroed to match invariant
+                        province_data_flat[group_flat_indices_in_province] = 0.0
+                        continue
                     
                     # Extract ONLY group cells using flat indices (minimal copy)
                     province_group_slice = province_data_flat[group_flat_indices_in_province].copy()
@@ -836,7 +838,9 @@ class TopDownEngine:
                     province_data_flat = histogram.data[query][p_idx].ravel()
                     
                     if target_sum <= 0:
-                        # Already set to 0 above
+                        # CRITICAL: Ensure cells are exactly 0 (should already be 0 from STEP 2)
+                        # Double-check to guarantee exact invariant match
+                        province_data_flat[group_flat_indices_in_province] = 0.0
                         continue
                     
                     # Extract ONLY group cells using flat indices (minimal copy)

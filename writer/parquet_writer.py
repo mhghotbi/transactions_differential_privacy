@@ -138,6 +138,99 @@ class ParquetWriter:
         
         return output_path
     
+    def write_comparison(
+        self,
+        original_histogram,  # Union[TransactionHistogram, SparkHistogram]
+        protected_histogram,  # Union[TransactionHistogram, SparkHistogram]
+        output_path: Optional[str] = None
+    ) -> str:
+        """
+        Write both original and DP-protected data with suffixes for comparison.
+        
+        Output columns:
+        - Dimension columns: province_code, city_code, mcc, day_idx
+        - Real data: transaction_count_real, unique_cards_real, transaction_amount_sum_real
+        - DP-protected: transaction_count_dp, unique_cards_dp, transaction_amount_sum_dp
+        
+        Args:
+            original_histogram: Original histogram before DP
+            protected_histogram: Protected histogram after DP
+            output_path: Optional override for output path
+            
+        Returns:
+            Path where data was written
+        """
+        from schema.histogram_spark import SparkHistogram
+        
+        output_path = output_path or self.config.data.output_path
+        comparison_path = os.path.join(output_path, "comparison_data")
+        os.makedirs(comparison_path, exist_ok=True)
+        
+        logger.info(f"Writing comparison data (original + protected) to: {comparison_path}")
+        
+        # Convert both histograms to DataFrames
+        if isinstance(original_histogram, SparkHistogram):
+            logger.info("Converting SparkHistogram original data...")
+            df_original = self._create_dataframe_from_spark_histogram(original_histogram)
+        else:
+            logger.info("Converting TransactionHistogram original data...")
+            df_original = self._create_dataframe_fast(original_histogram)
+        
+        if isinstance(protected_histogram, SparkHistogram):
+            logger.info("Converting SparkHistogram protected data...")
+            df_protected = self._create_dataframe_from_spark_histogram(protected_histogram)
+        else:
+            logger.info("Converting TransactionHistogram protected data...")
+            df_protected = self._create_dataframe_fast(protected_histogram)
+        
+        # Rename columns with suffixes
+        logger.info("Renaming columns with _real and _dp suffixes...")
+        
+        # Original data: rename value columns to _real
+        for col in ['transaction_count', 'unique_cards', 'transaction_amount_sum']:
+            if col in df_original.columns:
+                df_original = df_original.withColumnRenamed(col, f'{col}_real')
+        
+        # Protected data: rename value columns to _dp
+        for col in ['transaction_count', 'unique_cards', 'transaction_amount_sum']:
+            if col in df_protected.columns:
+                df_protected = df_protected.withColumnRenamed(col, f'{col}_dp')
+        
+        # Join on dimension columns
+        logger.info("Joining original and protected data...")
+        join_cols = ['province_code', 'city_code', 'mcc', 'day_idx']
+        
+        df_comparison = df_original.join(
+            df_protected,
+            on=join_cols,
+            how='outer'  # outer join to catch any missing cells
+        )
+        
+        # Add transaction_date from either side (should be same)
+        if 'transaction_date' in df_comparison.columns:
+            pass  # Already exists from join
+        else:
+            df_comparison = df_comparison.withColumn('transaction_date', F.col('day_idx').cast('string'))
+        
+        # Reorder columns for clarity
+        ordered_cols = join_cols + ['transaction_date']
+        ordered_cols += [f'{col}_real' for col in ['transaction_count', 'unique_cards', 'transaction_amount_sum']]
+        ordered_cols += [f'{col}_dp' for col in ['transaction_count', 'unique_cards', 'transaction_amount_sum']]
+        
+        # Select only existing columns
+        existing_cols = [col for col in ordered_cols if col in df_comparison.columns]
+        df_comparison = df_comparison.select(existing_cols)
+        
+        # Write to Parquet
+        logger.info(f"Writing comparison data partitioned by {self.partition_by}...")
+        df_comparison.write.mode("overwrite").partitionBy(*self.partition_by).parquet(comparison_path)
+        
+        num_records = df_comparison.count()
+        logger.info(f"Comparison data written successfully: {num_records:,} records")
+        logger.info(f"  Columns: {', '.join(existing_cols)}")
+        
+        return comparison_path
+    
     def _create_dataframe_from_spark_histogram(self, histogram) -> DataFrame:
         """
         Convert SparkHistogram to output DataFrame (100% Spark, NO collect).

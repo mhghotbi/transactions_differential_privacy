@@ -368,6 +368,10 @@ class DPPipeline:
                 winsorize_cap=winsorize_cap
             )
             
+            # Keep a copy of original histogram before DP (for comparison output)
+            logger.info("Creating copy of original histogram for comparison output...")
+            original_histograms = histograms.copy() if hasattr(histograms, 'copy') else histograms
+            
             protected_histograms = engine.run(histograms)
             
             # Step 4: Write output
@@ -379,7 +383,11 @@ class DPPipeline:
                 spark=spark,
                 config=self.config
             )
-            writer.write(protected_histograms)
+            # Write both original and protected data with suffixes
+            writer.write_comparison(
+                original_histogram=original_histograms,
+                protected_histogram=protected_histograms
+            )
             
             # Success
             result.success = True
