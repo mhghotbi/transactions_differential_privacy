@@ -398,6 +398,13 @@ class TransactionPreprocessor:
         min_date_lit = F.lit(self._min_date)
         df = df.withColumn('day_idx', F.datediff(F.col('transaction_date'), min_date_lit))
         
+        # Create weekday column (0=Monday, 6=Sunday)
+        # Spark's dayofweek returns 1=Sunday, 2=Monday, ..., 7=Saturday
+        # We convert to 0=Monday, 1=Tuesday, ..., 6=Sunday
+        # CRITICAL: Use F.pmod() not % operator - Spark's % follows Java semantics (can be negative)
+        # For Sunday: (1-2) % 7 = -1 (wrong), but F.pmod(1-2, 7) = 6 (correct)
+        df = df.withColumn('weekday', F.pmod(F.dayofweek(F.col('transaction_date')) - 2, 7))
+        
         # Filter to configured number of days
         df = df.filter(F.col('day_idx') < self.config.data.num_days)
         df = df.filter(F.col('day_idx') >= 0)
@@ -455,8 +462,9 @@ class TransactionPreprocessor:
         
         # Compute aggregations (4 queries: transaction_count, unique_cards, total_amount, total_amount_original)
         # CRITICAL: Cast sums to LongType to avoid Java BigDecimal reflection warnings
+        # Include weekday in groupBy for context-aware bounds
         agg_df = df.groupBy(
-            'province_code', 'city_idx', 'mcc_idx', 'day_idx'
+            'province_code', 'city_idx', 'mcc_idx', 'day_idx', 'weekday'
         ).agg(
             F.count('*').cast('long').alias('transaction_count'),
             F.countDistinct(F.col('card_number')).cast('long').alias('unique_cards'),

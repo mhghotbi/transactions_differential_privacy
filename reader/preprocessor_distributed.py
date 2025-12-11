@@ -270,7 +270,7 @@ class DistributedPreprocessor:
         )
     
     def _create_time_index(self, df: DataFrame) -> DataFrame:
-        """Create day index from transaction date."""
+        """Create day index and weekday from transaction date."""
         # Get min date (single aggregation)
         min_date = df.agg(F.min(F.col('transaction_date'))).first()[0]
         
@@ -279,6 +279,13 @@ class DistributedPreprocessor:
             'day_idx',
             F.datediff(F.col('transaction_date'), F.lit(min_date))
         )
+        
+        # Create weekday column (0=Monday, 6=Sunday)
+        # Spark's dayofweek returns 1=Sunday, 2=Monday, ..., 7=Saturday
+        # We convert to 0=Monday, 1=Tuesday, ..., 6=Sunday
+        # CRITICAL: Use F.pmod() not % operator - Spark's % follows Java semantics (can be negative)
+        # For Sunday: (1-2) % 7 = -1 (wrong), but F.pmod(1-2, 7) = 6 (correct)
+        df = df.withColumn('weekday', F.pmod(F.dayofweek(F.col('transaction_date')) - 2, 7))
         
         # Filter to configured range
         df = df.filter(
@@ -307,7 +314,8 @@ class DistributedPreprocessor:
             'province_name', 
             'acceptor_city',
             'mcc',
-            'day_idx'
+            'day_idx',
+            'weekday'
         ).agg(
             F.count('*').alias('transaction_count'),
             F.countDistinct(F.col('card_number')).alias('unique_cards'),

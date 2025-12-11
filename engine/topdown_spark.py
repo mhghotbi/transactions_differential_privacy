@@ -122,10 +122,13 @@ class TopDownSparkEngine:
         
         df = histogram.df
         
-        # Check if weekday column exists
+        # Check if weekday column exists (should be provided by preprocessor)
         if 'weekday' not in df.columns:
-            logger.warning("weekday column not found, adding default (0)")
-            df = df.withColumn('weekday', F.lit(0).cast(IntegerType()))
+            raise ValueError(
+                "weekday column not found in histogram. "
+                "The preprocessor must compute weekday from transaction_date before aggregation. "
+                "Please ensure the preprocessor includes weekday in the groupBy aggregation."
+            )
         
         # OPTIMIZATION: Repartition by province ONCE to minimize shuffles
         num_provinces = df.select('province_idx').distinct().count()
