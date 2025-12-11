@@ -56,22 +56,12 @@ class PrivacyConfig:
     sensitivity_method: str = "global"  # 'local', 'global', or 'fixed'
     fixed_max_cells_per_card: int = 100  # For 'fixed' sensitivity method
     
-    # MCC grouping settings for stratified sensitivity
-    mcc_grouping_enabled: bool = True
-    mcc_grouping_method: str = "multifactor"  # 'median_only' or 'multifactor'
-    mcc_num_groups: int = 10  # Number of groups for DP noise application (parallel composition)
-    mcc_num_groups_for_k: int = 5  # Number of groups for K computation (memory efficiency)
-    mcc_group_cap_percentile: float = 99.0  # Percentile for per-group caps
+    # Per-MCC winsorization settings
+    # Each MCC is processed separately (parallel composition - each gets full budget)
+    mcc_cap_percentile: float = 99.0  # Percentile for per-MCC winsorization caps
     
-    # Multi-factor grouping settings
-    mcc_grouping_adaptive: bool = False  # Automatically determine optimal number of groups
-    mcc_min_groups: int = 3  # Minimum number of groups (if adaptive)
-    mcc_max_groups: int = 15  # Maximum number of groups (if adaptive)
-    mcc_min_mccs_per_group: int = 3  # Minimum MCCs per group (validation/merging)
-    
-    # Computed MCC grouping (set after analysis)
-    mcc_group_caps: Optional[Dict[int, float]] = None  # group_id -> cap
-    mcc_to_group: Optional[Dict[str, int]] = None  # mcc_code -> group_id
+    # Computed per-MCC caps (set during preprocessing)
+    mcc_caps: Optional[Dict[str, float]] = None  # mcc_code -> winsorization_cap
     
     # Utility-focused noise parameters
     noise_level: float = 0.15  # Relative noise level (15% std for count)
@@ -111,17 +101,8 @@ class PrivacyConfig:
             if not 0 < level < 1:
                 raise ValueError(f"confidence_level must be in (0, 1), got {level}")
         
-        if self.mcc_grouping_method not in ('median_only', 'multifactor'):
-            raise ValueError(f"mcc_grouping_method must be 'median_only' or 'multifactor', got {self.mcc_grouping_method}")
-        
-        if self.mcc_min_groups < 1:
-            raise ValueError(f"mcc_min_groups must be >= 1, got {self.mcc_min_groups}")
-        
-        if self.mcc_max_groups < self.mcc_min_groups:
-            raise ValueError(f"mcc_max_groups ({self.mcc_max_groups}) must be >= mcc_min_groups ({self.mcc_min_groups})")
-        
-        if self.mcc_min_mccs_per_group < 1:
-            raise ValueError(f"mcc_min_mccs_per_group must be >= 1, got {self.mcc_min_mccs_per_group}")
+        if not 0 < self.mcc_cap_percentile <= 100:
+            raise ValueError(f"mcc_cap_percentile must be in (0, 100], got {self.mcc_cap_percentile}")
 
 
 @dataclass
@@ -259,25 +240,9 @@ class Config:
             if 'fixed_max_cells_per_card' in sec:
                 config.privacy.fixed_max_cells_per_card = int(sec['fixed_max_cells_per_card'])
             
-            # Parse MCC grouping settings
-            if 'mcc_grouping_enabled' in sec:
-                config.privacy.mcc_grouping_enabled = sec.getboolean('mcc_grouping_enabled')
-            if 'mcc_grouping_method' in sec:
-                config.privacy.mcc_grouping_method = sec['mcc_grouping_method']
-            if 'mcc_num_groups' in sec:
-                config.privacy.mcc_num_groups = int(sec['mcc_num_groups'])
-            if 'mcc_num_groups_for_k' in sec:
-                config.privacy.mcc_num_groups_for_k = int(sec['mcc_num_groups_for_k'])
-            if 'mcc_group_cap_percentile' in sec:
-                config.privacy.mcc_group_cap_percentile = float(sec['mcc_group_cap_percentile'])
-            if 'mcc_grouping_adaptive' in sec:
-                config.privacy.mcc_grouping_adaptive = sec.getboolean('mcc_grouping_adaptive')
-            if 'mcc_min_groups' in sec:
-                config.privacy.mcc_min_groups = int(sec['mcc_min_groups'])
-            if 'mcc_max_groups' in sec:
-                config.privacy.mcc_max_groups = int(sec['mcc_max_groups'])
-            if 'mcc_min_mccs_per_group' in sec:
-                config.privacy.mcc_min_mccs_per_group = int(sec['mcc_min_mccs_per_group'])
+            # Parse per-MCC winsorization settings
+            if 'mcc_cap_percentile' in sec:
+                config.privacy.mcc_cap_percentile = float(sec['mcc_cap_percentile'])
             
             # Parse utility-focused noise parameters
             if 'noise_level' in sec:
@@ -342,15 +307,7 @@ class Config:
             'include_relative_moe': str(self.privacy.include_relative_moe).lower(),
             'sensitivity_method': self.privacy.sensitivity_method,
             'fixed_max_cells_per_card': str(self.privacy.fixed_max_cells_per_card),
-            'mcc_grouping_enabled': str(self.privacy.mcc_grouping_enabled).lower(),
-            'mcc_grouping_method': self.privacy.mcc_grouping_method,
-            'mcc_num_groups': str(self.privacy.mcc_num_groups),
-            'mcc_num_groups_for_k': str(self.privacy.mcc_num_groups_for_k),
-            'mcc_group_cap_percentile': str(self.privacy.mcc_group_cap_percentile),
-            'mcc_grouping_adaptive': str(self.privacy.mcc_grouping_adaptive).lower(),
-            'mcc_min_groups': str(self.privacy.mcc_min_groups),
-            'mcc_max_groups': str(self.privacy.mcc_max_groups),
-            'mcc_min_mccs_per_group': str(self.privacy.mcc_min_mccs_per_group),
+            'mcc_cap_percentile': str(self.privacy.mcc_cap_percentile),
             'noise_level': str(self.privacy.noise_level),
             'cards_jitter': str(self.privacy.cards_jitter),
             'amount_jitter': str(self.privacy.amount_jitter),

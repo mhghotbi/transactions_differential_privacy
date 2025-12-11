@@ -58,7 +58,7 @@ class TransactionPreprocessor:
         self._mcc_to_idx: Dict[str, int] = {}
         self._city_to_idx: Dict[str, int] = {}
         self._min_date: Optional[date] = None
-        self._mcc_grouping = None  # MCCGroupingResult
+        self._mcc_caps = None  # Dict[str, float]: mcc_code -> cap
         self._d_max: Optional[int] = None  # Max cells per card for user-level DP
     
     def process(self, df: DataFrame) -> TransactionHistogram:
@@ -73,9 +73,9 @@ class TransactionPreprocessor:
         """
         logger.info("Starting preprocessing...")
         
-        # Step 0: Compute MCC groups FIRST (needed for per-group K computation and noise)
-        if self.config.privacy.mcc_grouping_enabled:
-            df = self._compute_mcc_groups(df)
+        # Step 0: Compute per-MCC winsorization caps
+        # Each MCC is processed separately (parallel composition)
+        df = self._compute_per_mcc_caps(df)
         
         # Step 1: Apply bounded contribution (can now use MCC groups for memory efficiency)
         df = self._apply_bounded_contribution(df)
@@ -156,70 +156,30 @@ class TransactionPreprocessor:
         
         return df
     
-    def _compute_mcc_groups(self, df: DataFrame) -> DataFrame:
+    def _compute_per_mcc_caps(self, df: DataFrame) -> DataFrame:
         """
-        Compute MCC groups for stratified sensitivity (main DP grouping).
+        Compute winsorization cap per individual MCC.
         
-        Uses either:
-        - median_only: Groups by log10(median_amount) only (original method)
-        - multifactor: Groups using multiple features with hierarchical clustering
-        
-        Uses parallel composition - each group gets full privacy budget.
+        Each MCC is processed separately (parallel composition - each gets full privacy budget).
+        This is more granular than grouping MCCs, providing better utility.
         """
-        from core.mcc_groups import compute_mcc_groups_spark, compute_mcc_groups_multifactor
+        logger.info("Computing per-MCC winsorization caps...")
+        logger.info(f"Percentile: {self.config.privacy.mcc_cap_percentile}")
         
-        logger.info("Computing MCC groups for stratified sensitivity...")
-        logger.info(f"Method: {self.config.privacy.mcc_grouping_method}")
+        # Compute cap per MCC using Spark
+        mcc_caps = df.groupBy('mcc').agg(
+            F.expr(f'percentile_approx(amount, {self.config.privacy.mcc_cap_percentile / 100.0})').alias('cap')
+        ).collect()
         
-        if self.config.privacy.mcc_grouping_method == 'multifactor':
-            # Multi-factor grouping with hierarchical clustering
-            self._mcc_grouping = compute_mcc_groups_multifactor(
-                df=df,
-                mcc_col='mcc',
-                amount_col='amount',
-                date_col=self.config.data.date_column,
-                num_groups=self.config.privacy.mcc_num_groups,
-                adaptive=self.config.privacy.mcc_grouping_adaptive,
-                min_groups=self.config.privacy.mcc_min_groups,
-                max_groups=self.config.privacy.mcc_max_groups,
-                min_mccs_per_group=self.config.privacy.mcc_min_mccs_per_group,
-                cap_percentile=self.config.privacy.mcc_group_cap_percentile
-            )
+        # Store in config
+        self._mcc_caps = {row['mcc']: float(row['cap']) for row in mcc_caps}
+        self.config.privacy.mcc_caps = self._mcc_caps
+        
+        logger.info(f"Computed caps for {len(self._mcc_caps)} individual MCCs")
+        if self._mcc_caps:
+            logger.info(f"Cap range: [{min(self._mcc_caps.values()):,.0f}, {max(self._mcc_caps.values()):,.0f}]")
         else:
-            # Original median-only grouping
-            self._mcc_grouping = compute_mcc_groups_spark(
-                df=df,
-                mcc_col='mcc',
-                amount_col='amount',
-                num_groups=self.config.privacy.mcc_num_groups,
-                cap_percentile=self.config.privacy.mcc_group_cap_percentile
-            )
-        
-        # Store in config for use by TopDownEngine
-        self.config.privacy.mcc_to_group = self._mcc_grouping.mcc_to_group
-        self.config.privacy.mcc_group_caps = {
-            gid: info.cap for gid, info in self._mcc_grouping.group_info.items()
-        }
-        
-        logger.info(f"Created {self._mcc_grouping.num_groups} MCC groups")
-        
-        # Add MCC group column to DataFrame for per-group processing
-        mcc_group_data = [
-            (mcc, group_id) 
-            for mcc, group_id in self._mcc_grouping.mcc_to_group.items()
-        ]
-        mcc_group_schema = StructType([
-            StructField("mcc_grp_key", StringType(), False),
-            StructField("mcc_group", IntegerType(), False),
-        ])
-        mcc_group_df = self.spark.createDataFrame(mcc_group_data, schema=mcc_group_schema)
-        
-        # Broadcast small MCC group lookup table (~300 MCCs) for efficient join
-        df = df.join(F.broadcast(mcc_group_df), df.mcc == mcc_group_df.mcc_grp_key, "left").drop("mcc_grp_key")
-        
-        # Fill unknown MCCs with highest group (conservative - highest cap)
-        max_group = max(self._mcc_grouping.group_info.keys()) if self._mcc_grouping.group_info else 0
-        df = df.fillna({'mcc_group': max_group})
+            logger.warning("No MCC caps computed - empty or all-null MCC data")
         
         return df
     
@@ -333,13 +293,14 @@ class TransactionPreprocessor:
         """
         Apply winsorization to transaction amounts.
         
-        If MCC grouping is enabled, uses per-group caps.
-        Otherwise, uses a single global cap.
+        Uses per-MCC caps computed earlier.
+        Each MCC is processed separately (parallel composition).
         """
-        if self.config.privacy.mcc_grouping_enabled and self._mcc_grouping is not None:
-            return self._apply_per_group_winsorization(df)
-        else:
-            return self._apply_global_winsorization(df)
+        if self._mcc_caps is None or len(self._mcc_caps) == 0:
+            logger.error("Per-MCC caps not computed, cannot apply winsorization")
+            raise RuntimeError("Per-MCC caps must be computed before winsorization")
+        
+        return self._apply_per_mcc_winsorization(df)
     
     def _apply_global_winsorization(self, df: DataFrame) -> DataFrame:
         """Apply single global winsorization cap."""
@@ -364,52 +325,47 @@ class TransactionPreprocessor:
         
         return df
     
-    def _apply_per_group_winsorization(self, df: DataFrame) -> DataFrame:
+    def _apply_per_mcc_winsorization(self, df: DataFrame) -> DataFrame:
         """
-        Apply per-MCC-group winsorization.
+        Apply winsorization with per-MCC caps.
         
-        Each MCC group has its own cap based on typical transaction amounts.
+        Each individual MCC has its own cap based on its transaction amount distribution.
+        This provides better utility than grouping MCCs together.
         """
-        logger.info("Applying per-MCC-group winsorization...")
+        logger.info("Applying per-MCC winsorization...")
         
-        # Build case-when expression for per-group caps
-        # Start with a base case (highest cap for unknown groups)
-        max_cap = max(self.config.privacy.mcc_group_caps.values())
-        self._winsorize_cap = max_cap  # Store max for reference
+        # Store max cap for reference
+        self._winsorize_cap = max(self._mcc_caps.values()) if self._mcc_caps else 0.0
         
         # Create cap lookup DataFrame
-        cap_data = [
-            (group_id, float(cap)) 
-            for group_id, cap in self.config.privacy.mcc_group_caps.items()
-        ]
+        cap_data = [(mcc, float(cap)) for mcc, cap in self._mcc_caps.items()]
         cap_schema = StructType([
-            StructField("cap_group_id", IntegerType(), False),
-            StructField("group_cap", DoubleType(), False),
+            StructField("cap_mcc", StringType(), False),
+            StructField("mcc_cap", DoubleType(), False),
         ])
         cap_df = self.spark.createDataFrame(cap_data, schema=cap_schema)
         
-        # Broadcast small cap lookup table (~20 MCC groups) for efficient join
-        df = df.join(F.broadcast(cap_df), df.mcc_group == cap_df.cap_group_id, "left").drop("cap_group_id")
-        df = df.fillna({'group_cap': max_cap})
+        # Broadcast small cap lookup table (~100-500 MCCs) for efficient join
+        df = df.join(F.broadcast(cap_df), df.mcc == cap_df.cap_mcc, "left").drop("cap_mcc")
+        df = df.fillna({'mcc_cap': self._winsorize_cap})  # Unknown MCCs get max cap
         
-        # Apply per-group winsorization
+        # Apply per-MCC winsorization
         df = df.withColumn(
             'amount_winsorized',
-            F.when(F.col('amount') > F.col('group_cap'), F.col('group_cap'))
+            F.when(F.col('amount') > F.col('mcc_cap'), F.col('mcc_cap'))
             .otherwise(F.col('amount'))
         )
         
-        # Statistics per group
-        group_stats = df.groupBy('mcc_group').agg(
-            F.count(F.when(F.col('amount') > F.col('group_cap'), 1)).alias('capped_count'),
-            F.count('*').alias('total_count'),
-            F.first('group_cap').alias('cap')
-        ).collect()
+        # Overall statistics
+        total_stats = df.agg(
+            F.count(F.when(F.col('amount') > F.col('mcc_cap'), 1)).alias('capped_count'),
+            F.count('*').alias('total_count')
+        ).first()
         
-        logger.info("Per-group winsorization statistics:")
-        for row in sorted(group_stats, key=lambda x: x.mcc_group):
-            pct = 100 * row.capped_count / row.total_count if row.total_count > 0 else 0
-            logger.info(f"  Group {row.mcc_group}: cap={row.cap:,.0f}, capped={row.capped_count:,} ({pct:.2f}%)")
+        pct_capped = 100 * total_stats.capped_count / total_stats.total_count if total_stats.total_count > 0 else 0
+        logger.info(f"Per-MCC winsorization: {total_stats.capped_count:,} / {total_stats.total_count:,} transactions capped ({pct_capped:.2f}%)")
+        if self._mcc_caps:
+            logger.info(f"Cap range: [{min(self._mcc_caps.values()):,.0f}, {max(self._mcc_caps.values()):,.0f}]")
         
         return df
     
@@ -579,9 +535,9 @@ class TransactionPreprocessor:
         return self._min_date
     
     @property
-    def mcc_grouping(self):
-        """Get MCC grouping result."""
-        return self._mcc_grouping
+    def mcc_caps(self):
+        """Get per-MCC caps dictionary."""
+        return self._mcc_caps
     
     @property
     def d_max(self) -> Optional[int]:

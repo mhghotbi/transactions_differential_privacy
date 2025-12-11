@@ -110,10 +110,10 @@ class DistributedPreprocessor:
         logger.info("Step 1: Geography join (broadcast)...")
         df = self._join_geography(df)
         
-        # Step 2: Compute MCC groups FIRST (needed for per-group K and per-group noise)
-        if self.config.privacy.mcc_grouping_enabled:
-            logger.info("Step 2: Computing MCC groups...")
-            df = self._compute_mcc_groups(df)
+        # Step 2: Compute per-MCC winsorization caps
+        # Each MCC is processed separately (parallel composition)
+        logger.info("Step 2: Computing per-MCC caps...")
+        df = self._compute_per_mcc_caps(df)
         
         # Step 3: Apply bounded contribution (clip transactions per card-cell)
         logger.info("Step 3: Applying bounded contribution...")
@@ -155,70 +155,30 @@ class DistributedPreprocessor:
             "left"
         ).drop("city_name")
     
-    def _compute_mcc_groups(self, df: DataFrame) -> DataFrame:
+    def _compute_per_mcc_caps(self, df: DataFrame) -> DataFrame:
         """
-        Compute MCC groups for stratified sensitivity and per-group processing.
+        Compute winsorization cap per individual MCC.
         
-        Uses either:
-        - median_only: Groups by log10(median_amount) only (original method)
-        - multifactor: Groups using multiple features with hierarchical clustering
-        
-        Uses parallel composition - each group gets full privacy budget.
+        Each MCC is processed separately (parallel composition - each gets full privacy budget).
+        This is more granular than grouping MCCs, providing better utility.
         """
-        from core.mcc_groups import compute_mcc_groups_spark, compute_mcc_groups_multifactor
+        logger.info("Computing per-MCC winsorization caps...")
+        logger.info(f"Percentile: {self.config.privacy.mcc_cap_percentile}")
         
-        logger.info("Computing MCC groups for stratified sensitivity...")
-        logger.info(f"Method: {self.config.privacy.mcc_grouping_method}")
+        # Compute cap per MCC using Spark
+        mcc_caps = df.groupBy('mcc').agg(
+            F.expr(f'percentile_approx(amount, {self.config.privacy.mcc_cap_percentile / 100.0})').alias('cap')
+        ).collect()
         
-        if self.config.privacy.mcc_grouping_method == 'multifactor':
-            # Multi-factor grouping with hierarchical clustering
-            self._mcc_grouping = compute_mcc_groups_multifactor(
-                df=df,
-                mcc_col='mcc',
-                amount_col='amount',
-                date_col=self.config.data.date_column,
-                num_groups=self.config.privacy.mcc_num_groups,
-                adaptive=self.config.privacy.mcc_grouping_adaptive,
-                min_groups=self.config.privacy.mcc_min_groups,
-                max_groups=self.config.privacy.mcc_max_groups,
-                min_mccs_per_group=self.config.privacy.mcc_min_mccs_per_group,
-                cap_percentile=self.config.privacy.mcc_group_cap_percentile
-            )
+        # Store in config
+        self._mcc_caps = {row['mcc']: float(row['cap']) for row in mcc_caps}
+        self.config.privacy.mcc_caps = self._mcc_caps
+        
+        logger.info(f"Computed caps for {len(self._mcc_caps)} individual MCCs")
+        if self._mcc_caps:
+            logger.info(f"Cap range: [{min(self._mcc_caps.values()):,.0f}, {max(self._mcc_caps.values()):,.0f}]")
         else:
-            # Original median-only grouping
-            self._mcc_grouping = compute_mcc_groups_spark(
-                df=df,
-                mcc_col='mcc',
-                amount_col='amount',
-                num_groups=self.config.privacy.mcc_num_groups,
-                cap_percentile=self.config.privacy.mcc_group_cap_percentile
-            )
-        
-        # Store in config for use by TopDownEngine
-        self.config.privacy.mcc_to_group = self._mcc_grouping.mcc_to_group
-        self.config.privacy.mcc_group_caps = {
-            gid: info.cap for gid, info in self._mcc_grouping.group_info.items()
-        }
-        
-        logger.info(f"Created {self._mcc_grouping.num_groups} MCC groups")
-        
-        # Add MCC group column to DataFrame for per-group processing
-        mcc_group_data = [
-            (mcc, group_id) 
-            for mcc, group_id in self._mcc_grouping.mcc_to_group.items()
-        ]
-        mcc_group_schema = StructType([
-            StructField("mcc_grp_key", StringType(), False),
-            StructField("mcc_group", IntegerType(), False),
-        ])
-        mcc_group_df = self.spark.createDataFrame(mcc_group_data, schema=mcc_group_schema)
-        
-        # Broadcast small MCC group lookup table (~300 MCCs) for efficient join
-        df = df.join(F.broadcast(mcc_group_df), df.mcc == mcc_group_df.mcc_grp_key, "left").drop("mcc_grp_key")
-        
-        # Fill unknown MCCs with highest group (conservative - highest cap)
-        max_group = max(self._mcc_grouping.group_info.keys()) if self._mcc_grouping.group_info else 0
-        df = df.fillna({'mcc_group': max_group})
+            logger.warning("No MCC caps computed - empty or all-null MCC data")
         
         return df
     

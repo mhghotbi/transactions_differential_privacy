@@ -319,9 +319,10 @@ class BudgetAllocator:
        - We use the FULL budget for the entire month, not per-day
        - Daily values are post-processed from monthly noisy totals
        
-    3. MCC Groups:
-       - MCCs are PARALLEL if each transaction belongs to exactly one MCC
-       - Each MCC group can use the FULL budget (parallel composition)
+    3. Individual MCCs:
+       - MCCs are PARALLEL since each transaction belongs to exactly one MCC
+       - Each individual MCC can use the FULL budget (parallel composition)
+       - No grouping - each MCC processed separately for better utility
     """
     
     def __init__(
