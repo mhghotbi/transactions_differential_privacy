@@ -29,8 +29,8 @@ Imagine you want to know how many people live on a street, but you can't ask any
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌───────────┐ │
 │  │   READER     │    │ PREPROCESSOR │    │   ENGINE     │    │  WRITER   │ │
 │  │              │───▶│              │───▶│              │───▶│           │ │
-│  │ spark_reader │    │ winsorize    │    │ topdown      │    │ parquet   │ │
-│  │              │    │ aggregate    │    │ noise inject │    │ output    │ │
+│  │ spark_reader │    │ winsorize    │    │ topdown_spark│    │ parquet   │ │
+│  │              │    │ aggregate    │    │ ratio preserve│    │ output    │ │
 │  └──────────────┘    └──────────────┘    └──────────────┘    └───────────┘ │
 │         │                   │                   │                          │
 │         ▼                   ▼                   ▼                          │
@@ -772,14 +772,17 @@ Implementation: Non-negativity clamping in post-processing is free!
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ Function: TopDownEngine.run()                                       │
+│ Function: TopDownSparkEngine.run()                                  │
 ├─────────────────────────────────────────────────────────────────────┤
-│ WHAT: Apply noise hierarchically from Province → City               │
-│ WHY:  Ensures consistency between aggregation levels                │
-│ HOW:  1. Aggregate to province level, add noise                     │
-│       2. Aggregate to city level, add noise                         │
-│       3. Adjust city totals to sum to noisy province totals         │
-│ MATH: Uses least-squares optimization for consistency               │
+│ WHAT: Apply utility-focused DP with ratio preservation              │
+│ WHY:  Preserves ratios (amount/count, count/cards) while adding DP  │
+│ HOW:  1. Compute province invariants (count is exact)                │
+│       2. Store original ratios per cell                              │
+│       3. Add noise to COUNT only                                     │
+│       4. Scale COUNT to match invariant                              │
+│       5. Derive amount and cards from scaled count + original ratios│
+│       6. Controlled rounding with invariant preservation            │
+│ NOTE: Uses total_amount internally, outputs transaction_amount_sum   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1358,8 +1361,9 @@ Relative MOE:
 #### Output Schema
 
 ```
-Original columns:
-  transaction_count, unique_cards, ...
+Base columns:
+  transaction_count, unique_cards, transaction_amount_sum
+  (Note: Engine uses 'total_amount' internally, writer outputs 'transaction_amount_sum')
 
 With confidence intervals (90%):
   transaction_count
@@ -1367,6 +1371,12 @@ With confidence intervals (90%):
   transaction_count_ci_lower_90   # Lower bound
   transaction_count_ci_upper_90   # Upper bound
   transaction_count_rel_moe_90    # Relative MOE (optional)
+  
+  transaction_amount_sum
+  transaction_amount_sum_moe_90
+  transaction_amount_sum_ci_lower_90
+  transaction_amount_sum_ci_upper_90
+  transaction_amount_sum_rel_moe_90
 ```
 
 #### Configuration

@@ -116,6 +116,7 @@ Edit `configs/default.ini`:
 total_rho = 1/4                    # ρ = 0.25 → ε ≈ 5 per month
 
 # Bounded contribution (IMPORTANT: affects data loss)
+# RECOMMENDED: transaction_weighted_percentile minimizes data loss compared to simple percentile
 contribution_bound_method = transaction_weighted_percentile  # Keep 99% of transactions
 contribution_bound_percentile = 99.0                        # Target retention percentage
 
