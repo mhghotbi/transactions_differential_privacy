@@ -398,7 +398,18 @@ class TopDownSparkEngine:
         logger.info("Context-Aware Noise Processing Complete")
         logger.info("=" * 70)
         
-        return SparkHistogram(self.spark, df_rounded, histogram.dimensions, histogram.city_codes)
+        # Drop weekday column before returning - it's a processing dimension, not a structural dimension
+        # The histogram structure is 4D (province, city, mcc, day), not 5D
+        # Aggregate by (province, city, mcc, day) in case there are any duplicates after dropping weekday
+        df_final = df_rounded.groupBy(
+            'province_idx', 'city_idx', 'mcc_idx', 'day_idx'
+        ).agg(
+            F.sum('transaction_count').cast('long').alias('transaction_count'),
+            F.sum('unique_cards').cast('long').alias('unique_cards'),
+            F.sum('total_amount').cast('long').alias('total_amount')
+        )
+        
+        return SparkHistogram(self.spark, df_final, histogram.dimensions, histogram.city_codes)
     
     def _compute_plausibility_bounds(self, df: DataFrame) -> DataFrame:
         """
