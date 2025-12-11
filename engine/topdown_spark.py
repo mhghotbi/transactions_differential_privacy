@@ -425,8 +425,11 @@ class TopDownSparkEngine:
             F.mean('amount_error_pct').alias('mean_error')
         ).first()
         
-        logger.info(f"  Amount error: max={amount_stats['max_error']:.2f}%, mean={amount_stats['mean_error']:.2f}%")
-        logger.info("  (Amount is derived to preserve ratios - small error expected)")
+        if amount_stats and amount_stats['max_error'] is not None and amount_stats['mean_error'] is not None:
+            logger.info(f"  Amount error: max={amount_stats['max_error']:.2f}%, mean={amount_stats['mean_error']:.2f}%")
+            logger.info("  (Amount is derived to preserve ratios - small error expected)")
+        else:
+            logger.warning("  ⚠ Unable to compute amount error statistics (no data)")
         
         # Check consistency
         inconsistent = df_rounded.filter(
@@ -451,9 +454,21 @@ class TopDownSparkEngine:
         ).first()
         
         logger.info(f"\n  Ratio Statistics:")
-        logger.info(f"    Active cells: {ratio_stats['active_cells']:,}")
-        logger.info(f"    TX per card: {ratio_stats['mean_tx_per_card']:.2f} ± {ratio_stats['std_tx_per_card']:.2f}")
-        logger.info(f"    Avg amount: {ratio_stats['mean_avg_amount']:,.2f} ± {ratio_stats['std_avg_amount']:,.2f}")
+        if ratio_stats and ratio_stats['active_cells'] is not None and ratio_stats['active_cells'] > 0:
+            logger.info(f"    Active cells: {ratio_stats['active_cells']:,}")
+            
+            # Check for None values in ratio calculations
+            if ratio_stats['mean_tx_per_card'] is not None and ratio_stats['std_tx_per_card'] is not None:
+                logger.info(f"    TX per card: {ratio_stats['mean_tx_per_card']:.2f} ± {ratio_stats['std_tx_per_card']:.2f}")
+            else:
+                logger.info(f"    TX per card: N/A (no valid data)")
+            
+            if ratio_stats['mean_avg_amount'] is not None and ratio_stats['std_avg_amount'] is not None:
+                logger.info(f"    Avg amount: {ratio_stats['mean_avg_amount']:,.2f} ± {ratio_stats['std_avg_amount']:,.2f}")
+            else:
+                logger.info(f"    Avg amount: N/A (no valid data)")
+        else:
+            logger.warning("    ⚠ No active cells found (all data zeroed out)")
         
         # Cleanup
         if self._invariants is not None:

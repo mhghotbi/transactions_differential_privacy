@@ -77,6 +77,7 @@ class PrivacyConfig:
     noise_level: float = 0.15  # Relative noise level (15% std for count)
     cards_jitter: float = 0.05  # Jitter for derived unique_cards (5%)
     amount_jitter: float = 0.05  # Jitter for derived total_amount (5%)
+    noise_seed: int = 42  # Random seed for reproducible noise generation
     
     def validate(self) -> None:
         """Validate privacy configuration."""
@@ -277,6 +278,16 @@ class Config:
                 config.privacy.mcc_max_groups = int(sec['mcc_max_groups'])
             if 'mcc_min_mccs_per_group' in sec:
                 config.privacy.mcc_min_mccs_per_group = int(sec['mcc_min_mccs_per_group'])
+            
+            # Parse utility-focused noise parameters
+            if 'noise_level' in sec:
+                config.privacy.noise_level = float(sec['noise_level'])
+            if 'cards_jitter' in sec:
+                config.privacy.cards_jitter = float(sec['cards_jitter'])
+            if 'amount_jitter' in sec:
+                config.privacy.amount_jitter = float(sec['amount_jitter'])
+            if 'noise_seed' in sec:
+                config.privacy.noise_seed = int(sec['noise_seed'])
         
         # Load data section
         if 'data' in parser:
@@ -340,6 +351,10 @@ class Config:
             'mcc_min_groups': str(self.privacy.mcc_min_groups),
             'mcc_max_groups': str(self.privacy.mcc_max_groups),
             'mcc_min_mccs_per_group': str(self.privacy.mcc_min_mccs_per_group),
+            'noise_level': str(self.privacy.noise_level),
+            'cards_jitter': str(self.privacy.cards_jitter),
+            'amount_jitter': str(self.privacy.amount_jitter),
+            'noise_seed': str(self.privacy.noise_seed),
         }
         for query, weight in self.privacy.query_split.items():
             parser['privacy'][f'query_split_{query}'] = str(weight)
