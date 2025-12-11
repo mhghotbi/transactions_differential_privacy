@@ -73,6 +73,11 @@ class PrivacyConfig:
     mcc_group_caps: Optional[Dict[int, float]] = None  # group_id -> cap
     mcc_to_group: Optional[Dict[str, int]] = None  # mcc_code -> group_id
     
+    # Utility-focused noise parameters
+    noise_level: float = 0.15  # Relative noise level (15% std for count)
+    cards_jitter: float = 0.05  # Jitter for derived unique_cards (5%)
+    amount_jitter: float = 0.05  # Jitter for derived total_amount (5%)
+    
     def validate(self) -> None:
         """Validate privacy configuration."""
         geo_sum = sum(self.geographic_split.values())

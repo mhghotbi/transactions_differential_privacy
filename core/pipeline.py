@@ -294,7 +294,7 @@ class DPPipeline:
             # Import components (after Spark init)
             from reader.spark_reader import SparkTransactionReader
             from reader.preprocessor import TransactionPreprocessor
-            from engine.topdown import TopDownEngine
+            from engine.topdown_spark import TopDownSparkEngine
             from writer.parquet_writer import ParquetWriter
             
             # Step 1: Read data
@@ -331,7 +331,7 @@ class DPPipeline:
             logger.info("Step 3: Applying differential privacy")
             logger.info("=" * 60)
             
-            engine = TopDownEngine(
+            engine = TopDownSparkEngine(
                 spark=spark,
                 config=self.config,
                 geography=geography,
