@@ -380,7 +380,10 @@ class DPPipeline:
                 spark=spark,
                 config=self.config
             )
-            # Write both original and protected data with suffixes
+            # Write protected data (for standard output)
+            writer.write(protected_histograms)
+            
+            # Write both original and protected data with suffixes (for comparison)
             writer.write_comparison(
                 original_histogram=original_histograms,
                 protected_histogram=protected_histograms

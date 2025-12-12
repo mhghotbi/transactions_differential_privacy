@@ -57,11 +57,12 @@ class TopDownSparkEngine:
     
     NOISE APPLICATION:
     1. Compute plausibility bounds per context from data
-    2. Apply multiplicative jitter to transaction count
-    3. Clamp noisy count to context-specific bounds
-    4. Scale to match province invariant
-    5. Derive amount and cards from original ratios
-    6. Validate all outputs are logically consistent
+    2. Apply independent multiplicative jitter to all three values (count, cards, amount)
+    3. Clamp all noisy values to context-specific bounds
+    4. Validate and adjust ratios (avg_amount, tx_per_card) to stay within bounds
+    5. Scale all three values to match province invariants
+    6. Re-validate ratios after scaling and adjust if needed
+    7. Validate all outputs are logically consistent
     """
     
     def __init__(
@@ -106,12 +107,13 @@ class TopDownSparkEngine:
         1. Compute province invariants (count is exact)
         2. Compute plausibility bounds per (MCC, City, Weekday) context
         3. Store original ratios per cell
-        4. Apply multiplicative jitter with proper randomness
-        5. Clamp to plausibility bounds
-        6. Scale to match province invariant
-        7. Derive amount and cards from original ratios
-        8. Validate plausibility and consistency
+        4. Apply independent multiplicative jitter to all three values (count, cards, amount)
+        5. Clamp all values to plausibility bounds and validate/adjust ratios
+        6. Scale all three values to match province invariants
+        7. Re-validate ratios after scaling and adjust if needed
+        8. Finalize values and ensure consistency
         9. Controlled rounding
+        10. Final validation
         """
         logger.info("=" * 70)
         logger.info("CONTEXT-AWARE PLAUSIBILITY-BASED NOISE")
@@ -191,40 +193,115 @@ class TopDownSparkEngine:
         # PHASE 4: Apply Multiplicative Jitter with Proper Randomness
         # ========================================
         logger.info("\n" + "=" * 70)
-        logger.info("PHASE 4: Applying Multiplicative Jitter (Proper Random)")
+        logger.info("PHASE 4: Applying Multiplicative Jitter to All Three Values")
         logger.info("=" * 70)
         
         noise_level = self.noise_config.noise_level
         seed = self.noise_config.seed
         
-        # Use Spark's rand() with seed for proper randomness
+        # Get minimum noise deviation from config (default 0.01 = 1%)
+        min_deviation = getattr(self.config.privacy, 'min_noise_factor_deviation', 0.01)
+        
+        # Generate three independent noise factors using different seed offsets
+        # This ensures independence between count, cards, and amount noise
         # rand() generates uniform [0, 1), we transform to multiplicative factor
         # noise_factor = 1 + noise_level * (uniform - 0.5) * 2
         # This gives range [1 - noise_level, 1 + noise_level]
+        
+        # Noise factor for count
         df = df.withColumn(
-            'noise_uniform',
+            'noise_uniform_count',
             F.rand(seed=seed)
         ).withColumn(
-            'noise_factor',
-            1.0 + noise_level * (F.col('noise_uniform') - 0.5) * 2.0
-        ).withColumn(
-            'noisy_count_raw',
-            F.col('transaction_count').cast(DoubleType()) * F.col('noise_factor')
+            'noise_factor_count_raw',
+            1.0 + noise_level * (F.col('noise_uniform_count') - 0.5) * 2.0
         )
         
-        logger.info(f"  Noise level: ±{noise_level:.0%}")
-        logger.info(f"  Seed: {seed}")
-        logger.info(f"  Noise factor range: [{1-noise_level:.2f}, {1+noise_level:.2f}]")
-        logger.info("  ✓ Proper random noise applied")
+        # Noise factor for cards
+        df = df.withColumn(
+            'noise_uniform_cards',
+            F.rand(seed=seed + 1)
+        ).withColumn(
+            'noise_factor_cards_raw',
+            1.0 + noise_level * (F.col('noise_uniform_cards') - 0.5) * 2.0
+        )
         
-        # Drop intermediate noise column
-        df = df.drop('noise_uniform')
+        # Noise factor for amount
+        df = df.withColumn(
+            'noise_uniform_amount',
+            F.rand(seed=seed + 2)
+        ).withColumn(
+            'noise_factor_amount_raw',
+            1.0 + noise_level * (F.col('noise_uniform_amount') - 0.5) * 2.0
+        )
+        
+        # Enforce minimum deviation from 1.0 to prevent zero noise for all three factors
+        if min_deviation > 0:
+            df = df.withColumn(
+                'noise_factor_count',
+                F.when(
+                    F.abs(F.col('noise_factor_count_raw') - 1.0) < min_deviation,
+                    F.when(F.col('noise_factor_count_raw') >= 1.0,
+                           1.0 + min_deviation
+                    ).otherwise(
+                        1.0 - min_deviation
+                    )
+                ).otherwise(F.col('noise_factor_count_raw'))
+            ).withColumn(
+                'noise_factor_cards',
+                F.when(
+                    F.abs(F.col('noise_factor_cards_raw') - 1.0) < min_deviation,
+                    F.when(F.col('noise_factor_cards_raw') >= 1.0,
+                           1.0 + min_deviation
+                    ).otherwise(
+                        1.0 - min_deviation
+                    )
+                ).otherwise(F.col('noise_factor_cards_raw'))
+            ).withColumn(
+                'noise_factor_amount',
+                F.when(
+                    F.abs(F.col('noise_factor_amount_raw') - 1.0) < min_deviation,
+                    F.when(F.col('noise_factor_amount_raw') >= 1.0,
+                           1.0 + min_deviation
+                    ).otherwise(
+                        1.0 - min_deviation
+                    )
+                ).otherwise(F.col('noise_factor_amount_raw'))
+            ).drop('noise_factor_count_raw', 'noise_factor_cards_raw', 'noise_factor_amount_raw')
+        else:
+            df = df.withColumn('noise_factor_count', F.col('noise_factor_count_raw')) \
+                   .withColumn('noise_factor_cards', F.col('noise_factor_cards_raw')) \
+                   .withColumn('noise_factor_amount', F.col('noise_factor_amount_raw')) \
+                   .drop('noise_factor_count_raw', 'noise_factor_cards_raw', 'noise_factor_amount_raw')
+        
+        # Apply noise to all three values independently
+        df = df.withColumn(
+            'noisy_count_raw',
+            F.col('transaction_count').cast(DoubleType()) * F.col('noise_factor_count')
+        ).withColumn(
+            'noisy_cards_raw',
+            F.col('unique_cards').cast(DoubleType()) * F.col('noise_factor_cards')
+        ).withColumn(
+            'noisy_amount_raw',
+            F.col('total_amount').cast(DoubleType()) * F.col('noise_factor_amount')
+        )
+        
+        logger.info(f"  Noise level: ±{noise_level:.0%} (applied to all three values)")
+        logger.info(f"  Seed: {seed} (count), {seed+1} (cards), {seed+2} (amount)")
+        logger.info(f"  Noise factor range: [{1-noise_level:.2f}, {1+noise_level:.2f}]")
+        if min_deviation > 0:
+            logger.info(f"  Minimum noise deviation: ±{min_deviation:.1%} (prevents zero noise)")
+        logger.info("  ✓ Independent random noise applied to count, cards, and amount")
+        
+        # Drop intermediate noise columns
+        df = df.drop('noise_uniform_count', 'noise_uniform_cards', 'noise_uniform_amount',
+                     'noise_factor_count', 'noise_factor_cards', 'noise_factor_amount')
         
         # ========================================
-        # PHASE 5: Clamp to Plausibility Bounds
+        # PHASE 5: Clamp to Bounds and Validate/Adjust Ratios
         # ========================================
         logger.info("\n" + "=" * 70)
-        logger.info("PHASE 5: Clamping to Plausibility Bounds")
+        logger.info("PHASE 5: Clamping to Bounds & Validating Ratios")
         logger.info("=" * 70)
         
         # Join with bounds (context = mcc_idx, city_idx, weekday)
@@ -244,125 +321,356 @@ class TopDownSparkEngine:
             'tx_per_card_max': 100.0
         })
         
-        # Clamp noisy count to bounds
+        # Clamp all three noisy values to their respective bounds
+        # For count: use count_min/count_max
+        # For cards: derive from count bounds and tx_per_card bounds (cards = count / tx_per_card)
+        # For amount: derive from count bounds and avg_amount bounds (amount = count * avg_amount)
         df = df.withColumn(
             'noisy_count_clamped',
             F.greatest(
                 F.col('count_min'),
                 F.least(F.col('count_max'), F.col('noisy_count_raw'))
             )
+        ).withColumn(
+            'noisy_cards_clamped',
+            F.greatest(
+                F.lit(0.0),
+                F.least(
+                    F.col('noisy_count_clamped') / F.greatest(F.col('tx_per_card_min'), F.lit(1.0)),
+                    F.col('noisy_cards_raw')
+                )
+            )
+        ).withColumn(
+            'noisy_amount_clamped',
+            F.greatest(
+                F.lit(0.0),
+                F.least(
+                    F.col('noisy_count_clamped') * F.col('avg_amount_max'),
+                    F.col('noisy_amount_raw')
+                )
+            )
         )
         
         # Log clamping statistics
         clamping_stats = df.agg(
-            F.sum(F.when(F.col('noisy_count_raw') < F.col('count_min'), 1).otherwise(0)).alias('clamped_low'),
-            F.sum(F.when(F.col('noisy_count_raw') > F.col('count_max'), 1).otherwise(0)).alias('clamped_high'),
+            F.sum(F.when(F.col('noisy_count_raw') < F.col('count_min'), 1).otherwise(0)).alias('count_clamped_low'),
+            F.sum(F.when(F.col('noisy_count_raw') > F.col('count_max'), 1).otherwise(0)).alias('count_clamped_high'),
             F.count('*').alias('total_cells')
         ).first()
         
-        total_clamped = clamping_stats['clamped_low'] + clamping_stats['clamped_high']
+        total_clamped = clamping_stats['count_clamped_low'] + clamping_stats['count_clamped_high']
         pct_clamped = 100 * total_clamped / clamping_stats['total_cells'] if clamping_stats['total_cells'] > 0 else 0
-        logger.info(f"  Cells clamped low: {clamping_stats['clamped_low']:,}")
-        logger.info(f"  Cells clamped high: {clamping_stats['clamped_high']:,}")
-        logger.info(f"  Total clamped: {total_clamped:,} ({pct_clamped:.2f}%)")
-        logger.info("  ✓ Plausibility bounds enforced")
+        logger.info(f"  Count clamped: {total_clamped:,} cells ({pct_clamped:.2f}%)")
+        logger.info("  ✓ Values clamped to bounds")
+        
+        # Now compute actual ratios and validate/adjust if needed
+        df = df.withColumn(
+            'actual_avg_amount',
+            F.when(F.col('noisy_count_clamped') > 0,
+                   F.col('noisy_amount_clamped') / F.col('noisy_count_clamped'))
+             .otherwise(F.lit(0.0))
+        ).withColumn(
+            'actual_tx_per_card',
+            F.when(F.col('noisy_cards_clamped') > 0,
+                   F.col('noisy_count_clamped') / F.col('noisy_cards_clamped'))
+             .otherwise(F.lit(1.0))
+        )
+        
+        # Check if ratios are within bounds and make minimal adjustments
+        # If avg_amount is too low: increase noisy_amount_clamped to avg_amount_min * count
+        # If avg_amount is too high: decrease noisy_amount_clamped to avg_amount_max * count
+        # If tx_per_card is too low: decrease noisy_cards_clamped (increase tx_per_card)
+        # If tx_per_card is too high: increase noisy_cards_clamped (decrease tx_per_card)
+        df = df.withColumn(
+            'noisy_amount_adjusted',
+            F.when(
+                (F.col('noisy_count_clamped') > 0) & 
+                (F.col('actual_avg_amount') < F.col('avg_amount_min')),
+                F.col('noisy_count_clamped') * F.col('avg_amount_min')
+            ).when(
+                (F.col('noisy_count_clamped') > 0) & 
+                (F.col('actual_avg_amount') > F.col('avg_amount_max')),
+                F.col('noisy_count_clamped') * F.col('avg_amount_max')
+            ).otherwise(F.col('noisy_amount_clamped'))
+        ).withColumn(
+            'noisy_cards_adjusted',
+            F.when(
+                (F.col('noisy_count_clamped') > 0) & 
+                (F.col('actual_tx_per_card') > F.col('tx_per_card_max')),
+                F.col('noisy_count_clamped') / F.col('tx_per_card_max')
+            ).when(
+                (F.col('noisy_count_clamped') > 0) & 
+                (F.col('actual_tx_per_card') < F.col('tx_per_card_min')),
+                F.col('noisy_count_clamped') / F.col('tx_per_card_min')
+            ).otherwise(F.col('noisy_cards_clamped'))
+        )
+        
+        # Recompute ratios after adjustment
+        df = df.withColumn(
+            'final_avg_amount',
+            F.when(F.col('noisy_count_clamped') > 0,
+                   F.col('noisy_amount_adjusted') / F.col('noisy_count_clamped'))
+             .otherwise(F.lit(0.0))
+        ).withColumn(
+            'final_tx_per_card',
+            F.when(F.col('noisy_cards_adjusted') > 0,
+                   F.col('noisy_count_clamped') / F.col('noisy_cards_adjusted'))
+             .otherwise(F.lit(1.0))
+        )
+        
+        # Log ratio adjustment statistics
+        ratio_stats = df.agg(
+            F.sum(F.when(
+                (F.col('noisy_count_clamped') > 0) & 
+                ((F.col('actual_avg_amount') < F.col('avg_amount_min')) | 
+                 (F.col('actual_avg_amount') > F.col('avg_amount_max'))),
+                1).otherwise(0)
+            ).alias('avg_amount_adjusted'),
+            F.sum(F.when(
+                (F.col('noisy_count_clamped') > 0) & 
+                ((F.col('actual_tx_per_card') < F.col('tx_per_card_min')) | 
+                 (F.col('actual_tx_per_card') > F.col('tx_per_card_max'))),
+                1).otherwise(0)
+            ).alias('tx_per_card_adjusted'),
+            F.count('*').alias('total')
+        ).first()
+        
+        if ratio_stats['total'] > 0:
+            avg_amt_pct = 100 * (ratio_stats['avg_amount_adjusted'] or 0) / ratio_stats['total']
+            tx_card_pct = 100 * (ratio_stats['tx_per_card_adjusted'] or 0) / ratio_stats['total']
+            logger.info(f"  Avg amount adjusted: {ratio_stats['avg_amount_adjusted'] or 0:,} cells ({avg_amt_pct:.2f}%)")
+            logger.info(f"  TX per card adjusted: {ratio_stats['tx_per_card_adjusted'] or 0:,} cells ({tx_card_pct:.2f}%)")
+        
+        logger.info("  ✓ Ratios validated and adjusted to stay within bounds")
+        
+        # Rename to final noisy values
+        df = df.withColumn('noisy_count', F.col('noisy_count_clamped')) \
+               .withColumn('noisy_cards', F.col('noisy_cards_adjusted')) \
+               .withColumn('noisy_amount', F.col('noisy_amount_adjusted'))
         
         # Drop intermediate columns
-        df = df.drop('noise_factor', 'noisy_count_raw')
+        df = df.drop('noisy_count_raw', 'noisy_cards_raw', 'noisy_amount_raw',
+                     'noisy_count_clamped', 'noisy_cards_clamped', 'noisy_amount_clamped',
+                     'noisy_amount_adjusted', 'noisy_cards_adjusted',
+                     'actual_avg_amount', 'actual_tx_per_card',
+                     'final_avg_amount', 'final_tx_per_card')
         
         # ========================================
-        # PHASE 6: Scale to Match Province Invariant
+        # PHASE 6: Scale to Match Province Invariants
         # ========================================
         logger.info("\n" + "=" * 70)
-        logger.info("PHASE 6: Scaling to Match Province Invariant")
+        logger.info("PHASE 6: Scaling All Three Values to Match Province Invariants")
         logger.info("=" * 70)
         
-        # Compute sum of clamped noisy counts per province
+        # Compute sums of noisy values per province
         window = Window.partitionBy('province_idx')
-        df = df.withColumn('noisy_count_sum', F.sum('noisy_count_clamped').over(window))
+        df = df.withColumn('noisy_count_sum', F.sum('noisy_count').over(window)) \
+               .withColumn('noisy_cards_sum', F.sum('noisy_cards').over(window)) \
+               .withColumn('noisy_amount_sum', F.sum('noisy_amount').over(window))
         
         # Join invariants
         df = df.join(F.broadcast(self._invariants), 'province_idx', 'left')
         
-        # Compute scale factor
+        # Compute scale factors for all three values
         df = df.withColumn(
-            'scale_factor',
+            'scale_factor_count',
             F.when(F.col('noisy_count_sum') > 0,
                    F.col('invariant_count') / F.col('noisy_count_sum'))
              .otherwise(F.lit(1.0))
-        )
-        
-        # Apply scaling
-        df = df.withColumn('scaled_count', F.col('noisy_count_clamped') * F.col('scale_factor'))
-        
-        logger.info("  ✓ Scaled to match province invariant")
-        
-        # Drop intermediate columns
-        df = df.drop('noisy_count_clamped', 'noisy_count_sum', 'scale_factor')
-        
-        # ========================================
-        # PHASE 7: Derive Amount and Cards from Original Ratios WITH BOUNDS
-        # ========================================
-        logger.info("\n" + "=" * 70)
-        logger.info("PHASE 7: Deriving Amount & Cards (Ratio Preservation + Bounds)")
-        logger.info("=" * 70)
-        
-        # Derive amount: noisy_count * original_avg_amount
-        # BUT clamp avg_amount to plausibility bounds first
-        df = df.withColumn(
-            'clamped_avg_amount',
-            F.greatest(
-                F.col('avg_amount_min'),
-                F.least(F.col('avg_amount_max'), F.col('original_avg_amount'))
-            )
         ).withColumn(
-            'derived_amount',
-            F.col('scaled_count') * F.col('clamped_avg_amount')
-        )
-        
-        # Derive cards: noisy_count / original_tx_per_card
-        # BUT clamp tx_per_card to plausibility bounds first
-        df = df.withColumn(
-            'clamped_tx_per_card',
-            F.greatest(
-                F.col('tx_per_card_min'),
-                F.least(F.col('tx_per_card_max'), F.col('original_tx_per_card'))
-            )
+            'scale_factor_cards',
+            F.when(F.col('noisy_cards_sum') > 0,
+                   F.col('original_cards_sum') / F.col('noisy_cards_sum'))
+             .otherwise(F.lit(1.0))
         ).withColumn(
-            'derived_cards',
-            F.col('scaled_count') / F.greatest(F.col('clamped_tx_per_card'), F.lit(1.0))
+            'scale_factor_amount',
+            F.when(F.col('noisy_amount_sum') > 0,
+                   F.col('invariant_amount') / F.col('noisy_amount_sum'))
+             .otherwise(F.lit(1.0))
         )
         
-        # Log ratio clamping stats
-        ratio_clamp_stats = df.agg(
-            F.sum(F.when(F.col('original_avg_amount') < F.col('avg_amount_min'), 1).otherwise(0)).alias('avg_amt_clamped_low'),
-            F.sum(F.when(F.col('original_avg_amount') > F.col('avg_amount_max'), 1).otherwise(0)).alias('avg_amt_clamped_high'),
-            F.sum(F.when(F.col('original_tx_per_card') < F.col('tx_per_card_min'), 1).otherwise(0)).alias('tx_card_clamped_low'),
-            F.sum(F.when(F.col('original_tx_per_card') > F.col('tx_per_card_max'), 1).otherwise(0)).alias('tx_card_clamped_high'),
+        # Apply scaling to all three values
+        df = df.withColumn('scaled_count', F.col('noisy_count') * F.col('scale_factor_count')) \
+               .withColumn('scaled_cards', F.col('noisy_cards') * F.col('scale_factor_cards')) \
+               .withColumn('scaled_amount', F.col('noisy_amount') * F.col('scale_factor_amount'))
+        
+        logger.info("  ✓ All three values scaled to match province invariants")
+        
+        # After scaling, re-validate ratios and adjust if needed (ratios may change after scaling)
+        df = df.withColumn(
+            'scaled_avg_amount',
+            F.when(F.col('scaled_count') > 0,
+                   F.col('scaled_amount') / F.col('scaled_count'))
+             .otherwise(F.lit(0.0))
+        ).withColumn(
+            'scaled_tx_per_card',
+            F.when(F.col('scaled_cards') > 0,
+                   F.col('scaled_count') / F.col('scaled_cards'))
+             .otherwise(F.lit(1.0))
+        )
+        
+        # Adjust if ratios are out of bounds after scaling
+        df = df.withColumn(
+            'scaled_amount_final',
+            F.when(
+                (F.col('scaled_count') > 0) & 
+                (F.col('scaled_avg_amount') < F.col('avg_amount_min')),
+                F.col('scaled_count') * F.col('avg_amount_min')
+            ).when(
+                (F.col('scaled_count') > 0) & 
+                (F.col('scaled_avg_amount') > F.col('avg_amount_max')),
+                F.col('scaled_count') * F.col('avg_amount_max')
+            ).otherwise(F.col('scaled_amount'))
+        ).withColumn(
+            'scaled_cards_final',
+            F.when(
+                (F.col('scaled_count') > 0) & 
+                (F.col('scaled_tx_per_card') > F.col('tx_per_card_max')),
+                F.col('scaled_count') / F.col('tx_per_card_max')
+            ).when(
+                (F.col('scaled_count') > 0) & 
+                (F.col('scaled_tx_per_card') < F.col('tx_per_card_min')),
+                F.col('scaled_count') / F.col('tx_per_card_min')
+            ).otherwise(F.col('scaled_cards'))
+        )
+        
+        # Ensure consistency: if count=0, then cards=0 and amount=0
+        df = df.withColumn(
+            'scaled_count_final',
+            F.when(F.col('scaled_count') <= 0.5, F.lit(0.0))
+             .otherwise(F.col('scaled_count'))
+        ).withColumn(
+            'scaled_cards_final',
+            F.when(F.col('scaled_count_final') == 0, F.lit(0.0))
+             .otherwise(F.col('scaled_cards_final'))
+        ).withColumn(
+            'scaled_amount_final',
+            F.when(F.col('scaled_count_final') == 0, F.lit(0.0))
+             .otherwise(F.col('scaled_amount_final'))
+        )
+        
+        # Log post-scaling ratio adjustments
+        post_scale_stats = df.agg(
+            F.sum(F.when(
+                (F.col('scaled_count') > 0) & 
+                ((F.col('scaled_avg_amount') < F.col('avg_amount_min')) | 
+                 (F.col('scaled_avg_amount') > F.col('avg_amount_max'))),
+                1).otherwise(0)
+            ).alias('post_scale_avg_amount_adjusted'),
+            F.sum(F.when(
+                (F.col('scaled_count') > 0) & 
+                ((F.col('scaled_tx_per_card') < F.col('tx_per_card_min')) | 
+                 (F.col('scaled_tx_per_card') > F.col('tx_per_card_max'))),
+                1).otherwise(0)
+            ).alias('post_scale_tx_per_card_adjusted'),
             F.count('*').alias('total')
         ).first()
         
-        logger.info(f"  Avg amount ratio clamped: {ratio_clamp_stats['avg_amt_clamped_low'] + ratio_clamp_stats['avg_amt_clamped_high']:,} cells")
-        logger.info(f"  TX/card ratio clamped: {ratio_clamp_stats['tx_card_clamped_low'] + ratio_clamp_stats['tx_card_clamped_high']:,} cells")
-        logger.info("  ✓ Amount derived with bounded avg_amount ratio")
-        logger.info("  ✓ Cards derived with bounded tx_per_card ratio")
+        if post_scale_stats['total'] > 0:
+            avg_amt_pct = 100 * (post_scale_stats['post_scale_avg_amount_adjusted'] or 0) / post_scale_stats['total']
+            tx_card_pct = 100 * (post_scale_stats['post_scale_tx_per_card_adjusted'] or 0) / post_scale_stats['total']
+            logger.info(f"  Post-scaling avg amount adjusted: {post_scale_stats['post_scale_avg_amount_adjusted'] or 0:,} cells ({avg_amt_pct:.2f}%)")
+            logger.info(f"  Post-scaling TX per card adjusted: {post_scale_stats['post_scale_tx_per_card_adjusted'] or 0:,} cells ({tx_card_pct:.2f}%)")
         
-        # Drop intermediate clamping columns
-        df = df.drop('clamped_avg_amount', 'clamped_tx_per_card')
+        logger.info("  ✓ Ratios re-validated after scaling")
+        
+        # Rename to final scaled values
+        df = df.withColumn('scaled_count', F.col('scaled_count_final')) \
+               .withColumn('scaled_cards', F.col('scaled_cards_final')) \
+               .withColumn('scaled_amount', F.col('scaled_amount_final'))
+        
+        # Drop intermediate columns
+        df = df.drop('noisy_count', 'noisy_cards', 'noisy_amount',
+                     'noisy_count_sum', 'noisy_cards_sum', 'noisy_amount_sum',
+                     'scale_factor_count', 'scale_factor_cards', 'scale_factor_amount',
+                     'scaled_avg_amount', 'scaled_tx_per_card',
+                     'scaled_count_final', 'scaled_cards_final', 'scaled_amount_final')
         
         # ========================================
-        # PHASE 8: Validate Plausibility and Consistency
+        # PHASE 7: Finalize Values and Ensure Consistency
         # ========================================
         logger.info("\n" + "=" * 70)
-        logger.info("PHASE 8: Validating Plausibility & Consistency")
+        logger.info("PHASE 7: Finalizing Values & Ensuring Consistency")
         logger.info("=" * 70)
         
-        df = self._validate_plausibility(df)
+        # Values already have noise applied and ratios validated
+        # Just rename to final names and ensure consistency constraints
+        df = df.withColumn('final_count', F.col('scaled_count')) \
+               .withColumn('final_cards', F.col('scaled_cards')) \
+               .withColumn('final_amount', F.col('scaled_amount'))
         
-        logger.info("  ✓ Plausibility and consistency validated")
+        # Ensure consistency constraints:
+        # 1. If count <= 0.5, set count/cards/amount to 0
+        # 2. If count > 0, cards must be >= 1 and <= count
+        # 3. Amount must be >= 0
+        df = df.withColumn(
+            'final_count',
+            F.when(F.col('final_count') <= 0.5, F.lit(0.0))
+             .otherwise(F.greatest(F.lit(1.0), F.col('final_count')))
+        ).withColumn(
+            'final_cards',
+            F.when(F.col('final_count') == 0, F.lit(0.0))
+             .otherwise(
+                 F.greatest(
+                     F.lit(1.0),
+                     F.least(F.col('final_cards'), F.col('final_count'))
+                 )
+             )
+        ).withColumn(
+            'final_amount',
+            F.when(F.col('final_count') == 0, F.lit(0.0))
+             .otherwise(F.greatest(F.lit(0.0), F.col('final_amount')))
+        )
         
-        # Drop intermediate columns (keep only final_*, invariant, bounds, and original ratios)
-        df = df.drop('scaled_count', 'derived_amount', 'derived_cards', 
+        # Log final statistics
+        final_stats = df.agg(
+            F.sum('final_count').alias('total_count'),
+            F.sum('final_cards').alias('total_cards'),
+            F.sum('final_amount').alias('total_amount'),
+            F.count('*').alias('total_cells')
+        ).first()
+        
+        logger.info(f"  Final total count: {final_stats['total_count']:,.0f}")
+        logger.info(f"  Final total cards: {final_stats['total_cards']:,.0f}")
+        logger.info(f"  Final total amount: {final_stats['total_amount']:,.0f}")
+        logger.info(f"  Total cells: {final_stats['total_cells']:,}")
+        logger.info("  ✓ Values finalized and consistency ensured")
+        
+        # ========================================
+        # PHASE 8: Final Validation
+        # ========================================
+        logger.info("\n" + "=" * 70)
+        logger.info("PHASE 8: Final Validation")
+        logger.info("=" * 70)
+        
+        # Values are already validated in Phase 7
+        # Just do a final check for consistency
+        inconsistent = df.filter(
+            ((F.col('final_count') == 0) & (F.col('final_cards') > 0)) |
+            ((F.col('final_count') == 0) & (F.col('final_amount') > 0)) |
+            ((F.col('final_count') > 0) & (F.col('final_cards') == 0)) |
+            (F.col('final_cards') > F.col('final_count'))
+        ).count()
+        
+        if inconsistent > 0:
+            logger.warning(f"  ⚠ Found {inconsistent} inconsistent cells (will be fixed)")
+            # Fix any remaining inconsistencies
+            df = df.withColumn(
+                'final_cards',
+                F.when(F.col('final_count') == 0, F.lit(0.0))
+                 .when(F.col('final_cards') > F.col('final_count'), F.col('final_count'))
+                 .when((F.col('final_count') > 0) & (F.col('final_cards') == 0), F.lit(1.0))
+                 .otherwise(F.col('final_cards'))
+            ).withColumn(
+                'final_amount',
+                F.when(F.col('final_count') == 0, F.lit(0.0))
+                 .otherwise(F.col('final_amount'))
+            )
+        
+        logger.info("  ✓ Final validation complete")
+        
+        # Drop intermediate columns (keep only final_*, invariant, and bounds)
+        df = df.drop('scaled_count', 'scaled_cards', 'scaled_amount',
                      'original_avg_amount', 'original_tx_per_card')
         
         # ========================================
