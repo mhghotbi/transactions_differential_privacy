@@ -186,15 +186,26 @@ class ParquetWriter:
         # Rename columns with suffixes
         logger.info("Renaming columns with _real and _dp suffixes...")
         
-        # Original data: rename value columns to _real
+        # Original data: rename value columns to _real, drop transaction_date to avoid ambiguity
         for col in ['transaction_count', 'unique_cards', 'transaction_amount_sum']:
             if col in df_original.columns:
                 df_original = df_original.withColumnRenamed(col, f'{col}_real')
         
-        # Protected data: rename value columns to _dp
+        # Keep transaction_date from original for later
+        transaction_date_col = None
+        if 'transaction_date' in df_original.columns:
+            transaction_date_col = 'transaction_date'
+            # Temporarily store it as a different name in original
+            df_original = df_original.withColumnRenamed('transaction_date', 'transaction_date_temp')
+        
+        # Protected data: rename value columns to _dp, drop transaction_date to avoid ambiguity
         for col in ['transaction_count', 'unique_cards', 'transaction_amount_sum']:
             if col in df_protected.columns:
                 df_protected = df_protected.withColumnRenamed(col, f'{col}_dp')
+        
+        # Drop transaction_date from protected (we'll use original's)
+        if 'transaction_date' in df_protected.columns:
+            df_protected = df_protected.drop('transaction_date')
         
         # Join on dimension columns
         logger.info("Joining original and protected data...")
@@ -206,9 +217,9 @@ class ParquetWriter:
             how='outer'  # outer join to catch any missing cells
         )
         
-        # Add transaction_date from either side (should be same)
-        if 'transaction_date' in df_comparison.columns:
-            pass  # Already exists from join
+        # Restore transaction_date column
+        if transaction_date_col:
+            df_comparison = df_comparison.withColumnRenamed('transaction_date_temp', 'transaction_date')
         else:
             df_comparison = df_comparison.withColumn('transaction_date', F.col('day_idx').cast('string'))
         

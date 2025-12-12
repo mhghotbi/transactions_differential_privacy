@@ -8,7 +8,6 @@ import os
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from fractions import Fraction
 from pathlib import Path
 
 
@@ -17,30 +16,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PrivacyConfig:
-    """Privacy-related configuration."""
-    total_rho: Fraction = field(default_factory=lambda: Fraction(1, 4))  # 0.25 monthly
-    delta: float = 1e-10
-    geographic_split: Dict[str, float] = field(default_factory=lambda: {
-        "province": 0.2,
-        "city": 0.8
-    })
-    query_split: Dict[str, float] = field(default_factory=lambda: {
-        "transaction_count": 0.34,
-        "unique_cards": 0.33,
-        "total_amount": 0.33
-    })
+    """Statistical Disclosure Control configuration."""
     
     # Bounded contribution settings
     contribution_bound_method: str = "transaction_weighted_percentile"  # 'transaction_weighted_percentile', 'iqr', 'percentile', or 'fixed'
     contribution_bound_iqr_multiplier: float = 1.5
     contribution_bound_fixed: int = 5
     contribution_bound_percentile: float = 99.0
-    contribution_bound_per_group: bool = True  # Compute K per MCC group for memory efficiency (large datasets)
+    contribution_bound_per_group: bool = True  # Compute K per MCC for memory efficiency (large datasets)
     
     # Computed K value (set after analysis)
     computed_contribution_bound: Optional[int] = None
     
-    # Computed D_max (max cells per card) for user-level DP
+    # Computed D_max (max cells per card)
     computed_d_max: Optional[int] = None
     
     # Suppression settings
@@ -48,40 +36,20 @@ class PrivacyConfig:
     suppression_method: str = "flag"  # 'flag', 'null', or 'value'
     suppression_sentinel: int = -1  # Sentinel value for suppressed cells (if method='value')
     
-    # Confidence interval settings
-    confidence_levels: List[float] = field(default_factory=lambda: [0.90])  # Default 90% CI
-    include_relative_moe: bool = True  # Include relative margin of error
-    
-    # Global sensitivity settings
-    sensitivity_method: str = "global"  # 'local', 'global', or 'fixed'
-    fixed_max_cells_per_card: int = 100  # For 'fixed' sensitivity method
-    
     # Per-MCC winsorization settings
-    # Each MCC is processed separately (parallel composition - each gets full budget)
     mcc_cap_percentile: float = 99.0  # Percentile for per-MCC winsorization caps
     
     # Computed per-MCC caps (set during preprocessing)
     mcc_caps: Optional[Dict[str, float]] = None  # mcc_code -> winsorization_cap
     
-    # Utility-focused noise parameters
+    # Utility-focused noise parameters (SDC)
     noise_level: float = 0.15  # Relative noise level (15% std for count)
     cards_jitter: float = 0.05  # Jitter for derived unique_cards (5%)
     amount_jitter: float = 0.05  # Jitter for derived total_amount (5%)
     noise_seed: int = 42  # Random seed for reproducible noise generation
     
     def validate(self) -> None:
-        """Validate privacy configuration."""
-        geo_sum = sum(self.geographic_split.values())
-        if abs(geo_sum - 1.0) > 1e-6:
-            raise ValueError(f"Geographic split must sum to 1.0, got {geo_sum}")
-        
-        query_sum = sum(self.query_split.values())
-        if abs(query_sum - 1.0) > 1e-6:
-            raise ValueError(f"Query split must sum to 1.0, got {query_sum}")
-        
-        if self.total_rho <= 0:
-            raise ValueError(f"total_rho must be positive, got {self.total_rho}")
-        
+        """Validate SDC configuration."""
         if self.contribution_bound_method not in ('transaction_weighted_percentile', 'iqr', 'percentile', 'fixed'):
             raise ValueError(f"contribution_bound_method must be 'transaction_weighted_percentile', 'iqr', 'percentile', or 'fixed', got {self.contribution_bound_method}")
         
@@ -93,13 +61,6 @@ class PrivacyConfig:
         
         if self.suppression_method not in ('flag', 'null', 'value'):
             raise ValueError(f"suppression_method must be 'flag', 'null', or 'value', got {self.suppression_method}")
-        
-        if self.sensitivity_method not in ('local', 'global', 'fixed'):
-            raise ValueError(f"sensitivity_method must be 'local', 'global', or 'fixed', got {self.sensitivity_method}")
-        
-        for level in self.confidence_levels:
-            if not 0 < level < 1:
-                raise ValueError(f"confidence_level must be in (0, 1), got {level}")
         
         if not 0 < self.mcc_cap_percentile <= 100:
             raise ValueError(f"mcc_cap_percentile must be in (0, 100], got {self.mcc_cap_percentile}")
@@ -190,23 +151,9 @@ class Config:
         
         config = cls()
         
-        # Load privacy section
+        # Load privacy section (SDC settings)
         if 'privacy' in parser:
             sec = parser['privacy']
-            config.privacy.total_rho = Fraction(sec.get('total_rho', '1'))
-            config.privacy.delta = float(sec.get('delta', '1e-10'))
-            
-            # Parse geographic split
-            if 'geographic_split_province' in sec:
-                config.privacy.geographic_split['province'] = float(sec['geographic_split_province'])
-            if 'geographic_split_city' in sec:
-                config.privacy.geographic_split['city'] = float(sec['geographic_split_city'])
-            
-            # Parse query split
-            for query in ['transaction_count', 'unique_cards', 'total_amount']:
-                key = f'query_split_{query}'
-                if key in sec:
-                    config.privacy.query_split[query] = float(sec[key])
             
             # Parse bounded contribution settings
             if 'contribution_bound_method' in sec:
@@ -227,18 +174,6 @@ class Config:
                 config.privacy.suppression_method = sec['suppression_method']
             if 'suppression_sentinel' in sec:
                 config.privacy.suppression_sentinel = int(sec['suppression_sentinel'])
-            
-            # Parse confidence interval settings
-            if 'confidence_levels' in sec:
-                config.privacy.confidence_levels = [float(x.strip()) for x in sec['confidence_levels'].split(',')]
-            if 'include_relative_moe' in sec:
-                config.privacy.include_relative_moe = sec.getboolean('include_relative_moe')
-            
-            # Parse global sensitivity settings
-            if 'sensitivity_method' in sec:
-                config.privacy.sensitivity_method = sec['sensitivity_method']
-            if 'fixed_max_cells_per_card' in sec:
-                config.privacy.fixed_max_cells_per_card = int(sec['fixed_max_cells_per_card'])
             
             # Parse per-MCC winsorization settings
             if 'mcc_cap_percentile' in sec:
@@ -289,12 +224,8 @@ class Config:
         """Save configuration to INI file."""
         parser = configparser.ConfigParser()
         
-        # Privacy section
+        # Privacy section (SDC settings)
         parser['privacy'] = {
-            'total_rho': str(self.privacy.total_rho),
-            'delta': str(self.privacy.delta),
-            'geographic_split_province': str(self.privacy.geographic_split['province']),
-            'geographic_split_city': str(self.privacy.geographic_split['city']),
             'contribution_bound_method': self.privacy.contribution_bound_method,
             'contribution_bound_iqr_multiplier': str(self.privacy.contribution_bound_iqr_multiplier),
             'contribution_bound_fixed': str(self.privacy.contribution_bound_fixed),
@@ -303,18 +234,12 @@ class Config:
             'suppression_threshold': str(self.privacy.suppression_threshold),
             'suppression_method': self.privacy.suppression_method,
             'suppression_sentinel': str(self.privacy.suppression_sentinel),
-            'confidence_levels': ','.join(str(x) for x in self.privacy.confidence_levels),
-            'include_relative_moe': str(self.privacy.include_relative_moe).lower(),
-            'sensitivity_method': self.privacy.sensitivity_method,
-            'fixed_max_cells_per_card': str(self.privacy.fixed_max_cells_per_card),
             'mcc_cap_percentile': str(self.privacy.mcc_cap_percentile),
             'noise_level': str(self.privacy.noise_level),
             'cards_jitter': str(self.privacy.cards_jitter),
             'amount_jitter': str(self.privacy.amount_jitter),
             'noise_seed': str(self.privacy.noise_seed),
         }
-        for query, weight in self.privacy.query_split.items():
-            parser['privacy'][f'query_split_{query}'] = str(weight)
         
         # Data section
         parser['data'] = {

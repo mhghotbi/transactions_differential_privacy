@@ -26,7 +26,6 @@ from pyspark.sql.types import DoubleType, LongType, StructType, StructField, Int
 from core.config import Config
 from schema.geography import Geography
 from schema.histogram_spark import SparkHistogram
-from core.budget import Budget
 
 
 logger = logging.getLogger(__name__)
@@ -69,14 +68,12 @@ class TopDownSparkEngine:
         self,
         spark: SparkSession,
         config: Config,
-        geography: Geography,
-        budget: Budget
+        geography: Geography
     ):
         """Initialize context-aware noise engine."""
         self.spark = spark
         self.config = config
         self.geography = geography
-        self.budget = budget
         
         # Noise configuration
         self.noise_config = NoiseConfig(
@@ -98,8 +95,8 @@ class TopDownSparkEngine:
         logger.info("=" * 60)
     
     def set_user_level_params(self, d_max: int, k_bound: int, winsorize_cap: float) -> None:
-        """Set user-level DP parameters (for compatibility)."""
-        logger.info(f"User-level params: D_max={d_max}, K={k_bound}, Cap={winsorize_cap:,.0f}")
+        """Set bounded contribution parameters (D_max, K, winsorize cap) from preprocessing."""
+        logger.info(f"Bounded contribution params: D_max={d_max}, K={k_bound}, Winsorize_cap={winsorize_cap:,.0f}")
     
     def run(self, histogram: SparkHistogram) -> SparkHistogram:
         """

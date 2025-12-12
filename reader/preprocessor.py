@@ -26,14 +26,15 @@ logger = logging.getLogger(__name__)
 
 class TransactionPreprocessor:
     """
-    Preprocesses transaction data for DP processing.
+    Preprocesses transaction data for SDC processing.
     
     Steps:
-    1. Compute winsorization cap from percentile
-    2. Apply winsorization to amounts
-    3. Calculate day indices
-    4. Create dimension indices (city, mcc)
-    5. Aggregate to histogram structure
+    1. Compute per-MCC winsorization caps to handle outliers
+    2. Apply bounded contribution (K) to limit cards' per-cell contributions
+    3. Apply winsorization to transaction amounts
+    4. Calculate day and weekday indices
+    5. Create dimension indices (province, city, mcc)
+    6. Aggregate to histogram structure per (province, city, mcc, day, weekday)
     """
     
     def __init__(
@@ -59,7 +60,7 @@ class TransactionPreprocessor:
         self._city_to_idx: Dict[str, int] = {}
         self._min_date: Optional[date] = None
         self._mcc_caps = None  # Dict[str, float]: mcc_code -> cap
-        self._d_max: Optional[int] = None  # Max cells per card for user-level DP
+        self._d_max: Optional[int] = None  # Max cells per card (for bounded contribution analysis)
     
     def process(self, df: DataFrame) -> TransactionHistogram:
         """
@@ -94,74 +95,12 @@ class TransactionPreprocessor:
         
         return histogram
     
-    @staticmethod
-    def _compute_mcc_groups_static(
-        df: DataFrame,
-        mcc_col: str = 'mcc',
-        amount_col: str = 'amount',
-        num_groups: int = 3,
-        cap_percentile: float = 99.0,
-        column_name: str = 'mcc_group_k'
-    ) -> DataFrame:
-        """
-        Static method to compute MCC groups without needing instance state.
-        
-        This is used for K computation grouping (separate from main DP grouping).
-        
-        Args:
-            df: Input DataFrame
-            mcc_col: MCC column name
-            amount_col: Amount column name
-            num_groups: Number of groups to create
-            cap_percentile: Percentile for winsorization cap
-            column_name: Name for the output group column
-            
-        Returns:
-            DataFrame with added group column
-        """
-        from core.mcc_groups import compute_mcc_groups_spark
-        
-        # Get Spark session from DataFrame
-        spark = df.sql_ctx.sparkSession
-        
-        logger.info(f"Computing {num_groups}-group MCC stratification for {column_name}...")
-        
-        mcc_grouping = compute_mcc_groups_spark(
-            df=df,
-            mcc_col=mcc_col,
-            amount_col=amount_col,
-            num_groups=num_groups,
-            cap_percentile=cap_percentile
-        )
-        
-        # Add MCC group column to DataFrame
-        mcc_group_data = [
-            (mcc, group_id) 
-            for mcc, group_id in mcc_grouping.mcc_to_group.items()
-        ]
-        mcc_group_schema = StructType([
-            StructField("mcc_key_temp", StringType(), False),
-            StructField(column_name, IntegerType(), False),
-        ])
-        mcc_group_df = spark.createDataFrame(mcc_group_data, schema=mcc_group_schema)
-        
-        # Broadcast small MCC group lookup table (~300 MCCs) for efficient join
-        df = df.join(F.broadcast(mcc_group_df), df[mcc_col] == mcc_group_df.mcc_key_temp, "left").drop("mcc_key_temp")
-        
-        # Fill unknown MCCs with highest group (conservative)
-        max_group = max(mcc_grouping.group_info.keys()) if mcc_grouping.group_info else 0
-        df = df.fillna({column_name: max_group})
-        
-        logger.info(f"Created {mcc_grouping.num_groups} groups for {column_name}")
-        
-        return df
-    
     def _compute_per_mcc_caps(self, df: DataFrame) -> DataFrame:
         """
         Compute winsorization cap per individual MCC.
         
-        Each MCC is processed separately (parallel composition - each gets full privacy budget).
-        This is more granular than grouping MCCs, providing better utility.
+        Each MCC is processed separately for more granular outlier handling.
+        This provides better utility than global winsorization across all MCCs.
         """
         logger.info("Computing per-MCC winsorization caps...")
         logger.info(f"Percentile: {self.config.privacy.mcc_cap_percentile}")
@@ -200,8 +139,7 @@ class TransactionPreprocessor:
             iqr_multiplier=self.config.privacy.contribution_bound_iqr_multiplier,
             fixed_k=self.config.privacy.contribution_bound_fixed,
             percentile=self.config.privacy.contribution_bound_percentile,
-            compute_per_group=self.config.privacy.contribution_bound_per_group,
-            num_groups_for_k=self.config.privacy.mcc_num_groups_for_k
+            compute_per_group=self.config.privacy.contribution_bound_per_group
         )
         
         # Need day_idx for cell definition, compute it temporarily
@@ -236,9 +174,9 @@ class TransactionPreprocessor:
             order_col='transaction_date'
         )
         
-        # === USER-LEVEL DP: Compute D_max (max cells per card) ===
+        # === Compute D_max (max cells per card for bounded contribution analysis) ===
         logger.info("")
-        logger.info("Computing D_max for user-level sensitivity...")
+        logger.info("Computing D_max (max cells per card)...")
         sensitivity_calc = GlobalSensitivityCalculator(
             spark=self.spark,
             method="user_level"
@@ -249,11 +187,11 @@ class TransactionPreprocessor:
             cell_columns=['acceptor_city', 'mcc', 'day_idx_temp']
         )
         
-        # Store D_max in config for TopDownEngine
+        # Store D_max in config for engine
         self._d_max = d_max
         self.config.privacy.computed_d_max = d_max
         
-        logger.info(f"User-Level DP Parameters:")
+        logger.info(f"Bounded Contribution Parameters:")
         logger.info(f"  K (per-cell bound): {k}")
         logger.info(f"  D_max (max cells per card): {d_max}")
         logger.info(f"  sqrt(D_max): {d_max**0.5:.4f}")
@@ -453,7 +391,7 @@ class TransactionPreprocessor:
         Aggregate data to SparkHistogram structure (100% Spark, ZERO collect).
         
         CRITICAL: Computes BOTH winsorized and original amounts:
-        - total_amount (winsorized): For DP noise calibration
+        - total_amount (winsorized): For SDC processing (outliers handled)
         - total_amount_original: For computing invariants that match public data
         
         Returns SparkHistogram that keeps all data distributed (no driver memory).
@@ -468,7 +406,7 @@ class TransactionPreprocessor:
         ).agg(
             F.count('*').cast('long').alias('transaction_count'),
             F.countDistinct(F.col('card_number')).cast('long').alias('unique_cards'),
-            F.sum(F.col('amount_winsorized')).cast('long').alias('total_amount'),         # Winsorized (for DP sensitivity)
+            F.sum(F.col('amount_winsorized')).cast('long').alias('total_amount'),         # Winsorized (outliers handled)
             F.sum(F.col('amount')).cast('long').alias('total_amount_original')             # Original (for invariants)
         )
         
@@ -549,5 +487,5 @@ class TransactionPreprocessor:
     
     @property
     def d_max(self) -> Optional[int]:
-        """Get D_max (max cells per card) for user-level DP sensitivity."""
+        """Get D_max (max cells per card) for bounded contribution analysis."""
         return self._d_max

@@ -195,8 +195,7 @@ class DistributedPreprocessor:
             iqr_multiplier=self.config.privacy.contribution_bound_iqr_multiplier,
             fixed_k=self.config.privacy.contribution_bound_fixed,
             percentile=self.config.privacy.contribution_bound_percentile,
-            compute_per_group=self.config.privacy.contribution_bound_per_group,
-            num_groups_for_k=self.config.privacy.mcc_num_groups_for_k
+            compute_per_group=self.config.privacy.contribution_bound_per_group
         )
         
         # Need day_idx for cell definition - compute temporarily

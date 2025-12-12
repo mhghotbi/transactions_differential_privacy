@@ -1,8 +1,16 @@
 """
-Bounded Contribution for Differential Privacy.
+Bounded Contribution for Statistical Disclosure Control.
 
-Implements contribution bounding to ensure correct sensitivity for DP queries.
-Each card's contribution per cell (city, mcc, day) is limited to K.
+Implements contribution bounding to prevent extreme outliers from dominating statistics
+and to improve SDC protection in secure enclave deployments.
+
+Each card's contribution per cell (city, mcc, day) is limited to K transactions.
+
+WHY BOUND CONTRIBUTIONS (SDC context):
+- Prevents single cards with thousands of transactions from skewing aggregates
+- Improves utility by reducing impact of outliers on noise calibration
+- Maintains realistic statistics (e.g., one card shouldn't represent 90% of a cell)
+- Complements plausibility bounds for better disclosure control
 
 Methods:
 - Transaction-Weighted Percentile (RECOMMENDED): K where p% of TRANSACTIONS are kept
@@ -16,16 +24,17 @@ Methods:
 - IQR: K = ceil(Q3 + 1.5 * IQR) - statistical outlier detection
   
 - Fixed: K = user-specified value
-
-Reference: Census 2020 also bounds household contributions.
 """
 
 import logging
 import math
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, TYPE_CHECKING
 from dataclasses import dataclass
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame, SparkSession
 
 try:
     from pyspark.sql import DataFrame, SparkSession
@@ -35,6 +44,8 @@ try:
     HAS_SPARK = True
 except ImportError:
     HAS_SPARK = False
+    DataFrame = None  # type: ignore
+    SparkSession = None  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -77,10 +88,12 @@ class ContributionBoundResult:
 
 class BoundedContributionCalculator:
     """
-    Calculates and applies bounded contribution.
+    Calculates and applies bounded contribution for SDC.
     
     Ensures each card contributes at most K transactions per cell (city, mcc, day).
-    K is calculated using IQR method by default to exclude outliers.
+    This prevents extreme outliers from dominating statistics and improves utility.
+    
+    K is calculated using statistical methods to balance data retention and outlier prevention.
     """
     
     def __init__(
@@ -89,31 +102,29 @@ class BoundedContributionCalculator:
         iqr_multiplier: float = 1.5,
         fixed_k: int = 5,
         percentile: float = 99.0,
-        compute_per_group: bool = True,
-        num_groups_for_k: int = 5
+        compute_per_group: bool = True
     ):
         """
-        Initialize calculator.
+        Initialize bounded contribution calculator for SDC.
         
         Args:
             method: One of:
                 - 'transaction_weighted_percentile': Keep p% of transactions (RECOMMENDED)
+                  Minimizes data loss while removing extreme outliers
                 - 'percentile': p-th percentile of cell counts (can lose many transactions)
-                - 'iqr': Statistical outlier detection
+                - 'iqr': Statistical outlier detection (Q3 + 1.5*IQR)
                 - 'fixed': Use fixed K value
             iqr_multiplier: Multiplier for IQR method (default 1.5)
             fixed_k: Fixed K value if method='fixed'
             percentile: Target percentile (0-100) for percentile methods
-            compute_per_group: If True and mcc_group column exists, compute K per group
-                              then take max. Reduces memory for large datasets.
-            num_groups_for_k: Number of MCC groups to use for K computation (e.g., 5)
+            compute_per_group: If True, compute K per individual MCC, then take max.
+                              Reduces memory for large datasets.
         """
         self.method = method
         self.iqr_multiplier = iqr_multiplier
         self.fixed_k = fixed_k
         self.percentile = percentile
         self.compute_per_group = compute_per_group
-        self.num_groups_for_k = num_groups_for_k
         
         self._computed_k: Optional[int] = None
         self._stats: Dict[str, float] = {}
@@ -277,70 +288,72 @@ class BoundedContributionCalculator:
         day_col: str
     ) -> int:
         """
-        Compute K using a SEPARATE coarse MCC grouping for memory efficiency.
-        
-        This method creates a NEW grouping with num_groups_for_k groups (e.g., 5)
-        JUST for K computation. This is different from the main mcc_group column
-        which has more groups (e.g., 20) and is used for DP noise application.
+        Compute K per individual MCC for memory efficiency.
         
         Strategy:
-        1. Create temporary K-computation grouping (3 groups) from MCC amounts
-        2. Compute K for each group: K₁, K₂, K₃
-        3. Take MAX(K₁, K₂, K₃) as global K
-        4. Return this K to be used with the main 20-group stratification for DP
+        1. Get all distinct MCC codes
+        2. Compute K for each MCC: K₁, K₂, ..., Kₙ
+        3. Take MAX(K₁, K₂, ..., Kₙ) as global K
+        4. Return this K to be used globally
         
         Args:
-            df: Input DataFrame (will create temporary grouping)
+            df: Input DataFrame
             card_col, city_col, mcc_col, day_col: Column names
             
         Returns:
-            Maximum K across K-computation groups
+            Maximum K across all MCCs
         """
-        logger.info(f"  Creating temporary {self.num_groups_for_k}-group MCC stratification for K computation")
-        logger.info(f"  (This is separate from the main MCC grouping used for DP noise)")
+        logger.info(f"  Computing K per individual MCC for memory efficiency")
         
-        # Create temporary K-computation grouping
-        from reader.preprocessor import TransactionPreprocessor
-        temp_grouping = TransactionPreprocessor._compute_mcc_groups_static(
-            df=df,
-            mcc_col=mcc_col,
-            amount_col='amount',
-            num_groups=self.num_groups_for_k,
-            column_name='mcc_group_k'
-        )
+        # Get list of distinct MCCs
+        mccs = df.select(mcc_col).distinct().rdd.flatMap(lambda x: x).collect()
+        mccs = sorted([str(m) for m in mccs if m is not None])
+        num_mccs = len(mccs)
         
-        # Get list of K-computation groups
-        groups = temp_grouping.select('mcc_group_k').distinct().rdd.flatMap(lambda x: x).collect()
-        groups = sorted(groups)
-        num_groups = len(groups)
+        logger.info(f"  Found {num_mccs} distinct MCC codes for K computation")
         
-        logger.info(f"  Created {num_groups} groups for K computation")
-        logger.info(f"  Will compute K for each group, then take maximum")
+        # Handle edge case: no MCCs in data
+        if num_mccs == 0:
+            logger.warning("  No MCC codes found in data, using default K=1")
+            self._computed_k = 1
+            self._stats = {
+                'num_mccs': 0,
+                'k_values': [],
+                'global_k': 1,
+                'min_k': 1,
+                'max_k': 1,
+                'mean_k': 1.0,
+                'mcc_stats': []
+            }
+            logger.info(f"  Global K (default): {self._computed_k}")
+            return self._computed_k
+        
+        logger.info(f"  Will compute K for each MCC, then take maximum")
         
         k_values = []
-        group_stats = []
+        mcc_stats = []
         
-        for i, group_id in enumerate(groups, 1):
-            logger.info(f"  [{i}/{num_groups}] Processing K-computation group {group_id}...")
+        for i, mcc_code in enumerate(mccs, 1):
+            logger.info(f"  [{i}/{num_mccs}] Processing MCC {mcc_code}...")
             
-            # Filter to this group only
-            df_group = temp_grouping.filter(F.col('mcc_group_k') == group_id)
+            # Filter to this MCC only
+            df_mcc = df.filter(F.col(mcc_col) == mcc_code)
             
-            # Count records in this group
-            group_count = df_group.count()
-            logger.info(f"    Records in group: {group_count:,}")
+            # Count records in this MCC
+            mcc_count = df_mcc.count()
+            logger.info(f"    Records in MCC: {mcc_count:,}")
             
-            # Compute cell counts for this group
-            cell_counts = df_group.groupBy(card_col, city_col, mcc_col, day_col).agg(
+            # Compute cell counts for this MCC
+            cell_counts = df_mcc.groupBy(card_col, city_col, mcc_col, day_col).agg(
                 F.count('*').alias('tx_count')
             )
             
             # Compute K using the standard logic (same as global computation)
             if self.method == 'fixed':
-                k_group = self.fixed_k
-                stats_group = {'group_id': group_id, 'fixed_k': float(self.fixed_k)}
+                k_mcc = self.fixed_k
+                stats_mcc = {'mcc': mcc_code, 'fixed_k': float(self.fixed_k)}
             else:
-                # Compute statistics for this group
+                # Compute statistics for this MCC
                 stats = cell_counts.select(
                     F.min(F.col('tx_count')).alias('min'),
                     F.max(F.col('tx_count')).alias('max'),
@@ -352,8 +365,8 @@ class BoundedContributionCalculator:
                     F.expr(f'percentile_approx(tx_count, {self.percentile / 100})').alias('pct')
                 ).first()
                 
-                stats_group = {
-                    'group_id': group_id,
+                stats_mcc = {
+                    'mcc': mcc_code,
                     'min': float(stats['min']),
                     'max': float(stats['max']),
                     'mean': float(stats['mean']),
@@ -361,7 +374,7 @@ class BoundedContributionCalculator:
                 }
                 
                 if self.method == 'transaction_weighted_percentile':
-                    # Memory-efficient transaction-weighted percentile for this group
+                    # Memory-efficient transaction-weighted percentile for this MCC
                     tx_count_freq = cell_counts.groupBy('tx_count').agg(
                         F.count('*').alias('num_cells'),
                         (F.col('tx_count') * F.count('*')).alias('total_txns_at_count')
@@ -370,61 +383,61 @@ class BoundedContributionCalculator:
                     freq_data = tx_count_freq.collect()
                     
                     if not freq_data:
-                        k_group = 1
+                        k_mcc = 1
                     else:
                         total_txns = sum(row['total_txns_at_count'] for row in freq_data)
                         cumsum_txns = 0
-                        k_group = 1
+                        k_mcc = 1
                         
                         for row in freq_data:
                             cumsum_txns += row['total_txns_at_count']
                             retention_pct = (cumsum_txns / total_txns) * 100
                             
                             if retention_pct >= self.percentile:
-                                k_group = max(1, int(math.ceil(row['tx_count'])))
-                                stats_group['retention_pct'] = float(retention_pct)
+                                k_mcc = max(1, int(math.ceil(row['tx_count'])))
+                                stats_mcc['retention_pct'] = float(retention_pct)
                                 break
                         else:
-                            k_group = int(freq_data[-1]['tx_count'])
-                            stats_group['retention_pct'] = 100.0
+                            k_mcc = int(freq_data[-1]['tx_count'])
+                            stats_mcc['retention_pct'] = 100.0
                         
-                        stats_group['total_transactions'] = float(total_txns)
+                        stats_mcc['total_transactions'] = float(total_txns)
                 
                 elif self.method == 'iqr':
-                    q1 = stats_group['q1'] = float(stats['q1'])
-                    q3 = stats_group['q3'] = float(stats['q3'])
+                    q1 = stats_mcc['q1'] = float(stats['q1'])
+                    q3 = stats_mcc['q3'] = float(stats['q3'])
                     iqr = q3 - q1
                     upper_bound = q3 + self.iqr_multiplier * iqr
-                    k_group = max(1, int(math.ceil(upper_bound)))
-                    stats_group['iqr'] = iqr
-                    stats_group['upper_bound'] = upper_bound
+                    k_mcc = max(1, int(math.ceil(upper_bound)))
+                    stats_mcc['iqr'] = iqr
+                    stats_mcc['upper_bound'] = upper_bound
                 
                 elif self.method == 'percentile':
-                    k_group = max(1, int(math.ceil(float(stats['pct']))))
-                    stats_group[f'p{int(self.percentile)}'] = float(stats['pct'])
+                    k_mcc = max(1, int(math.ceil(float(stats['pct']))))
+                    stats_mcc[f'p{int(self.percentile)}'] = float(stats['pct'])
                 
                 else:
                     raise ValueError(f"Unknown method: {self.method}")
             
-            k_values.append(k_group)
-            group_stats.append(stats_group)
-            logger.info(f"    K for group {group_id}: {k_group}")
+            k_values.append(k_mcc)
+            mcc_stats.append(stats_mcc)
+            logger.info(f"    K for MCC {mcc_code}: {k_mcc}")
         
-        # Take maximum K across all groups
+        # Take maximum K across all MCCs
         self._computed_k = max(k_values)
         
         # Store aggregated statistics
         self._stats = {
-            'num_groups': num_groups,
+            'num_mccs': num_mccs,
             'k_values': k_values,
             'global_k': self._computed_k,
             'min_k': min(k_values),
             'max_k': max(k_values),
             'mean_k': sum(k_values) / len(k_values),
-            'group_stats': group_stats
+            'mcc_stats': mcc_stats
         }
         
-        logger.info(f"  Per-group K values: {k_values}")
+        logger.info(f"  Per-MCC K values: {k_values}")
         logger.info(f"  Global K (maximum): {self._computed_k}")
         logger.info(f"  K range: [{min(k_values)}, {max(k_values)}]")
         

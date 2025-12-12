@@ -1,6 +1,6 @@
-# Transaction DP Examples
+# Transaction SDC Examples
 
-This folder contains example scripts for testing the Transaction DP System.
+This folder contains example scripts for testing the Transaction SDC System (Statistical Disclosure Control).
 
 ## Prerequisites
 
@@ -44,84 +44,67 @@ python examples/generate_sample_data.py \
 
 ### 3. Run Pipeline
 
-Run the complete pipeline including data generation and DP application:
+Run the complete pipeline including data generation and SDC application:
 
 ```bash
-# Full run (generate data + apply DP)
+# Full run (generate data + apply SDC)
 python examples/run_pipeline.py
 
 # Only generate data
 python examples/run_pipeline.py --generate-only
 
-# Only run DP on existing data
+# Only run SDC on existing data
 python examples/run_pipeline.py --run-only --input data/my_data.csv
-
-# With different privacy budget
-python examples/run_pipeline.py --rho 1/2
 
 # Quick test with fewer records
 python examples/run_pipeline.py --num-records 100000
 ```
 
-### 4. Production Pipeline (Census DAS Style)
+### 4. Production Pipeline
 
-For production scale with Census 2020-compliant DP:
+For production scale with SDC protection:
 
 ```bash
-# Full Census DAS methodology (exact Discrete Gaussian + NNLS + invariants)
+# Full SDC pipeline (context-aware plausibility-based noise)
 python examples/run_production.py \
     --input data/transactions.parquet \
     --output output/protected \
-    --rho 0.25 \
-    --census-das \
     --local
 
-# Exact mechanism only (no NNLS post-processing)
+# With custom noise level (default: 0.15 = 15%)
 python examples/run_production.py \
     --input data/transactions.parquet \
     --output output/protected \
-    --rho 0.25 \
-    --exact \
-    --local
-
-# Fast approximate (for testing)
-python examples/run_production.py \
-    --input data/transactions.parquet \
-    --output output/protected \
-    --rho 0.25 \
-    --approximate \
+    --noise-level 0.20 \
     --local
 ```
 
-### Privacy Budget Explanation
+### SDC Configuration
 
-Default: `rho = 0.25` per month
-
-| Level | Budget | Sigma | Typical Noise |
-|-------|--------|-------|---------------|
-| Province | 0.0125 per query | 6.32 | ±12 |
-| City | 0.05 per query | 3.16 | ±6 |
-
-Annual privacy (12 monthly releases): `rho = 3`, `epsilon ≈ 20`
+Default noise settings:
+- Count noise: 15% relative (multiplicative jitter)
+- Cards jitter: 5% (for derived unique_cards)
+- Amount jitter: 5% (for derived total_amount)
 
 ### Invariant Structure
 
 ```
 EXACT (no noise added):
-  - National monthly totals
-  - Province monthly totals
+  - Province-level transaction counts (invariant)
+  - Province-level totals match public statistics exactly
 
-NOISY (with post-processing):
-  - City daily values → adjusted to sum to province daily
-  - Province daily values → adjusted to sum to monthly invariant
+PROTECTED (with context-aware noise):
+  - City-level counts: multiplicative jitter with plausibility bounds
+  - Ratios preserved: avg_amount and tx_per_card stay within plausible ranges
+  - Controlled rounding: maintains province invariants exactly
 ```
 
 ## Output
 
 After successful execution, output includes:
 
-1. **`output/dp_protected/protected_data/`** - Parquet files with protected data
-2. **`output/dp_protected/metadata.json`** - Execution metadata including privacy parameters
+1. **`output/sdc_protected/protected_data/`** - Parquet files with protected data
+2. **`output/sdc_protected/metadata.json`** - Execution metadata including SDC parameters
 
 ## Sample Data Structure
 
@@ -141,7 +124,7 @@ Generated data includes these columns:
 
 ```
 ╔════════════════════════════════════════════════════════════╗
-║          Transaction DP System - Example Runner            ║
+║          Transaction SDC System - Example Runner            ║
 ╚════════════════════════════════════════════════════════════╝
 
 Step 1: Generating sample transaction data
@@ -149,15 +132,15 @@ Step 1: Generating sample transaction data
   Generating 1,000,000 transactions...
   Done!
 
-Step 2: Running DP Pipeline
+Step 2: Running SDC Pipeline
   Initializing Spark session...
   Loading geography...
-  Applying differential privacy...
+  Applying Statistical Disclosure Control...
   Writing protected data...
 
 Results
   Success:          True
   Total Records:    1,000,000
-  Budget Used:      rho = 1
+  Noise Level:      15% relative
   Duration:         45.23 seconds
 ```

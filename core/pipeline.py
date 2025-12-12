@@ -1,11 +1,18 @@
 """
-DP Pipeline Orchestration.
+SDC Pipeline Orchestration.
 
-This module coordinates the entire differential privacy workflow:
+This module coordinates the entire Statistical Disclosure Control workflow:
 1. Read transaction data
-2. Preprocess and aggregate into histograms
-3. Apply DP noise using top-down mechanism
-4. Write protected results
+2. Preprocess: winsorize amounts, bound contributions (K)
+3. Aggregate to histograms per (province, city, mcc, day, weekday)
+4. Apply context-aware plausibility-based noise with province invariants
+5. Write protected results
+
+APPROACH: Utility-first SDC for secure enclave deployment
+- Province counts are exact (invariant)
+- Multiplicative jitter preserves ratios naturally
+- Data-driven bounds per (MCC, City, Weekday) context
+- Controlled rounding with ratio preservation
 """
 
 import logging
@@ -24,7 +31,6 @@ class PipelineResult:
     """Result of a pipeline execution."""
     success: bool
     total_records: int = 0
-    budget_used: str = ""
     output_path: str = ""
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -35,7 +41,6 @@ class PipelineResult:
         return {
             "success": self.success,
             "total_records": self.total_records,
-            "budget_used": self.budget_used,
             "output_path": self.output_path,
             "duration_seconds": (
                 (self.end_time - self.start_time).total_seconds()
@@ -47,29 +52,36 @@ class PipelineResult:
 
 class DPPipeline:
     """
-    Main pipeline for applying differential privacy to transaction data.
+    Main pipeline for applying Statistical Disclosure Control to transaction data.
+    
+    Designed for secure enclave deployment with utility-first protection.
     
     The pipeline follows these steps:
     1. Initialize Spark session
     2. Load geography mapping (city -> province)
     3. Read transaction data
-    4. Preprocess: winsorize amounts, compute day indices
-    5. Aggregate to histograms per (province, city, mcc, day)
-    6. Apply top-down DP: Province level -> City level
+    4. Preprocess: winsorize amounts, bound contributions (K), compute indices
+    5. Aggregate to histograms per (province, city, mcc, day, weekday)
+    6. Apply context-aware noise: compute plausibility bounds → add jitter → preserve ratios
     7. Write protected results
+    
+    KEY FEATURES:
+    - Province invariants: exact totals preserved (no noise at province level)
+    - Context-aware bounds: plausibility ranges per (MCC, City, Weekday)
+    - Ratio preservation: avg_amount and tx_per_card stay within plausible ranges
+    - Multiplicative jitter: preserves relationships naturally
     """
     
     def __init__(self, config: Config):
         """
-        Initialize pipeline.
+        Initialize SDC pipeline.
         
         Args:
-            config: Configuration object
+            config: Configuration object with SDC settings (noise levels, suppression, etc.)
         """
         self.config = config
         self._spark = None
         self._geography = None
-        self._budget = None
     
     def _init_spark(self):
         """Initialize Spark session."""
@@ -226,29 +238,19 @@ class DPPipeline:
         
         return self._geography
     
-    def _init_budget(self):
-        """Initialize privacy budget."""
-        from core.budget import Budget
-        
-        logger.info("Initializing privacy budget...")
-        
-        self._budget = Budget(
-            total_rho=self.config.privacy.total_rho,
-            delta=self.config.privacy.delta,
-            geographic_split=self.config.privacy.geographic_split,
-            query_split=self.config.privacy.query_split
-        )
-        
-        logger.info(self._budget.summary())
-        
-        return self._budget
-    
     def run(self) -> Dict[str, Any]:
         """
-        Execute the full DP pipeline.
+        Execute the full SDC pipeline.
+        
+        Process flow:
+        1. Initialize Spark and load geography
+        2. Read and preprocess transaction data (winsorization, bounded contribution)
+        3. Aggregate to histogram per (province, city, mcc, day, weekday)
+        4. Apply context-aware plausibility-based noise
+        5. Write protected results
         
         Returns:
-            Dictionary with execution results
+            Dictionary with execution results (success, total_records, output_path, etc.)
         """
         result = PipelineResult(success=False)
         result.start_time = datetime.now()
@@ -287,10 +289,6 @@ class DPPipeline:
             if geography is None:
                 raise RuntimeError("Failed to initialize Geography")
             
-            budget = self._init_budget()
-            if budget is None:
-                raise RuntimeError("Failed to initialize Budget")
-            
             # Import components (after Spark init)
             from reader.spark_reader import SparkTransactionReader
             from reader.preprocessor import TransactionPreprocessor
@@ -326,19 +324,18 @@ class DPPipeline:
             )
             histograms = preprocessor.process(raw_df)
             
-            # Step 3: Apply DP
+            # Step 3: Apply SDC (context-aware plausibility-based noise)
             logger.info("=" * 60)
-            logger.info("Step 3: Applying differential privacy")
+            logger.info("Step 3: Applying Statistical Disclosure Control")
             logger.info("=" * 60)
             
             engine = TopDownSparkEngine(
                 spark=spark,
                 config=self.config,
-                geography=geography,
-                budget=budget
+                geography=geography
             )
             
-            # Set user-level DP parameters from preprocessing
+            # Set bounded contribution parameters from preprocessing
             d_max = preprocessor.d_max or self.config.privacy.computed_d_max or 1
             k_bound = self.config.privacy.computed_contribution_bound or 1
             
@@ -391,7 +388,6 @@ class DPPipeline:
             
             # Success
             result.success = True
-            result.budget_used = str(self.config.privacy.total_rho)
             result.output_path = self.config.data.output_path
             
             logger.info("Pipeline completed successfully")
