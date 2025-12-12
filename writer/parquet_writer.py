@@ -119,6 +119,33 @@ class ParquetWriter:
             logger.warning("No records to write!")
             return output_path
         
+        # Apply suppression if enabled (for SDC pipeline)
+        if self.config.privacy.suppression_threshold > 0:
+            logger.info(f"Applying suppression (threshold={self.config.privacy.suppression_threshold}, method={self.config.privacy.suppression_method})...")
+            from core.suppression import SuppressionManager
+            
+            # SDC pipeline uses column names without _protected suffix
+            # Map to the actual column names in the DataFrame
+            protected_cols = []
+            for col in ['transaction_count', 'unique_cards', 'total_amount', 'transaction_amount_sum']:
+                if col in df.columns:
+                    protected_cols.append(col)
+            
+            if protected_cols:
+                # Use transaction_count as primary count column (SDC pipeline naming)
+                primary_col = 'transaction_count' if 'transaction_count' in df.columns else protected_cols[0]
+                
+                suppression_mgr = SuppressionManager(
+                    threshold=self.config.privacy.suppression_threshold,
+                    method=self.config.privacy.suppression_method,
+                    sentinel_value=self.config.privacy.suppression_sentinel,
+                    primary_count_column=primary_col
+                )
+                df = suppression_mgr.apply(df, protected_cols)
+                logger.info("Suppression applied successfully")
+            else:
+                logger.warning("No protected columns found for suppression")
+        
         logger.info(f"Writing {num_records:,} records to Parquet (distributed write)")
         
         # Write to Parquet (distributed, no driver collection)
