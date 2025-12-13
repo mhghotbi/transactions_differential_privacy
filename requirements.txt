@@ -1,0 +1,31 @@
+# Transaction DP System - Python Dependencies
+# ============================================
+# Install with: pip install -r requirements.txt
+
+# ===========================================
+# Core Dependencies (Required)
+# ===========================================
+
+# Scientific Computing
+numpy>=1.21.0,<3.0.0
+
+# Scientific optimization (NNLS post-processing, Census 2020 style)
+scipy>=1.7.0
+
+# Apache Spark 3.5.x (requires Java 8 or 11)
+pyspark>=3.5.0,<4.0.0
+
+# Parquet support (required by PySpark for Parquet I/O)
+pyarrow>=8.0.0
+
+# ===========================================
+# Testing Dependencies (included in scipy)
+# =========================================
+
+# ===========================================
+# Development Dependencies (Optional)
+# ===========================================
+
+# Testing frameworks
+# pytest>=7.0.0
+# pytest-cov>=3.0.0

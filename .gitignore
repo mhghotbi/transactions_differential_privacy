@@ -1,52 +1,162 @@
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+venv/
+env/
+ENV/
+.venv/
+.ENV/
+virtualenv/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ============================================
+# Jupyter Notebooks
+# ============================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ============================================
+# IDE & Editor Files
+# ============================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+~*
+.attach*
+
+# ============================================
+# OS Files
+# ============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ============================================
+# Environment & Secrets
+# ============================================
+.env
+.env.local
+.env.*.local
+*.env
+secrets.json
+*.key
+*.pem
+*.cert
+config.local.*
+*local-*
+confs.json
+
+# ============================================
+# Logs & Temporary Files
+# ============================================
+*.log
+*.out
+logs/
+*/logs/*
+**/code/logs/*
+*.tmp
+*.[tT][mM][pP]
+*.old
+*.dfxml
+*.yarnout
+slgout
+TAGS
+
+# ============================================
+# Testing & Coverage
+# ============================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.hypothesis/
+*.cover
+.cache
+
+# ============================================
+# Spark & Big Data
+# ============================================
+**/metastore_db/*
+derby.log
+spark-warehouse/
+*.parquet.tmp
+*.parquet.crc
+
+# ============================================
+# Data & Output Directories
+# ============================================
+# Exclude output directories that may contain processed data
+output/
+outputs/
+results/
+*/error_metrics/*
+
+# Exclude large data files (keep structure files like city_province.csv)
+# Uncomment if you want to exclude all data files:
+# data/*.parquet
+# data/*.csv
+# But keep: data/city_province.csv (mapping file)
+
+# ============================================
+# Project-Specific Patterns
+# ============================================
 *[tT][iI][tT][lL][eE]*13*
-*.txt
-*.pyc
 *.lp
 *.mps
-*.swp
 *.ilp
-*.[tT][mM][pP]
-*.[lL][oO][gG]
-*.[sS][wW][aA][pP]
 *.e
 *.o
-*.swo
-confs.json
-*local-*
-**/metastore_db/*
-**/code/misc_code/*
-**/code/logs/*
-~*
-*~
-.cache
+cluster_stats.*
+run_user007
 *T26*
-*.old
-*/logs/*
+
+# ============================================
+# LaTeX & Documentation Build Files
+# ============================================
 latex_docs/*.log
 latex_docs/*.aux
-*/error_metrics/*
-*.out
-*.dfxml
-logs/
-run_user007
-slgout
-cluster_stats.*
-TAGS
-.attach*
-certificate.pdf
-*.zip
-.idea/
-*.json
-*.yarnout
-.DS_Store
+das2020_certificate.aux
 
-# Whitelisting needed file run_sugar_test_out.txt
-!etc/hhtype/run_sugar_test_out.txt
+# ============================================
+# Archives & Media
+# ============================================
+*.zip
 *.pdf
+certificate.pdf
 certificate_demo.pdf
 graph.png
-das2020_certificate.aux
 background1.jpg
+
+# ============================================
+# Query Output Files
+# ============================================
 query*.csv
-.coverage*
-logs
+
+# ============================================
+# Whitelisting (exceptions to above rules)
+# ============================================
+# Keep specific needed files
+!etc/hhtype/run_sugar_test_out.txt
+!requirements.txt
+!README.md
+!*.md
+!configs/*.ini
+!data/city_province.csv

@@ -1,4 +1,6 @@
-# Code Explanation Request: Transaction SDC System
+# Code Explanation: Transaction SDC System
+
+**Note:** This document explains the **Statistical Disclosure Control (SDC)** implementation using multiplicative jitter and plausibility bounds. The codebase also includes a **Differential Privacy (DP)** implementation using Discrete Gaussian mechanism (see `reader/preprocessor_distributed.py` and `examples/run_production.py`).
 
 Explain this code with **gradually increasing complexity** across 4 levels:
 
@@ -9,6 +11,15 @@ Explain this code with **gradually increasing complexity** across 4 levels:
 ### What does this code do in one sentence?
 This system adds context-aware plausibility-based noise to financial transaction statistics to prevent disclosure while maximizing utility for analysis in a secure enclave environment.
 
+### Which Implementation Should I Use?
+
+| Use Case | Implementation | Entry Point |
+|----------|---------------|-------------|
+| **Secure enclave deployment** (physical isolation) | SDC (this document) | `examples/run_pipeline.py` |
+| **Public release** (formal privacy guarantees) | DP (Discrete Gaussian) | `examples/run_production.py` |
+| **Need provable privacy** (ε, δ)-DP | DP | `examples/run_production.py --census-das` |
+| **Prioritize utility** over formal proofs | SDC | `examples/run_pipeline.py` |
+
 ### What real-world problem does it solve?
 Banks and payment companies need to share transaction patterns (how much people spend in each city, which merchants are popular) in a secure enclave where physical isolation provides primary protection. This code adds realistic noise that prevents obvious outliers while preserving the statistical relationships needed for analysis. The focus is on **utility-first** protection - minimizing distortion while maintaining plausibility.
 
@@ -18,6 +29,8 @@ Imagine you're publishing statistics about a bakery's daily sales, but you want 
 ---
 
 ## 📊 Level 2: Architecture & Flow
+
+**Note:** This section describes the **SDC implementation** using `TopDownSparkEngine`. For the DP implementation architecture, see `reader/preprocessor_distributed.py` which uses `CensusDASEngine`.
 
 ### System Architecture Diagram (ASCII)
 
@@ -366,9 +379,11 @@ def validate(self):
 | Memory | Driver collects histogram | Fully distributed |
 | Use case | Testing, small production | Large-scale production |
 
-### Census 2020 DAS Compatibility
+### Relationship to Census 2020 DAS
 
-The `CensusDASEngine` class exactly replicates the US Census Bureau's 2020 methodology:
+**Note:** The SDC implementation (`TopDownSparkEngine`) is inspired by Census 2020 but uses multiplicative jitter instead of Discrete Gaussian. For exact Census 2020 replication, use the DP implementation (`CensusDASEngine` in `reader/preprocessor_distributed.py`).
+
+The `CensusDASEngine` class (DP implementation) exactly replicates the US Census Bureau's 2020 methodology:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -1497,7 +1512,9 @@ mcc_cap_percentile = 99.0
 
 ## 📊 Comparison with US Census 2020 DAS
 
-| Feature | Census 2020 | Our SDC Implementation |
+### SDC Implementation (This Document)
+
+| Feature | Census 2020 | SDC Implementation |
 |---------|-------------|-------------------|
 | **Approach** | Formal DP (zCDP) | SDC (utility-first) |
 | **Mechanism** | Discrete Gaussian | Multiplicative jitter |
@@ -1508,6 +1525,20 @@ mcc_cap_percentile = 99.0
 | **Suppression** | Yes | Yes ✅ |
 | **Bounded Contribution** | 1 person = 1 record | K transactions/cell ✅ |
 | **Post-processing** | NNLS optimization | Ratio-preserving rounding ✅ |
+
+### DP Implementation (Alternative)
+
+The codebase also includes a DP implementation (`CensusDASEngine`) that matches Census 2020 more closely:
+
+| Feature | Census 2020 | DP Implementation |
+|---------|-------------|------------------|
+| **Approach** | Formal DP (zCDP) | Formal DP (zCDP) ✅ |
+| **Mechanism** | Discrete Gaussian | Discrete Gaussian ✅ |
+| **Framework** | zCDP with budget | zCDP with budget ✅ |
+| **Post-processing** | NNLS optimization | NNLS optimization ✅ |
+| **Privacy Guarantee** | (ε, δ)-DP | (ε, δ)-DP ✅ |
+
+**See:** `reader/preprocessor_distributed.py` and `examples/run_production.py` for the DP implementation.
 
 ### Key Differences Explained
 

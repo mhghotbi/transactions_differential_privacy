@@ -1,18 +1,39 @@
-# Transaction DP System
+# Transaction Privacy System
 
-A production-ready Differential Privacy system for financial transaction data, implementing **US Census 2020 DAS methodology**.
+A production-ready privacy-preserving system for financial transaction data with **two implementation approaches**:
+
+1. **Differential Privacy (DP)** - Formal privacy guarantees using US Census 2020 DAS methodology
+2. **Statistical Disclosure Control (SDC)** - Utility-first approach for secure enclave deployment
 
 ## Overview
 
 This system adds mathematically calibrated noise to transaction statistics, enabling data sharing while protecting individual privacy.
 
+### Differential Privacy Implementation (Formal DP)
+
 ```
 Raw Transactions  →  Aggregate by (City, MCC, Day)  →  Add DP Noise  →  NNLS + Rounding  →  Protected Output
-   10B rows              ~10M cells                     Gaussian          (match public)      Parquet + CI
-                                                          (cell level)      province totals
+   10B rows              ~10M cells                     Discrete          (match public)      Parquet + CI
+                                                          Gaussian          province totals
+                                                          (cell level)
 ```
 
+**Use when:** You need formal privacy guarantees (ε, δ)-DP with provable protection against inference attacks.
+
+### Statistical Disclosure Control Implementation (Utility-First SDC)
+
+```
+Raw Transactions  →  Aggregate by (City, MCC, Day)  →  Add SDC Noise  →  Ratio Preserve  →  Protected Output
+   10B rows              ~10M cells                     Multiplicative    (plausibility)      Parquet + CI
+                                                          Jitter           bounds
+                                                          (context-aware)
+```
+
+**Use when:** You're deploying in a secure enclave with physical isolation and prioritize utility over formal privacy proofs.
+
 ## Key Features
+
+### Differential Privacy Features
 
 | Feature | Description |
 |---------|-------------|
@@ -25,6 +46,17 @@ Raw Transactions  →  Aggregate by (City, MCC, Day)  →  Add DP Noise  →  NN
 | **Confidence Intervals** | Quantified uncertainty |
 | **Global Sensitivity** | Correct for multi-cell cards |
 | **Bounded Contribution** | Transaction-weighted percentile (minimizes data loss) |
+
+### Statistical Disclosure Control Features
+
+| Feature | Description |
+|---------|-------------|
+| **Multiplicative Jitter** | Preserves ratios naturally (amount/count, count/cards) |
+| **Context-Aware Bounds** | Data-driven plausibility ranges per (MCC, City, Weekday) |
+| **Province Invariants** | Exact province totals (no noise at province level) |
+| **Ratio Preservation** | Maintains realistic relationships between queries |
+| **Bounded Contribution** | Transaction-weighted percentile (minimizes data loss) |
+| **Cell Suppression** | Hide small counts |
 
 ## Quick Start
 
@@ -58,25 +90,53 @@ python tests/test_no_spark.py
 python tests/test_dp_correctness.py
 ```
 
-### Quick Example
+### Quick Examples
+
+#### Using Statistical Disclosure Control (SDC) - Default
 
 ```bash
-# Generate sample data and run DP pipeline
-python examples/run_pipeline.py --num-records 100000 --rho 0.25
+# Generate sample data and run SDC pipeline (utility-first)
+python examples/run_pipeline.py --num-records 100000
 ```
 
+This uses `TopDownSparkEngine` with multiplicative jitter and plausibility bounds.
+
+#### Using Differential Privacy (DP) - Formal Privacy
+
+```bash
+# Run DP pipeline with formal privacy guarantees
+python examples/run_production.py \
+    --input data/transactions.parquet \
+    --output output/protected \
+    --rho 0.25 \
+    --census-das
+```
+
+This uses `CensusDASEngine` with Discrete Gaussian mechanism matching Census 2020 DAS.
+
 ### Production (10B+ rows)
+
+#### DP Implementation (Formal Privacy)
 
 ```bash
 spark-submit \
     --master yarn \
     --num-executors 100 \
     --executor-memory 32g \
-    run_production.py \
+    examples/run_production.py \
     --input hdfs:///data/transactions \
     --output hdfs:///output/protected \
     --rho 0.25 \
     --census-das
+```
+
+#### SDC Implementation (Utility-First)
+
+```bash
+# Uses same pipeline but with SDC engine (configured via config.ini)
+python examples/run_pipeline.py \
+    --input hdfs:///data/transactions \
+    --output hdfs:///output/protected
 ```
 
 ## Output Format
@@ -108,11 +168,13 @@ Each row contains:
 
 ## Configuration
 
-Edit `configs/default.ini`:
+### Differential Privacy Configuration
+
+Edit `configs/default.ini` for DP implementation:
 
 ```ini
 [privacy]
-# Monthly privacy budget
+# Monthly privacy budget (for DP implementation)
 total_rho = 1/4                    # ρ = 0.25 → ε ≈ 5 per month
 
 # Bounded contribution (IMPORTANT: affects data loss)
@@ -130,12 +192,50 @@ confidence_levels = 0.90           # 90% CI
 sensitivity_method = global        # Account for multi-cell cards
 ```
 
+### Statistical Disclosure Control Configuration
+
+For SDC implementation, configure noise levels:
+
+```ini
+[privacy]
+# SDC noise levels (utility-first)
+noise_level = 0.15          # 15% relative noise for counts
+cards_jitter = 0.05         # 5% jitter for unique_cards
+amount_jitter = 0.05        # 5% jitter for total_amount
+
+# Bounded contribution
+contribution_bound_method = transaction_weighted_percentile
+contribution_bound_percentile = 99.0
+
+# Suppression
+suppression_threshold = 5
+```
+
 ## Privacy Guarantees
+
+### Differential Privacy (DP Implementation)
 
 | Time Period | zCDP (ρ) | (ε, δ)-DP |
 |-------------|----------|-----------|
 | Monthly | 0.25 | ε ≈ 5, δ = 10⁻¹⁰ |
 | Annual | 3.0 | ε ≈ 20, δ = 10⁻¹⁰ |
+
+**Formal Guarantee:** Provides provable (ε, δ)-differential privacy protection against inference attacks.
+
+### Statistical Disclosure Control (SDC Implementation)
+
+**Protection Layers:**
+1. Physical isolation (secure enclave) - primary protection
+2. Context-aware plausibility bounds - prevents obvious outliers
+3. Multiplicative jitter - adds realistic variation
+4. Suppression - hides small cells
+
+**Utility Guarantee:** For multiplicative jitter with `noise_level = 0.15`:
+- Expected relative error: ~15%
+- 95th percentile error: < 29% with 95% probability
+- Province totals: EXACT (0% error)
+
+**Note:** SDC does not provide formal privacy guarantees but prioritizes utility in secure enclave deployments.
 
 ## Documentation
 
@@ -145,6 +245,19 @@ sensitivity_method = global        # Account for multi-cell cards
 | [CODE_EXPLANATION.md](CODE_EXPLANATION.md) | Technical deep-dive |
 | [PRIVACY_PROOF.md](PRIVACY_PROOF.md) | Formal privacy analysis |
 
+## Implementation Comparison
+
+| Aspect | DP Implementation | SDC Implementation |
+|--------|------------------|-------------------|
+| **Engine** | `CensusDASEngine` | `TopDownSparkEngine` |
+| **Noise Mechanism** | Discrete Gaussian | Multiplicative jitter |
+| **Privacy Framework** | zCDP | Context-aware bounds |
+| **Privacy Guarantee** | Formal (ε, δ)-DP | Utility-first (no formal proof) |
+| **Use Case** | Public release, formal guarantees | Secure enclave, utility priority |
+| **Entry Point** | `examples/run_production.py` | `examples/run_pipeline.py` |
+| **Post-Processing** | NNLS optimization | Ratio-preserving rounding |
+| **Invariants** | Province-month totals (exact) | Province totals (exact) |
+
 ## Project Structure
 
 ```
@@ -153,19 +266,22 @@ transactions_differential_privacy/
 ├── demo_notebook.ipynb     # Interactive demo notebook
 ├── requirements.txt        # Python dependencies
 ├── README.md               # This file
+├── CODE_EXPLANATION.md     # Technical deep-dive (SDC implementation)
 ├── configs/
 │   └── default.ini         # Default configuration
 ├── core/
 │   ├── config.py           # Configuration management
-│   ├── budget.py           # Privacy budget allocation
-│   ├── primitives.py       # Discrete Gaussian mechanism
-│   ├── pipeline.py         # DP pipeline orchestration
-│   ├── postprocessing.py   # NNLS optimization
+│   ├── budget.py           # Privacy budget allocation (DP)
+│   ├── primitives.py       # Discrete Gaussian mechanism (DP)
+│   ├── pipeline.py         # SDC pipeline orchestration
+│   ├── postprocessing.py   # NNLS optimization (DP)
 │   ├── rounder.py          # Controlled rounding
 │   ├── invariants.py       # Exact totals management
 │   ├── suppression.py      # Cell suppression
 │   ├── confidence.py       # Confidence intervals
-│   └── sensitivity.py      # Global sensitivity
+│   ├── sensitivity.py      # Global sensitivity (DP)
+│   ├── plausibility_bounds.py  # SDC plausibility bounds
+│   └── bounded_contribution.py # Bounded contribution (both)
 ├── data/
 │   └── city_province.csv   # City-Province mapping
 ├── schema/
@@ -174,17 +290,17 @@ transactions_differential_privacy/
 ├── reader/
 │   ├── spark_reader.py     # Data reading
 │   ├── preprocessor.py     # Basic preprocessing
-│   └── preprocessor_distributed.py  # Production scale
+│   └── preprocessor_distributed.py  # Production scale (DP)
 ├── engine/
-│   └── topdown.py          # Top-down DP engine
+│   └── topdown_spark.py    # SDC engine (TopDownSparkEngine)
 ├── queries/
 │   └── transaction_queries.py  # Query definitions
 ├── writer/
 │   └── parquet_writer.py   # Output writing
 ├── examples/
 │   ├── generate_sample_data.py
-│   ├── run_pipeline.py
-│   ├── run_production.py
+│   ├── run_pipeline.py     # SDC pipeline (default)
+│   ├── run_production.py  # DP pipeline (formal privacy)
 │   └── quick_test.py
 ├── tests/
 │   ├── test_no_spark.py    # Unit tests
@@ -194,13 +310,28 @@ transactions_differential_privacy/
 
 ## Comparison with US Census 2020
 
-| Aspect | Census 2020 | This System |
-|--------|-------------|-------------|
+### DP Implementation
+
+| Aspect | Census 2020 | DP Implementation |
+|--------|-------------|-------------------|
 | Mechanism | Discrete Gaussian | Discrete Gaussian ✓ |
 | Framework | zCDP | zCDP ✓ |
 | NNLS | Yes | Yes ✓ |
 | Rounding | Yes | Yes ✓ |
 | Invariants | Population totals | Province-month totals (public) ✓ |
+| Suppression | Yes | Yes ✓ |
+| Geography | 6 levels | 2 levels |
+| Privacy Unit | Person | Card-Month |
+
+### SDC Implementation
+
+| Aspect | Census 2020 | SDC Implementation |
+|--------|-------------|-------------------|
+| Approach | Formal DP (zCDP) | SDC (utility-first) |
+| Mechanism | Discrete Gaussian | Multiplicative jitter |
+| Framework | zCDP with budget | Context-aware bounds |
+| Post-Processing | NNLS optimization | Ratio-preserving rounding ✓ |
+| Invariants | Population totals | Province totals (exact) ✓ |
 | Suppression | Yes | Yes ✓ |
 | Geography | 6 levels | 2 levels |
 | Privacy Unit | Person | Card-Month |
