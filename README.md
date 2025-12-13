@@ -7,8 +7,9 @@ A production-ready Differential Privacy system for financial transaction data, i
 This system adds mathematically calibrated noise to transaction statistics, enabling data sharing while protecting individual privacy.
 
 ```
-Raw Transactions  →  Aggregate by (City, MCC, Day)  →  Add DP Noise  →  Protected Output
-   10B rows              ~10M cells                     Gaussian          Parquet + CI
+Raw Transactions  →  Aggregate by (City, MCC, Day)  →  Add DP Noise  →  NNLS + Rounding  →  Protected Output
+   10B rows              ~10M cells                     Gaussian          (match public)      Parquet + CI
+                                                          (cell level)      province totals
 ```
 
 ## Key Features
@@ -19,11 +20,11 @@ Raw Transactions  →  Aggregate by (City, MCC, Day)  →  Add DP Noise  →  Pr
 | **zCDP Composition** | Tight privacy accounting |
 | **NNLS Post-Processing** | Geographic consistency |
 | **Controlled Rounding** | Integer outputs |
-| **Monthly Invariants** | Exact province/national totals |
+| **Province-Month Invariants** | Exact province-month totals (public data) |
 | **Cell Suppression** | Hide small counts |
 | **Confidence Intervals** | Quantified uncertainty |
 | **Global Sensitivity** | Correct for multi-cell cards |
-| **Bounded Contribution** | IQR-based outlier handling |
+| **Bounded Contribution** | Transaction-weighted percentile (minimizes data loss) |
 
 ## Quick Start
 
@@ -82,29 +83,28 @@ spark-submit \
 
 ```
 output/protected/
-├── province_name=Tehran/
-│   └── part-00000.parquet
-├── province_name=Isfahan/
-│   └── part-00000.parquet
-└── ...
+├── province_code=1/
+│   ├── city_code=101/
+│   │   └── part-00000.parquet
+│   └── city_code=102/
+│       └── part-00000.parquet
+└── province_code=2/
+    └── ...
 ```
 
 Each row contains:
 
 | Column | Description |
 |--------|-------------|
-| `province_name` | Province name |
-| `acceptor_city` | City name |
+| `province_code` | Province code (integer) |
+| `city_code` | City code (integer) |
 | `mcc` | Merchant Category Code |
 | `day_idx` | Day index (0-29) |
+| `transaction_date` | Transaction date string |
 | `transaction_count` | Protected count |
-| `transaction_count_moe_90` | 90% Margin of Error |
-| `transaction_count_ci_lower_90` | CI lower bound |
-| `transaction_count_ci_upper_90` | CI upper bound |
 | `unique_cards` | Protected unique card count |
-| `unique_acceptors` | Protected unique acceptor count |
-| `total_amount` | Protected total amount |
-| `is_suppressed` | True if count < threshold |
+| `transaction_amount_sum` | Protected total amount |
+| `is_suppressed` | True if count < threshold (if suppression enabled) |
 
 ## Configuration
 
@@ -115,8 +115,13 @@ Edit `configs/default.ini`:
 # Monthly privacy budget
 total_rho = 1/4                    # ρ = 0.25 → ε ≈ 5 per month
 
+# Bounded contribution (IMPORTANT: affects data loss)
+# RECOMMENDED: transaction_weighted_percentile minimizes data loss compared to simple percentile
+contribution_bound_method = transaction_weighted_percentile  # Keep 99% of transactions
+contribution_bound_percentile = 99.0                        # Target retention percentage
+
 # Suppression
-suppression_threshold = 10         # Hide cells with count < 10
+suppression_threshold = 5          # Hide cells with count < 5
 
 # Confidence intervals
 confidence_levels = 0.90           # 90% CI
@@ -195,7 +200,7 @@ transactions_differential_privacy/
 | Framework | zCDP | zCDP ✓ |
 | NNLS | Yes | Yes ✓ |
 | Rounding | Yes | Yes ✓ |
-| Invariants | Population totals | Monthly totals ✓ |
+| Invariants | Population totals | Province-month totals (public) ✓ |
 | Suppression | Yes | Yes ✓ |
 | Geography | 6 levels | 2 levels |
 | Privacy Unit | Person | Card-Month |

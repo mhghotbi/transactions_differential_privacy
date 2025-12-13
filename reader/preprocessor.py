@@ -26,14 +26,15 @@ logger = logging.getLogger(__name__)
 
 class TransactionPreprocessor:
     """
-    Preprocesses transaction data for DP processing.
+    Preprocesses transaction data for SDC processing.
     
     Steps:
-    1. Compute winsorization cap from percentile
-    2. Apply winsorization to amounts
-    3. Calculate day indices
-    4. Create dimension indices (city, mcc)
-    5. Aggregate to histogram structure
+    1. Compute per-MCC winsorization caps to handle outliers
+    2. Apply bounded contribution (K) to limit cards' per-cell contributions
+    3. Apply winsorization to transaction amounts
+    4. Calculate day and weekday indices
+    5. Create dimension indices (province, city, mcc)
+    6. Aggregate to histogram structure per (province, city, mcc, day, weekday)
     """
     
     def __init__(
@@ -58,8 +59,8 @@ class TransactionPreprocessor:
         self._mcc_to_idx: Dict[str, int] = {}
         self._city_to_idx: Dict[str, int] = {}
         self._min_date: Optional[date] = None
-        self._mcc_grouping = None  # MCCGroupingResult
-        self._d_max: Optional[int] = None  # Max cells per card for user-level DP
+        self._mcc_caps = None  # Dict[str, float]: mcc_code -> cap
+        self._d_max: Optional[int] = None  # Max cells per card (for bounded contribution analysis)
     
     def process(self, df: DataFrame) -> TransactionHistogram:
         """
@@ -73,20 +74,20 @@ class TransactionPreprocessor:
         """
         logger.info("Starting preprocessing...")
         
-        # Step 0: Apply bounded contribution (clip transactions per card-cell)
+        # Step 0: Compute per-MCC winsorization caps
+        # Each MCC is processed separately (parallel composition)
+        df = self._compute_per_mcc_caps(df)
+        
+        # Step 1: Apply bounded contribution (can now use MCC groups for memory efficiency)
         df = self._apply_bounded_contribution(df)
         
-        # Step 0.5: Compute MCC groups for stratified sensitivity
-        if self.config.privacy.mcc_grouping_enabled:
-            df = self._compute_mcc_groups(df)
-        
-        # Step 1: Compute and apply winsorization (per-group if enabled)
+        # Step 3: Compute and apply winsorization (per-group if enabled)
         df = self._apply_winsorization(df)
         
-        # Step 2: Create dimension indices
+        # Step 4: Create dimension indices
         df = self._create_indices(df)
         
-        # Step 3: Aggregate to histogram
+        # Step 5: Aggregate to histogram
         histogram = self._aggregate_to_histogram(df)
         
         logger.info("Preprocessing complete")
@@ -94,49 +95,30 @@ class TransactionPreprocessor:
         
         return histogram
     
-    def _compute_mcc_groups(self, df: DataFrame) -> DataFrame:
+    def _compute_per_mcc_caps(self, df: DataFrame) -> DataFrame:
         """
-        Compute MCC groups for stratified sensitivity.
+        Compute winsorization cap per individual MCC.
         
-        Groups MCCs by order of magnitude of typical transaction amounts.
-        Uses parallel composition - each group gets full privacy budget.
+        Each MCC is processed separately for more granular outlier handling.
+        This provides better utility than global winsorization across all MCCs.
         """
-        from core.mcc_groups import compute_mcc_groups_spark
+        logger.info("Computing per-MCC winsorization caps...")
+        logger.info(f"Percentile: {self.config.privacy.mcc_cap_percentile}")
         
-        logger.info("Computing MCC groups for stratified sensitivity...")
+        # Compute cap per MCC using Spark
+        mcc_caps = df.groupBy('mcc').agg(
+            F.expr(f'percentile_approx(amount, {self.config.privacy.mcc_cap_percentile / 100.0})').alias('cap')
+        ).collect()
         
-        self._mcc_grouping = compute_mcc_groups_spark(
-            df=df,
-            mcc_col='mcc',
-            amount_col='amount',
-            num_groups=self.config.privacy.mcc_num_groups,
-            cap_percentile=self.config.privacy.mcc_group_cap_percentile
-        )
+        # Store in config
+        self._mcc_caps = {row['mcc']: float(row['cap']) for row in mcc_caps}
+        self.config.privacy.mcc_caps = self._mcc_caps
         
-        # Store in config for use by TopDownEngine
-        self.config.privacy.mcc_to_group = self._mcc_grouping.mcc_to_group
-        self.config.privacy.mcc_group_caps = {
-            gid: info.cap for gid, info in self._mcc_grouping.group_info.items()
-        }
-        
-        logger.info(f"Created {self._mcc_grouping.num_groups} MCC groups")
-        
-        # Add MCC group column to DataFrame for per-group processing
-        mcc_group_data = [
-            (mcc, group_id) 
-            for mcc, group_id in self._mcc_grouping.mcc_to_group.items()
-        ]
-        mcc_group_schema = StructType([
-            StructField("mcc_grp_key", StringType(), False),
-            StructField("mcc_group", IntegerType(), False),
-        ])
-        mcc_group_df = self.spark.createDataFrame(mcc_group_data, schema=mcc_group_schema)
-        
-        df = df.join(mcc_group_df, df.mcc == mcc_group_df.mcc_grp_key, "left").drop("mcc_grp_key")
-        
-        # Fill unknown MCCs with highest group (conservative - highest cap)
-        max_group = max(self._mcc_grouping.group_info.keys()) if self._mcc_grouping.group_info else 0
-        df = df.fillna({'mcc_group': max_group})
+        logger.info(f"Computed caps for {len(self._mcc_caps)} individual MCCs")
+        if self._mcc_caps:
+            logger.info(f"Cap range: [{min(self._mcc_caps.values()):,.0f}, {max(self._mcc_caps.values()):,.0f}]")
+        else:
+            logger.warning("No MCC caps computed - empty or all-null MCC data")
         
         return df
     
@@ -156,11 +138,12 @@ class TransactionPreprocessor:
             method=self.config.privacy.contribution_bound_method,
             iqr_multiplier=self.config.privacy.contribution_bound_iqr_multiplier,
             fixed_k=self.config.privacy.contribution_bound_fixed,
-            percentile=self.config.privacy.contribution_bound_percentile
+            percentile=self.config.privacy.contribution_bound_percentile,
+            compute_per_group=self.config.privacy.contribution_bound_per_group
         )
         
         # Need day_idx for cell definition, compute it temporarily
-        date_stats = df.agg(F.min('transaction_date').alias('min_date')).collect()[0]
+        date_stats = df.agg(F.min(F.col('transaction_date')).alias('min_date')).first()
         min_date = date_stats.min_date
         
         df_with_day = df.withColumn(
@@ -191,9 +174,9 @@ class TransactionPreprocessor:
             order_col='transaction_date'
         )
         
-        # === USER-LEVEL DP: Compute D_max (max cells per card) ===
+        # === Compute D_max (max cells per card for bounded contribution analysis) ===
         logger.info("")
-        logger.info("Computing D_max for user-level sensitivity...")
+        logger.info("Computing D_max (max cells per card)...")
         sensitivity_calc = GlobalSensitivityCalculator(
             spark=self.spark,
             method="user_level"
@@ -204,11 +187,11 @@ class TransactionPreprocessor:
             cell_columns=['acceptor_city', 'mcc', 'day_idx_temp']
         )
         
-        # Store D_max in config for TopDownEngine
+        # Store D_max in config for engine
         self._d_max = d_max
         self.config.privacy.computed_d_max = d_max
         
-        logger.info(f"User-Level DP Parameters:")
+        logger.info(f"Bounded Contribution Parameters:")
         logger.info(f"  K (per-cell bound): {k}")
         logger.info(f"  D_max (max cells per card): {d_max}")
         logger.info(f"  sqrt(D_max): {d_max**0.5:.4f}")
@@ -248,13 +231,14 @@ class TransactionPreprocessor:
         """
         Apply winsorization to transaction amounts.
         
-        If MCC grouping is enabled, uses per-group caps.
-        Otherwise, uses a single global cap.
+        Uses per-MCC caps computed earlier.
+        Each MCC is processed separately (parallel composition).
         """
-        if self.config.privacy.mcc_grouping_enabled and self._mcc_grouping is not None:
-            return self._apply_per_group_winsorization(df)
-        else:
-            return self._apply_global_winsorization(df)
+        if self._mcc_caps is None or len(self._mcc_caps) == 0:
+            logger.error("Per-MCC caps not computed, cannot apply winsorization")
+            raise RuntimeError("Per-MCC caps must be computed before winsorization")
+        
+        return self._apply_per_mcc_winsorization(df)
     
     def _apply_global_winsorization(self, df: DataFrame) -> DataFrame:
         """Apply single global winsorization cap."""
@@ -270,61 +254,56 @@ class TransactionPreprocessor:
         # Statistics after winsorization
         stats = df.agg(
             F.count(F.when(F.col('amount') > self._winsorize_cap, 1)).alias('capped_count'),
-            F.sum('amount').alias('original_sum'),
-            F.sum('amount_winsorized').alias('winsorized_sum')
-        ).collect()[0]
+            F.sum(F.col('amount')).alias('original_sum'),
+            F.sum(F.col('amount_winsorized')).alias('winsorized_sum')
+        ).first()
         
         logger.info(f"Global Winsorization: {stats.capped_count:,} transactions capped")
         logger.info(f"Amount sum: {stats.original_sum:,.2f} -> {stats.winsorized_sum:,.2f}")
         
         return df
     
-    def _apply_per_group_winsorization(self, df: DataFrame) -> DataFrame:
+    def _apply_per_mcc_winsorization(self, df: DataFrame) -> DataFrame:
         """
-        Apply per-MCC-group winsorization.
+        Apply winsorization with per-MCC caps.
         
-        Each MCC group has its own cap based on typical transaction amounts.
+        Each individual MCC has its own cap based on its transaction amount distribution.
+        This provides better utility than grouping MCCs together.
         """
-        logger.info("Applying per-MCC-group winsorization...")
+        logger.info("Applying per-MCC winsorization...")
         
-        # Build case-when expression for per-group caps
-        # Start with a base case (highest cap for unknown groups)
-        max_cap = max(self.config.privacy.mcc_group_caps.values())
-        self._winsorize_cap = max_cap  # Store max for reference
+        # Store max cap for reference
+        self._winsorize_cap = max(self._mcc_caps.values()) if self._mcc_caps else 0.0
         
         # Create cap lookup DataFrame
-        cap_data = [
-            (group_id, float(cap)) 
-            for group_id, cap in self.config.privacy.mcc_group_caps.items()
-        ]
+        cap_data = [(mcc, float(cap)) for mcc, cap in self._mcc_caps.items()]
         cap_schema = StructType([
-            StructField("cap_group_id", IntegerType(), False),
-            StructField("group_cap", DoubleType(), False),
+            StructField("cap_mcc", StringType(), False),
+            StructField("mcc_cap", DoubleType(), False),
         ])
         cap_df = self.spark.createDataFrame(cap_data, schema=cap_schema)
         
-        # Join to get per-row cap
-        df = df.join(cap_df, df.mcc_group == cap_df.cap_group_id, "left").drop("cap_group_id")
-        df = df.fillna({'group_cap': max_cap})
+        # Broadcast small cap lookup table (~100-500 MCCs) for efficient join
+        df = df.join(F.broadcast(cap_df), df.mcc == cap_df.cap_mcc, "left").drop("cap_mcc")
+        df = df.fillna({'mcc_cap': self._winsorize_cap})  # Unknown MCCs get max cap
         
-        # Apply per-group winsorization
+        # Apply per-MCC winsorization
         df = df.withColumn(
             'amount_winsorized',
-            F.when(F.col('amount') > F.col('group_cap'), F.col('group_cap'))
+            F.when(F.col('amount') > F.col('mcc_cap'), F.col('mcc_cap'))
             .otherwise(F.col('amount'))
         )
         
-        # Statistics per group
-        group_stats = df.groupBy('mcc_group').agg(
-            F.count(F.when(F.col('amount') > F.col('group_cap'), 1)).alias('capped_count'),
-            F.count('*').alias('total_count'),
-            F.first('group_cap').alias('cap')
-        ).collect()
+        # Overall statistics
+        total_stats = df.agg(
+            F.count(F.when(F.col('amount') > F.col('mcc_cap'), 1)).alias('capped_count'),
+            F.count('*').alias('total_count')
+        ).first()
         
-        logger.info("Per-group winsorization statistics:")
-        for row in sorted(group_stats, key=lambda x: x.mcc_group):
-            pct = 100 * row.capped_count / row.total_count if row.total_count > 0 else 0
-            logger.info(f"  Group {row.mcc_group}: cap={row.cap:,.0f}, capped={row.capped_count:,} ({pct:.2f}%)")
+        pct_capped = 100 * total_stats.capped_count / total_stats.total_count if total_stats.total_count > 0 else 0
+        logger.info(f"Per-MCC winsorization: {total_stats.capped_count:,} / {total_stats.total_count:,} transactions capped ({pct_capped:.2f}%)")
+        if self._mcc_caps:
+            logger.info(f"Cap range: [{min(self._mcc_caps.values()):,.0f}, {max(self._mcc_caps.values()):,.0f}]")
         
         return df
     
@@ -332,9 +311,9 @@ class TransactionPreprocessor:
         """Create numeric indices for dimensions using Spark SQL (no UDFs)."""
         # Get date range
         date_stats = df.agg(
-            F.min('transaction_date').alias('min_date'),
-            F.max('transaction_date').alias('max_date')
-        ).collect()[0]
+            F.min(F.col('transaction_date')).alias('min_date'),
+            F.max(F.col('transaction_date')).alias('max_date')
+        ).first()
         
         self._min_date = date_stats.min_date
         max_date = date_stats.max_date
@@ -357,6 +336,13 @@ class TransactionPreprocessor:
         min_date_lit = F.lit(self._min_date)
         df = df.withColumn('day_idx', F.datediff(F.col('transaction_date'), min_date_lit))
         
+        # Create weekday column (0=Monday, 6=Sunday)
+        # Spark's dayofweek returns 1=Sunday, 2=Monday, ..., 7=Saturday
+        # We convert to 0=Monday, 1=Tuesday, ..., 6=Sunday
+        # CRITICAL: Use F.pmod() not % operator - Spark's % follows Java semantics (can be negative)
+        # For Sunday: (1-2) % 7 = -1 (wrong), but F.pmod(1-2, 7) = 6 (correct)
+        df = df.withColumn('weekday', F.pmod(F.dayofweek(F.col('transaction_date')) - 2, 7))
+        
         # Filter to configured number of days
         df = df.filter(F.col('day_idx') < self.config.data.num_days)
         df = df.filter(F.col('day_idx') >= 0)
@@ -372,16 +358,15 @@ class TransactionPreprocessor:
         ])
         mcc_df = self.spark.createDataFrame(mcc_mapping_data, schema=mcc_schema)
         
-        df = df.join(mcc_df, df.mcc == mcc_df.mcc_key, "left").drop("mcc_key")
+        # Broadcast small MCC index lookup table (~300 MCCs) for efficient join
+        df = df.join(F.broadcast(mcc_df), df.mcc == mcc_df.mcc_key, "left").drop("mcc_key")
         
         logger.info(f"Unique MCCs: {len(self._mcc_to_idx)}")
         
         # Create city index mapping using join (no UDF!)
-        city_data = (
-            df.select('province_code', 'acceptor_city')
-            .distinct()
-            .collect()
-        )
+        # Stream distinct city-province pairs (1500+ pairs) instead of collecting all at once
+        city_data_df = df.select('province_code', 'acceptor_city').distinct()
+        city_data = list(city_data_df.toLocalIterator())
         
         # Global city index
         unique_cities = sorted(set(row.acceptor_city for row in city_data))
@@ -394,35 +379,51 @@ class TransactionPreprocessor:
         ])
         city_df = self.spark.createDataFrame(city_mapping_data, schema=city_schema)
         
-        df = df.join(city_df, df.acceptor_city == city_df.city_key, "left").drop("city_key")
+        # Broadcast small city index lookup table (~1500 cities) for efficient join
+        df = df.join(F.broadcast(city_df), df.acceptor_city == city_df.city_key, "left").drop("city_key")
         
         logger.info(f"Unique cities: {len(self._city_to_idx)}")
         
         return df
     
-    def _aggregate_to_histogram(self, df: DataFrame) -> TransactionHistogram:
-        """Aggregate data to histogram structure."""
-        # Compute aggregations (3 queries: transaction_count, unique_cards, total_amount)
+    def _aggregate_to_histogram(self, df: DataFrame):
+        """
+        Aggregate data to SparkHistogram structure (100% Spark, ZERO collect).
+        
+        CRITICAL: Computes BOTH winsorized and original amounts:
+        - total_amount (winsorized): For SDC processing (outliers handled)
+        - total_amount_original: For computing invariants that match public data
+        
+        Returns SparkHistogram that keeps all data distributed (no driver memory).
+        """
+        from schema.histogram_spark import SparkHistogram, HistogramDimension
+        
+        # Compute aggregations (4 queries: transaction_count, unique_cards, total_amount, total_amount_original)
+        # CRITICAL: Cast sums to LongType to avoid Java BigDecimal reflection warnings
+        # Include weekday in groupBy for context-aware bounds
         agg_df = df.groupBy(
-            'province_code', 'city_idx', 'mcc_idx', 'day_idx'
+            'province_code', 'city_idx', 'mcc_idx', 'day_idx', 'weekday'
         ).agg(
-            F.count('*').alias('transaction_count'),
-            F.countDistinct('card_number').alias('unique_cards'),
-            F.sum('amount_winsorized').alias('total_amount')
+            F.count('*').cast('long').alias('transaction_count'),
+            F.countDistinct(F.col('card_number')).cast('long').alias('unique_cards'),
+            F.sum(F.col('amount_winsorized')).cast('long').alias('total_amount'),         # Winsorized (outliers handled)
+            F.sum(F.col('amount')).cast('long').alias('total_amount_original')             # Original (for invariants)
         )
         
-        # Collect aggregated data
-        agg_data = agg_df.collect()
+        # Rename province_code to province_idx for consistency
+        agg_df = agg_df.withColumnRenamed('province_code', 'province_idx')
         
-        logger.info(f"Aggregated to {len(agg_data):,} non-zero cells")
+        # Get count first (for logging) - use count() instead of collect()
+        num_cells = agg_df.count()
+        logger.info(f"Aggregated to {num_cells:,} non-zero cells (Spark DataFrame, NO collect)")
         
-        # Create histogram
+        # Create dimension metadata (small lists in driver, ~1 KB total)
         num_provinces = max(self.geography.province_codes) + 1
         num_cities = len(self._city_to_idx)
         num_mccs = len(self._mcc_to_idx)
         num_days = self.config.data.num_days
         
-        # Create label lists
+        # Create label lists (small metadata)
         province_labels = [''] * num_provinces
         for code in self.geography.province_codes:
             province = self.geography.get_province(code)
@@ -430,40 +431,32 @@ class TransactionPreprocessor:
                 province_labels[code] = province.name
         
         city_labels = [''] * num_cities
+        city_codes = [0] * num_cities
         for city, idx in self._city_to_idx.items():
             city_labels[idx] = city
+            city_code = self.geography.get_city_code(city)
+            city_codes[idx] = city_code if city_code is not None else Geography.UNKNOWN_CITY_CODE
         
         mcc_labels = [''] * num_mccs
         for mcc, idx in self._mcc_to_idx.items():
             mcc_labels[idx] = mcc
         
-        histogram = TransactionHistogram(
-            province_dim=num_provinces,
-            city_dim=num_cities,
-            mcc_dim=num_mccs,
-            day_dim=num_days,
-            province_labels=province_labels,
-            city_labels=city_labels,
-            mcc_labels=mcc_labels
-        )
+        # Build dimensions dictionary
+        dimensions = {
+            'province': HistogramDimension('province', num_provinces, province_labels),
+            'city': HistogramDimension('city', num_cities, city_labels),
+            'mcc': HistogramDimension('mcc', num_mccs, mcc_labels),
+            'day': HistogramDimension('day', num_days, [str(i) for i in range(num_days)])
+        }
         
-        # Fill histogram
-        for row in agg_data:
-            p_idx = row.province_code
-            c_idx = row.city_idx
-            m_idx = row.mcc_idx
-            d_idx = row.day_idx
-            
-            if p_idx is not None and c_idx is not None and m_idx is not None and d_idx is not None:
-                if 0 <= p_idx < num_provinces and 0 <= c_idx < num_cities and \
-                   0 <= m_idx < num_mccs and 0 <= d_idx < num_days:
-                    
-                    histogram.set_value(p_idx, c_idx, m_idx, d_idx, 
-                                       'transaction_count', int(row.transaction_count))
-                    histogram.set_value(p_idx, c_idx, m_idx, d_idx,
-                                       'unique_cards', int(row.unique_cards))
-                    histogram.set_value(p_idx, c_idx, m_idx, d_idx,
-                                       'total_amount', int(row.total_amount))
+        # Create SparkHistogram (data stays in Spark, NO collection to driver)
+        logger.info("Creating SparkHistogram (100% Spark, data remains distributed)")
+        histogram = SparkHistogram(
+            spark=self.spark,
+            df=agg_df,
+            dimensions=dimensions,
+            city_codes=city_codes
+        )
         
         return histogram
     
@@ -488,11 +481,11 @@ class TransactionPreprocessor:
         return self._min_date
     
     @property
-    def mcc_grouping(self):
-        """Get MCC grouping result."""
-        return self._mcc_grouping
+    def mcc_caps(self):
+        """Get per-MCC caps dictionary."""
+        return self._mcc_caps
     
     @property
     def d_max(self) -> Optional[int]:
-        """Get D_max (max cells per card) for user-level DP sensitivity."""
+        """Get D_max (max cells per card) for bounded contribution analysis."""
         return self._d_max

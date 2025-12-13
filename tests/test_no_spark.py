@@ -207,36 +207,7 @@ def test_histogram():
     return True
 
 
-def test_queries():
-    """Test query definitions."""
-    print("Testing Queries...")
-    
-    from queries.transaction_queries import (
-        TransactionCountQuery,
-        UniqueCardsQuery,
-        UniqueAcceptorsQuery,
-        TotalAmountQuery,
-        TransactionWorkload
-    )
-    
-    # Test sensitivities
-    assert TransactionCountQuery.sensitivity() == 1.0
-    assert UniqueCardsQuery.sensitivity() == 1.0
-    assert UniqueAcceptorsQuery.sensitivity() == 1.0
-    
-    amount_query = TotalAmountQuery(winsorize_cap=1000000)
-    assert amount_query.sensitivity() == 1000000
-    
-    # Test workload
-    workload = TransactionWorkload()
-    specs = workload.get_query_specs()
-    assert len(specs) == 4
-    assert 'transaction_count' in specs
-    
-    sensitivities = workload.get_sensitivities()
-    assert sensitivities['transaction_count'] == 1.0
-    
-    print("  ✓ Queries OK")
+# test_queries() removed - queries module deleted as unused
     return True
 
 
@@ -792,7 +763,7 @@ def run_all_tests():
         test_primitives,
         test_geography,
         test_histogram,
-        test_queries,
+        # test_queries removed - queries module deleted as unused
         test_sample_data_generator,
         test_nnls_postprocessor,
         test_controlled_rounder,

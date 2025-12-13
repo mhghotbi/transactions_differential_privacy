@@ -1,7 +1,7 @@
 # Transaction DP System - Cursor AI Rules
 
 ## Project Overview
-This is a production-ready Differential Privacy system for financial transaction data, implementing US Census 2020 DAS methodology. The system processes billions of transactions using Spark and applies mathematically calibrated noise to protect individual privacy.
+This is a production-ready privacy-preserving system for financial transaction data. The main pipeline uses **Statistical Disclosure Control (SDC)** with multiplicative jitter, while alternative implementations support formal **Differential Privacy (DP)** using US Census 2020 DAS methodology with discrete Gaussian mechanisms. The system processes billions of transactions using Spark and applies mathematically calibrated noise to protect individual privacy.
 
 ## Agent Expertise & Approach
 
@@ -20,8 +20,9 @@ You are an expert in:
 - **When suggesting changes**: Always verify that modifications preserve privacy guarantees and mathematical correctness
 
 ### Key Mathematical Concepts in This Codebase
+- **Multiplicative Jitter (SDC)**: Main pipeline uses `noise_factor = 1 + noise_level * (uniform - 0.5) * 2`, with minimum deviation enforcement to prevent zero noise (`min_noise_factor_deviation`)
 - **zCDP (zero-Concentrated DP)**: Privacy budget measured in ρ (rho), converts to (ε,δ)-DP via: ε = ρ + 2√(ρ·ln(1/δ))
-- **Discrete Gaussian Mechanism**: Adds integer noise from discrete Gaussian distribution, preserves exact integer outputs
+- **Discrete Gaussian Mechanism**: Adds integer noise from discrete Gaussian distribution, preserves exact integer outputs (used in alternative DP implementations)
 - **Global Sensitivity**: Accounts for multi-cell contributions (one card can contribute to multiple cells)
 - **NNLS Post-Processing**: Non-negative least squares optimization to maintain geographic consistency while preserving privacy
 - **Budget Composition**: Privacy budget split across geographic levels (province/city) and query types (count/unique/total)
@@ -40,6 +41,7 @@ Before approving any changes to DP mechanisms:
 ### Privacy & Security
 - NEVER modify privacy budget calculations without understanding zCDP composition
 - NEVER remove noise mechanisms or bypass DP guarantees
+- ALWAYS enforce minimum noise (`min_noise_factor_deviation > 0`) to prevent zero-noise cells that leak information
 - ALWAYS maintain exact invariants (province/national totals must remain exact)
 - NEVER log or expose raw transaction data - only aggregated statistics
 - ALWAYS validate privacy budget allocations before applying noise
@@ -134,7 +136,8 @@ df = spark.read.option("header", "true").csv(csv_path)  # For CSV
 from core.config import Config
 config = Config()
 config.data.input_path = "data/transactions.parquet"
-config.privacy.total_rho = Fraction(1, 4)  # 0.25
+config.privacy.noise_level = 0.15  # 15% relative noise
+config.privacy.min_noise_factor_deviation = 0.01  # 1% minimum (prevents zero noise)
 config.validate()
 ```
 
@@ -151,6 +154,7 @@ if not result['success']:
 - ❌ Don't use Pandas for large datasets (> 100K rows)
 - ❌ Don't modify privacy budget calculations without understanding zCDP
 - ❌ Don't bypass DP noise mechanisms
+- ❌ Don't set `min_noise_factor_deviation = 0.0` (allows zero noise, privacy risk)
 - ❌ Don't log raw transaction data
 - ❌ Don't create new Spark sessions if one already exists
 - ❌ Don't use CSV for large datasets (use Parquet)

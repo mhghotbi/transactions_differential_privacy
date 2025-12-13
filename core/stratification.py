@@ -195,20 +195,20 @@ class CityTierClassifier:
         logger.info("Classifying cities into tiers...")
         
         # Count transactions per city
-        city_counts = df.groupBy(city_col).agg(
+        city_counts_df = df.groupBy(city_col).agg(
             F.count("*").alias("tx_count")
-        ).collect()
+        )
         
-        if not city_counts:
+        # Stream results to driver instead of collecting all at once (1500 cities)
+        city_txns = {row[city_col]: row["tx_count"] for row in city_counts_df.toLocalIterator()}
+        
+        if not city_txns:
             logger.warning("No cities found in data")
             return CityTierResult(
                 city_to_tier={},
                 tier_info={},
                 tier_boundaries={}
             )
-        
-        # Build city -> count mapping
-        city_txns = {row[city_col]: row["tx_count"] for row in city_counts}
         counts = list(city_txns.values())
         
         logger.info(f"Found {len(city_txns)} cities")
@@ -533,13 +533,13 @@ class StratumManager:
                 F.countDistinct(card_col).alias("num_cards"),
                 F.mean(amount_col).alias("typical_amount"),
                 F.expr(f"percentile_approx({amount_col}, {amount_percentile/100})").alias("amount_cap")
-            ).collect()[0]
+            ).first()
             
             # Compute max cells per card in this stratum
             cells_per_card = stratum_df.groupBy(card_col).agg(
                 F.countDistinct(city_col, mcc_col, day_idx_col).alias("num_cells")
             )
-            max_cells = cells_per_card.agg(F.max("num_cells")).collect()[0][0] or 1
+            max_cells = cells_per_card.agg(F.max(F.col("num_cells"))).first()[0] or 1
             
             # Create stratum
             stratum = Stratum(

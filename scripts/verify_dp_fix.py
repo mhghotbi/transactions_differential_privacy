@@ -62,9 +62,9 @@ def verify_dp_output(
         'acceptor_city', 'mcc', 'transaction_date'
     ).agg(
         F.count('*').alias('transaction_count'),
-        F.countDistinct('card_number').alias('unique_cards'),
-        F.countDistinct('acceptor_id').alias('unique_acceptors'),
-        F.sum('amount').alias('total_amount')
+        F.countDistinct(F.col('card_number')).alias('unique_cards'),
+        F.countDistinct(F.col('acceptor_id')).alias('unique_acceptors'),
+        F.sum(F.col('amount')).alias('total_amount')
     )
     
     orig_cell_count = original_agg.count()
@@ -90,19 +90,19 @@ def verify_dp_output(
     
     # Original totals
     orig_totals = original_agg.agg(
-        F.sum('transaction_count').alias('transaction_count'),
-        F.sum('unique_cards').alias('unique_cards'),
-        F.sum('unique_acceptors').alias('unique_acceptors'),
-        F.sum('total_amount').alias('total_amount')
-    ).collect()[0]
+        F.sum(F.col('transaction_count')).alias('transaction_count'),
+        F.sum(F.col('unique_cards')).alias('unique_cards'),
+        F.sum(F.col('unique_acceptors')).alias('unique_acceptors'),
+        F.sum(F.col('total_amount')).alias('total_amount')
+    ).first()
     
     # DP totals
     dp_totals = dp_df.agg(
-        F.sum('transaction_count').alias('transaction_count'),
-        F.sum('unique_cards').alias('unique_cards'),
-        F.sum('unique_acceptors').alias('unique_acceptors'),
-        F.sum('total_amount').alias('total_amount')
-    ).collect()[0]
+        F.sum(F.col('transaction_count')).alias('transaction_count'),
+        F.sum(F.col('unique_cards')).alias('unique_cards'),
+        F.sum(F.col('unique_acceptors')).alias('unique_acceptors'),
+        F.sum(F.col('total_amount')).alias('total_amount')
+    ).first()
     
     # Calculate errors
     metrics = ['transaction_count', 'unique_cards', 'unique_acceptors', 'total_amount']

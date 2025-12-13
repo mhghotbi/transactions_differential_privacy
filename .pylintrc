@@ -14,139 +14,8 @@ ignore=CVS, scripts
 ignore-patterns=
 
 # Python code to execute, usually for sys.path manipulation such as
-# pygtk.require().
-init-hook="import sys; sys.path += ['.',
-                                    './analysis',
-                                    './analysis/analysis_scripts',
-                                    './analysis/analysis_scripts/user007',
-                                    './analysis/attic',
-                                    './analysis/attic/analysis_scripts',
-                                    './analysis/attic/other_scripts',
-                                    './analysis/attic/other_scripts/PL94_Experiment',
-                                    './analysis/attic/redistricting_votingage_check',
-                                    './analysis/plotting',
-                                    './analysis/tools',
-                                    './analysis/vignettes',
-                                    './analysis/vignettes/using_das_data',
-                                    './analysis/vignettes/using_noisy_measurements',
-                                    './analysis/vignettes/using_random_data',
-                                    './configs',
-                                    './configs/2018',
-                                    './configs/CVAP_2020',
-                                    './configs/Census1940',
-                                    './configs/Census1940/DDP2010_Update',
-                                    './configs/DHCH2020',
-                                    './configs/DHCH2020/Gurobi',
-                                    './configs/DHCH2020/Reader',
-                                    './configs/DHCHDemoTenVac',
-                                    './configs/DHCP2020',
-                                    './configs/DHCP2020/Reader',
-                                    './configs/DHCP2020/Writer',
-                                    './configs/PL94',
-                                    './configs/PL94_2020',
-                                    './configs/full_household',
-                                    './configs/full_household/Gurobi',
-                                    './configs/full_household/Reader',
-                                    './configs/full_person',
-                                    './configs/full_person/Reader',
-                                    './configs/full_person/Writer',
-                                    './configs/user007',
-                                    './configs/user007/PL94'
-                                    './configs/user007/PL94/DefaultReader',
-                                    './configs/production',
-                                    './configs/production/dhc',
-                                    './configs/production/pl94',
-                                    './configs/production/pl94/ppmf_april2021',
-                                    './configs/production/pl94/ppmf_april2021/unit05eps_per4eps',
-                                    './configs/production/pl94/ppmf_april2021/unit1_9eps_per10_3eps',
-                                    './configs/production/pl94/ppmf_oct2020',
-                                    './configs/production/pl94/ppmf_oct2020/aian_discrete_unit05eps_per4eps',
-                                    './configs/production/pl94/ppmf_oct2020/aian_discrete_unit4eps_per15eps',
-                                    './configs/production/pl94/ppmf_oct2020/aian_geometric_unit05eps_per4eps',
-                                    './configs/production/pl94/ppmf_oct2020/aian_geometric_unit4eps_per15eps',
-                                    './configs/production/pl94/ppmf_oct2020/nonaian_discrete_unit05eps_per4eps',
-                                    './configs/production/pl94/ppmf_oct2020/nonaian_discrete_unit4eps_per15eps',
-                                    './configs/production/pl94/ppmf_oct2020/nonaian_geometric_unit05eps_per4eps',
-                                    './configs/production/pl94/ppmf_oct2020/nonaian_geometric_unit4eps_per15eps',
-                                    './configs/tests',
-                                    './das_framework',
-                                    './das_framework/certificate',
-                                    './das_framework/certificate/texfiles',
-                                    './das_framework/ctools',
-                                    './das_framework/ctools/latex-windows',
-                                    './das_framework/ctools/schema',
-                                    './das_framework/ctools/schema/tests',
-                                    './das_framework/ctools/tests',
-                                    './das_framework/ctools/tests/hcf_test',
-                                    './das_framework/ctools/tests/hcf_test/child',
-                                    './das_framework/ctools/tests/test_files',
-                                    './das_framework/hooks',
-                                    './das_framework/tests',
-                                    './etc',
-                                    './etc/hhtype',
-                                    './jenkins',
-                                    './latex_docs',
-                                    './manualInvariantChecks',
-                                    './programs',
-                                    './programs/constraints',
-                                    './programs/constraints/tests',
-                                    './programs/engine',
-                                    './programs/engine/tests',
-                                    './programs/experiment',
-                                    './programs/geographic_spines',
-                                    './programs/invariants',
-                                    './programs/invariants/tests',
-                                    './programs/metrics',
-                                    './programs/metrics/tests',
-                                    './programs/nodes',
-                                    './programs/nodes/tests',
-                                    './programs/optimization',
-                                    './programs/optimization/tests',
-                                    './programs/python_dvs',
-                                    './programs/python_dvs/cli',
-                                    './programs/python_dvs/cli/plugins',
-                                    './programs/python_dvs/cli/plugins/tests',
-                                    './programs/python_dvs/daemon',
-                                    './programs/python_dvs/demo',
-                                    './programs/python_dvs/doc',
-                                    './programs/python_dvs/dvs',
-                                    './programs/python_dvs/inprogress',
-                                    './programs/python_dvs/sql',
-                                    './programs/python_dvs/tests',
-                                    './programs/queries',
-                                    './programs/queries/tests',
-                                    './programs/reader',
-                                    './programs/reader/cef_2020',
-                                    './programs/reader/cvap',
-                                    './programs/reader/ipums_1940',
-                                    './programs/reader/reader_tests',
-                                    './programs/schema',
-                                    './programs/schema/attributes',
-                                    './programs/schema/attributes/dhch',
-                                    './programs/schema/schemas',
-                                    './programs/schema/table_building',
-                                    './programs/schema/tests',
-                                    './programs/strategies',
-                                    './programs/strategies/tests',
-                                    './programs/tests',
-                                    './programs/utilities',
-                                    './programs/validator',
-                                    './programs/workload',
-                                    './programs/writer',
-                                    './programs/writer/cef_2020',
-                                    './programs/writer/ipums_1940',
-                                    './programs/writer/tests',
-                                    './relative_errors_data',
-                                    './release_doc',
-                                    './scripts',
-                                    './tests',
-                                    './tests/analysis',
-                                    './toy_examples_and_test_methods',
-                                    './toy_examples_and_test_methods/user007',
-                                    '/usr/lib/spark/python',
-                                    '/usr/lib/spark/python/lib/py4j-src.zip',
-                                    '/mnt/das_python'];"
-
+# pygtk.require(). Only include paths relevant to this project.
+init-hook="import sys; sys.path += ['.'];"
 
 # Use multiple processes to speed up Pylint.
 jobs=1
@@ -157,9 +26,6 @@ load-plugins=
 
 # Pickle collected data for later comparisons.
 persistent=yes
-
-# Specify a configuration file.
-#rcfile=
 
 # Allow loading of arbitrary C extensions. Extensions are imported into the
 # active Python interpreter and may run arbitrary code.
@@ -172,23 +38,13 @@ unsafe-load-any-extension=no
 # all. Valid levels: HIGH, INFERENCE, INFERENCE_FAILURE, UNDEFINED
 confidence=
 
-# Disable the message, report, category or checker with the given id(s). You
-# can either give multiple identifiers separated by comma (,) or put this
-# option multiple times (only on the command line, not in the configuration
-# file where it should appear only once).You can also use "--disable=all" to
-# disable everything first and then reenable specific checks. For example, if
-# you want to run only the similarities checker, you can use "--disable=all
-# --enable=similarities". If you want to run only the classes checker, but have
-# no Warning level messages displayed, use"--disable=all --enable=classes
-# --disable=W"
-#disable=print-statement,parameter-unpacking,unpacking-in-except,old-raise-syntax,backtick,long-suffix,old-ne-operator,old-octal-literal,import-star-module-level,raw-checker-failed,bad-inline-option,locally-disabled,locally-enabled,file-ignored,suppressed-message,useless-suppression,deprecated-pragma,apply-builtin,basestring-builtin,buffer-builtin,cmp-builtin,coerce-builtin,execfile-builtin,file-builtin,long-builtin,raw_input-builtin,reduce-builtin,standarderror-builtin,unicode-builtin,xrange-builtin,coerce-method,delslice-method,getslice-method,setslice-method,no-absolute-import,old-division,dict-iter-method,dict-view-method,next-method-called,metaclass-assignment,indexing-exception,raising-string,reload-builtin,oct-method,hex-method,nonzero-method,cmp-method,input-builtin,round-builtin,intern-builtin,unichr-builtin,map-builtin-not-iterating,zip-builtin-not-iterating,range-builtin-not-iterating,filter-builtin-not-iterating,using-cmp-argument,eq-without-hash,div-method,idiv-method,rdiv-method,exception-message-attribute,invalid-str-codec,sys-max-int,bad-python3-import,deprecated-string-function,deprecated-str-translate-call
+# Disable the message, report, category or checker with the given id(s).
+# We disable most checks and only enable critical ones to focus on important issues.
 disable=all
-# Enable the message, report, category or checker with the given id(s). You can
-# either give multiple identifier separated by comma (,) or put this option
-# multiple time (only on the command line, not in the configuration file where
-# it should appear only once). See also the "--disable" option for examples.
-enable=W0702,W0703,E0603,E0604,E0103,E0104,E0116,E0601,E0401,E0602,E0116,E0110,E0114
 
+# Enable the message, report, category or checker with the given id(s).
+# Critical errors that should always be checked:
+enable=W0702,W0703,E0603,E0604,E0103,E0104,E0116,E0601,E0401,E0602,E0110,E0114
 
 
 [REPORTS]
@@ -200,13 +56,8 @@ enable=W0702,W0703,E0603,E0604,E0103,E0104,E0116,E0601,E0401,E0602,E0116,E0110,E
 # (RP0004).
 evaluation=10.0 - ((float(5 * error + warning + refactor + convention) / statement) * 10)
 
-# Template used to display messages. This is a python new-style format string
-# used to format the message information. See doc for all details
-#msg-template=
-
 # Set the output format. Available formats are text, parseable, colorized, json
-# and msvs (visual studio).You can also give a reporter class, eg
-# mypackage.mymodule.MyReporterClass.
+# and msvs (visual studio).
 output-format=text
 
 # Tells whether to display a full report or only the messages
@@ -327,7 +178,7 @@ ignored-classes=optparse.Values,thread._local,_thread._local
 # (useful for modules/projects where namespaces are manipulated during runtime
 # and thus existing member attributes cannot be deduced by static analysis. It
 # supports qualified module names, as well as Unix pattern matching.
-ignored-modules=gurobipy,numpy,numpy.random,PyPDF2,temptestenginemodule,pywintypes,win32com.client,hdmm,pymysql
+ignored-modules=gurobipy,numpy,numpy.random,PyPDF2,pywintypes,win32com.client,hdmm,pymysql,pyspark.sql,scipy
 
 # Show a hint with possible names when a member name was not found. The aspect
 # of finding the hint is based on edit distance.
@@ -399,18 +250,12 @@ const-rgx=(([A-Z_][A-Z0-9_]*)|(__.*__))$
 docstring-min-length=-1
 
 # Naming hint for function names
-#function-name-hint=(([a-z][a-z0-9_]{2,30})|(_[a-z0-9_]*))$
-# NONDEFAULT
 function-name-hint=[a-z][a-zA-Z0-9]+$
 
 # Regular expression matching correct function names
-#function-rgx=(([a-z][a-z0-9_]{2,30})|(_[a-z0-9_]*))$
-# NONDEFAULT
 function-rgx=[a-z][a-zA-Z0-9]+$
 
 # Good variable names which should always be accepted, separated by a comma
-#good-names=i,j,k,ex,Run,_
-# NONDEFAULT
 good-names=i,j,k,ex,Run,y,x,_
 
 # Include a hint for the correct naming format with invalid-name
@@ -423,23 +268,15 @@ inlinevar-name-hint=[A-Za-z_][A-Za-z0-9_]*$
 inlinevar-rgx=[A-Za-z_][A-Za-z0-9_]*$
 
 # Naming hint for method names
-# method-name-hint=(([a-z][a-z0-9_]{2,30})|(_[a-z0-9_]*))$
-# NONDEFAULT
 method-name-hint=[a-z][a-zA-Z0-9]+$
 
 # Regular expression matching correct method names
-# method-rgx=(([a-z][a-z0-9_]{2,30})|(_[a-z0-9_]*))$
-# NONDEFAULT
 method-rgx=_{0,2}[a-z][a-zA-Z0-9]+_{0,2}$
 
 # Naming hint for module names
-#module-name-hint=(([a-z_][a-z0-9_]*)|([A-Z][a-zA-Z0-9]+))$
-# NONDEFAULT
 module-name-hint=([a-z][a-z_]*[a-z])$
 
 # Regular expression matching correct module names
-#module-rgx=(([a-z_][a-z0-9_]*)|([A-Z][a-zA-Z0-9]+))$
-# NONDEFAULT
 module-rgx=([a-z][a-z_]*[a-z])$
 
 # Colon-delimited sets of names that determine each other's naming style when

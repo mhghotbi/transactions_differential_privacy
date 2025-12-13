@@ -90,13 +90,55 @@ class SparkTransactionReader:
         df = self._rename_columns(df)
         
         # Validate and filter
-        df = self._validate_and_filter(df)
+        # Use skip_expensive_counts from config for production runs on very large datasets
+        skip_counts = getattr(self.config.spark, 'skip_expensive_counts', False)
+        df = self._validate_and_filter(df, skip_counts=skip_counts)
         
         return df
     
     def _read_parquet(self, path: str) -> DataFrame:
-        """Read from Parquet format."""
-        return self.spark.read.parquet(path)
+        """
+        Read from Parquet format with error handling.
+        
+        Args:
+            path: Path to Parquet file or directory
+            
+        Returns:
+            DataFrame with transaction data
+            
+        Raises:
+            ValueError: If file is empty, corrupted, or cannot be read
+        """
+        try:
+            df = self.spark.read.parquet(path)
+            
+            # Validate that we got a valid DataFrame
+            if df is None:
+                raise ValueError(f"Failed to read Parquet file: {path} (returned None)")
+            
+            # Check if DataFrame has partitions (indicates file was read)
+            try:
+                num_partitions = df.rdd.getNumPartitions()
+                if num_partitions == 0:
+                    logger.warning(f"Parquet file {path} has 0 partitions - may be empty")
+            except Exception as e:
+                logger.warning(f"Could not check partitions: {e}")
+            
+            return df
+            
+        except Exception as e:
+            error_msg = f"Error reading Parquet file {path}: {str(e)}"
+            logger.error(error_msg)
+            
+            # Provide more helpful error message for common issues
+            if "read length must be non-negative or -1" in str(e):
+                raise ValueError(
+                    f"Parquet file appears corrupted or empty: {path}\n"
+                    f"Original error: {str(e)}\n"
+                    f"Please verify the file exists and is not corrupted."
+                ) from e
+            else:
+                raise ValueError(error_msg) from e
     
     def _read_csv(self, path: str) -> DataFrame:
         """Read from CSV format."""
@@ -116,7 +158,7 @@ class SparkTransactionReader:
         
         return df
     
-    def _validate_and_filter(self, df: DataFrame) -> DataFrame:
+    def _validate_and_filter(self, df: DataFrame, skip_counts: bool = False) -> DataFrame:
         """
         Validate data and filter invalid records.
         
@@ -125,6 +167,11 @@ class SparkTransactionReader:
         - Converts transaction_date to DateType if needed
         - Validates cities against geography
         - Adds province information
+        
+        Args:
+            df: Input DataFrame
+            skip_counts: If True, skip expensive count() operations (for 10B+ row datasets)
+                        These counts are ONLY for logging and do NOT affect processing
         """
         # Check required columns (internal names after column mapping)
         required_columns = [
@@ -136,12 +183,40 @@ class SparkTransactionReader:
         if missing:
             raise ValueError(f"Missing required columns: {missing}")
         
-        initial_count = df.count()
-        logger.info(f"Initial record count: {initial_count:,}")
+        if skip_counts:
+            logger.info("Skipping record counts for performance (skip_counts=True)")
+            initial_count = -1
+        else:
+            # First, try to get count - catch only data reading errors
+            try:
+                initial_count = df.count()
+            except Exception as e:
+                # Handle data reading errors (corrupted file, etc.)
+                if "read length must be non-negative or -1" in str(e):
+                    raise ValueError(
+                        "Error reading input data. This may indicate:\n"
+                        "1. The input file is corrupted or empty\n"
+                        "2. The file format is incorrect\n"
+                        "3. There's an issue with the file system\n"
+                        f"Original error: {str(e)}"
+                    ) from e
+                else:
+                    raise
+            
+            # Then, validate the count (separate from data reading errors)
+            logger.info(f"Initial record count: {initial_count:,}")
+            if initial_count == 0:
+                raise ValueError(
+                    "Input DataFrame is empty. Please verify your input file contains data."
+                )
         
         # Convert transaction_date to DateType if it's a string
         date_field = [f for f in df.schema.fields if f.name == 'transaction_date'][0]
+        date_conversion_happened = False
+        after_date_conversion = initial_count if not skip_counts else -1
+        
         if isinstance(date_field.dataType, StringType):
+            date_conversion_happened = True
             logger.info("Converting transaction_date from StringType to DateType")
             # Try to parse date (supports ISO format YYYY-MM-DD)
             df = df.withColumn(
@@ -150,19 +225,75 @@ class SparkTransactionReader:
             )
             # Filter out any null dates (parsing failures)
             df = df.filter(F.col('transaction_date').isNotNull())
-            logger.info("Date conversion complete")
+            
+            # Count after date conversion (if not skipping counts)
+            if not skip_counts:
+                try:
+                    after_date_conversion = df.count()
+                    date_dropped = initial_count - after_date_conversion
+                    if date_dropped > 0:
+                        logger.info(f"Date conversion: {after_date_conversion:,} records "
+                                   f"(dropped {date_dropped:,} with invalid dates)")
+                    else:
+                        logger.info("Date conversion complete (no records dropped)")
+                except Exception as e:
+                    if "read length must be non-negative or -1" in str(e):
+                        raise ValueError(
+                            "Error counting records after date conversion. This may indicate:\n"
+                            "1. The input file is corrupted\n"
+                            "2. There's an issue with the file system\n"
+                            f"Original error: {str(e)}"
+                        ) from e
+                    else:
+                        raise
+            else:
+                logger.info("Date conversion complete")
         
         # Filter null values
         for col in required_columns:
             df = df.filter(F.col(col).isNotNull())
         
-        after_null_filter = df.count()
-        logger.info(f"After null filter: {after_null_filter:,} "
-                   f"(dropped {initial_count - after_null_filter:,})")
+        if not skip_counts:
+            # First, try to get count - catch only data reading errors
+            try:
+                after_null_filter = df.count()
+            except Exception as e:
+                # Handle data reading errors (corrupted file, etc.)
+                if "read length must be non-negative or -1" in str(e):
+                    raise ValueError(
+                        "Error counting records after null filter. This may indicate:\n"
+                        "1. The input file is corrupted or empty\n"
+                        "2. There's an issue with the file system\n"
+                        f"Original error: {str(e)}"
+                    ) from e
+                else:
+                    raise
+            
+            # Then, validate the count (separate from data reading errors)
+            # Calculate drops accurately: after date conversion (if happened) or initial count
+            if date_conversion_happened:
+                # Date conversion happened, so compare to count after date conversion
+                base_count = after_date_conversion
+                null_dropped = base_count - after_null_filter
+                total_dropped = initial_count - after_null_filter
+                logger.info(f"After null filter: {after_null_filter:,} "
+                           f"(dropped {null_dropped:,} null values, "
+                           f"{total_dropped:,} total from initial)")
+            else:
+                # No date conversion, so compare directly to initial count
+                null_dropped = initial_count - after_null_filter
+                logger.info(f"After null filter: {after_null_filter:,} "
+                           f"(dropped {null_dropped:,})")
+            
+            if after_null_filter == 0:
+                raise ValueError(
+                    "All records were filtered out after null filtering. "
+                    "Please check your input data - all required columns must have non-null values."
+                )
         
         # Create city-province lookup DataFrame (no UDFs!)
         city_province_data = [
-            (city, info[0], info[1])  # city_name, province_code, province_name
+            (city, info[0], info[1], info[2])  # city_name, province_code, province_name, city_code
             for city, info in self.geography.city_to_province_broadcast().items()
         ]
         
@@ -170,37 +301,43 @@ class SparkTransactionReader:
             StructField("city_name", StringType(), False),
             StructField("province_code", IntegerType(), False),
             StructField("province_name", StringType(), False),
+            StructField("city_code", IntegerType(), False),
         ])
         
         city_province_df = self.spark.createDataFrame(city_province_data, schema=city_province_schema)
         
         # Join to add province info (instead of UDF)
         # Use LEFT join to keep unknown cities, assign them to "Unknown" province
+        # Broadcast small city-province lookup table (~1500 cities) for efficient join
         df = df.join(
-            city_province_df,
+            F.broadcast(city_province_df),
             df.acceptor_city == city_province_df.city_name,
             "left"  # Keep all cities, even if not in city_province file
         ).drop("city_name")
         
-        # Count unknown cities before filling
-        unknown_count = df.filter(F.col('province_code').isNull()).count()
+        # Assign unknown cities to "Unknown" province and unknown city code
+        # Count unknown cities (for logging only - can skip for large datasets)
+        if not skip_counts:
+            unknown_count = df.filter(F.col('province_code').isNull()).count()
+            if unknown_count > 0:
+                logger.warning(f"Found {unknown_count:,} transactions with unknown cities - assigned to 'Unknown' province")
         
-        # Assign unknown cities to "Unknown" province
         df = df.fillna({
             'province_code': Geography.UNKNOWN_PROVINCE_CODE,
-            'province_name': Geography.UNKNOWN_PROVINCE_NAME
+            'province_name': Geography.UNKNOWN_PROVINCE_NAME,
+            'city_code': Geography.UNKNOWN_CITY_CODE
         })
         
-        after_city_join = df.count()
-        logger.info(f"After city mapping: {after_city_join:,} records")
-        if unknown_count > 0:
-            logger.warning(f"Found {unknown_count:,} transactions with unknown cities - assigned to 'Unknown' province")
+        if not skip_counts:
+            after_city_join = df.count()
+            logger.info(f"After city mapping: {after_city_join:,} records")
         
         # Filter positive amounts
         df = df.filter(F.col('amount') > 0)
         
-        final_count = df.count()
-        logger.info(f"Final record count: {final_count:,}")
+        if not skip_counts:
+            final_count = df.count()
+            logger.info(f"Final record count: {final_count:,}")
         
         return df
     
@@ -211,9 +348,9 @@ class SparkTransactionReader:
     def get_date_range(self, df: DataFrame) -> tuple:
         """Get min and max dates from data."""
         stats = df.agg(
-            F.min('transaction_date').alias('min_date'),
-            F.max('transaction_date').alias('max_date')
-        ).collect()[0]
+            F.min(F.col('transaction_date')).alias('min_date'),
+            F.max(F.col('transaction_date')).alias('max_date')
+        ).first()
         
         return stats.min_date, stats.max_date
     
@@ -226,16 +363,16 @@ class SparkTransactionReader:
         """
         stats = df.agg(
             F.count('*').alias('total_transactions'),
-            F.countDistinct('card_number').alias('unique_cards'),
-            F.countDistinct('acceptor_city').alias('unique_cities'),
-            F.countDistinct('mcc').alias('unique_mccs'),
-            F.sum('amount').alias('total_amount'),
-            F.avg('amount').alias('avg_amount'),
-            F.min('amount').alias('min_amount'),
-            F.max('amount').alias('max_amount'),
-            F.min('transaction_date').alias('min_date'),
-            F.max('transaction_date').alias('max_date')
-        ).collect()[0]
+            F.countDistinct(F.col('card_number')).alias('unique_cards'),
+            F.countDistinct(F.col('acceptor_city')).alias('unique_cities'),
+            F.countDistinct(F.col('mcc')).alias('unique_mccs'),
+            F.sum(F.col('amount')).alias('total_amount'),
+            F.avg(F.col('amount')).alias('avg_amount'),
+            F.min(F.col('amount')).alias('min_amount'),
+            F.max(F.col('amount')).alias('max_amount'),
+            F.min(F.col('transaction_date')).alias('min_date'),
+            F.max(F.col('transaction_date')).alias('max_date')
+        ).first()
         
         return {
             'total_transactions': stats.total_transactions,

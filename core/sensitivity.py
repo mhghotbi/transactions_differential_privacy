@@ -214,14 +214,14 @@ class GlobalSensitivityCalculator:
         
         # Get max and percentiles
         stats = cells_per_individual.agg(
-            F.max("num_cells").alias("max"),
+            F.max(F.col("num_cells")).alias("max"),
             F.expr("percentile_approx(num_cells, 0.5)").alias("p50"),
             F.expr("percentile_approx(num_cells, 0.9)").alias("p90"),
             F.expr("percentile_approx(num_cells, 0.95)").alias("p95"),
             F.expr("percentile_approx(num_cells, 0.99)").alias("p99"),
             F.mean("num_cells").alias("mean"),
             F.count("*").alias("num_cards")
-        ).collect()[0]
+        ).first()
         
         self._max_cells_per_card = int(stats["max"]) if stats["max"] else 1
         self._percentile_cells = {
@@ -278,9 +278,18 @@ class GlobalSensitivityCalculator:
             F.countDistinct(*cell_columns).alias("num_cells")
         )
         
-        distribution = cells_per_individual.groupBy("num_cells").count().collect()
+        # Cache intermediate result to avoid recomputation during groupBy shuffle
+        cells_per_individual.cache()
         
-        self._cells_distribution = {row["num_cells"]: row["count"] for row in distribution}
+        # Group by num_cells and count - final result is small (distinct num_cells values)
+        # Use toLocalIterator() for memory efficiency to prevent OOM with thousands of unique values
+        distribution_df = cells_per_individual.groupBy("num_cells").count()
+        
+        # Uncache to free memory
+        cells_per_individual.unpersist()
+        
+        # Stream results to driver instead of collecting all at once
+        self._cells_distribution = {row["num_cells"]: row["count"] for row in distribution_df.toLocalIterator()}
         
         # Log summary statistics
         total_individuals = sum(self._cells_distribution.values())
@@ -753,13 +762,13 @@ class StratumSensitivityCalculator:
                 F.countDistinct(card_col).alias("num_cards"),
                 F.mean(amount_col).alias("typical_amount"),
                 F.expr(f"percentile_approx({amount_col}, {amount_percentile/100})").alias("amount_cap")
-            ).collect()[0]
+            ).first()
             
             # Compute max cells per card within this stratum
             cells_per_card = stratum_df.groupBy(card_col).agg(
                 F.countDistinct(*cell_columns).alias("num_cells")
             )
-            max_cells = cells_per_card.agg(F.max("num_cells")).collect()[0][0] or 1
+            max_cells = cells_per_card.agg(F.max(F.col("num_cells"))).first()[0] or 1
             
             # Create stratum sensitivity
             stratum_sens = StratumSensitivity(

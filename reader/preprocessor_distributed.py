@@ -74,9 +74,9 @@ class DistributedPreprocessor:
     def _broadcast_geography(self) -> None:
         """Create and broadcast geography lookup table."""
         # Geography is small (~500 cities) - safe to broadcast
-        # Use the existing method that returns city -> (province_code, province_name)
+        # Use the existing method that returns city -> (province_code, province_name, city_code)
         geo_data = [
-            (city, info[0], info[1])  # city_name, province_code, province_name
+            (city, info[0], info[1], info[2])  # city_name, province_code, province_name, city_code
             for city, info in self.geography.city_to_province_broadcast().items()
         ]
         
@@ -84,6 +84,7 @@ class DistributedPreprocessor:
             StructField("city_name", StringType(), False),
             StructField("province_code", IntegerType(), False),
             StructField("province_name", StringType(), False),
+            StructField("city_code", IntegerType(), False),
         ])
         
         self._geo_df = self.spark.createDataFrame(geo_data, schema=geo_schema)
@@ -109,20 +110,25 @@ class DistributedPreprocessor:
         logger.info("Step 1: Geography join (broadcast)...")
         df = self._join_geography(df)
         
-        # Step 2: Apply bounded contribution (clip transactions per card-cell)
-        logger.info("Step 2: Applying bounded contribution...")
+        # Step 2: Compute per-MCC winsorization caps
+        # Each MCC is processed separately (parallel composition)
+        logger.info("Step 2: Computing per-MCC caps...")
+        df = self._compute_per_mcc_caps(df)
+        
+        # Step 3: Apply bounded contribution (clip transactions per card-cell)
+        logger.info("Step 3: Applying bounded contribution...")
         df = self._apply_bounded_contribution(df)
         
-        # Step 3: Compute winsorization cap (approximate quantile)
-        logger.info("Step 3: Computing winsorization cap...")
+        # Step 4: Compute winsorization cap (approximate quantile)
+        logger.info("Step 4: Computing winsorization cap...")
         winsorize_cap = self._compute_winsorize_cap_distributed(df)
         
-        # Step 4: Apply winsorization
-        logger.info("Step 4: Applying winsorization...")
+        # Step 5: Apply winsorization
+        logger.info("Step 5: Applying winsorization...")
         df = self._apply_winsorization(df, winsorize_cap)
         
-        # Step 5: Create time index
-        logger.info("Step 5: Creating time indices...")
+        # Step 6: Create time index
+        logger.info("Step 6: Creating time indices...")
         df = self._create_time_index(df)
         
         # Checkpoint after expensive transformations
@@ -130,12 +136,12 @@ class DistributedPreprocessor:
             logger.info("Checkpointing after preprocessing...")
             df = df.checkpoint()
         
-        # Step 6: Distributed aggregation (the key step!)
-        logger.info("Step 6: Distributed aggregation...")
+        # Step 7: Distributed aggregation (the key step!)
+        logger.info("Step 7: Distributed aggregation...")
         agg_df = self._aggregate_distributed(df)
         
-        # Step 7: Repartition for optimal parallelism
-        logger.info("Step 7: Repartitioning by province...")
+        # Step 8: Repartition for optimal parallelism
+        logger.info("Step 8: Repartitioning by province...")
         agg_df = self._repartition_for_dp(agg_df)
         
         logger.info("Distributed preprocessing complete")
@@ -149,6 +155,33 @@ class DistributedPreprocessor:
             "left"
         ).drop("city_name")
     
+    def _compute_per_mcc_caps(self, df: DataFrame) -> DataFrame:
+        """
+        Compute winsorization cap per individual MCC.
+        
+        Each MCC is processed separately (parallel composition - each gets full privacy budget).
+        This is more granular than grouping MCCs, providing better utility.
+        """
+        logger.info("Computing per-MCC winsorization caps...")
+        logger.info(f"Percentile: {self.config.privacy.mcc_cap_percentile}")
+        
+        # Compute cap per MCC using Spark
+        mcc_caps = df.groupBy('mcc').agg(
+            F.expr(f'percentile_approx(amount, {self.config.privacy.mcc_cap_percentile / 100.0})').alias('cap')
+        ).collect()
+        
+        # Store in config
+        self._mcc_caps = {row['mcc']: float(row['cap']) for row in mcc_caps}
+        self.config.privacy.mcc_caps = self._mcc_caps
+        
+        logger.info(f"Computed caps for {len(self._mcc_caps)} individual MCCs")
+        if self._mcc_caps:
+            logger.info(f"Cap range: [{min(self._mcc_caps.values()):,.0f}, {max(self._mcc_caps.values()):,.0f}]")
+        else:
+            logger.warning("No MCC caps computed - empty or all-null MCC data")
+        
+        return df
+    
     def _apply_bounded_contribution(self, df: DataFrame) -> DataFrame:
         """
         Apply bounded contribution - clip transactions per card-cell using IQR.
@@ -161,11 +194,12 @@ class DistributedPreprocessor:
             method=self.config.privacy.contribution_bound_method,
             iqr_multiplier=self.config.privacy.contribution_bound_iqr_multiplier,
             fixed_k=self.config.privacy.contribution_bound_fixed,
-            percentile=self.config.privacy.contribution_bound_percentile
+            percentile=self.config.privacy.contribution_bound_percentile,
+            compute_per_group=self.config.privacy.contribution_bound_per_group
         )
         
         # Need day_idx for cell definition - compute temporarily
-        date_stats = df.agg(F.min('transaction_date').alias('min_date')).collect()[0]
+        date_stats = df.agg(F.min(F.col('transaction_date')).alias('min_date')).first()
         min_date = date_stats.min_date
         
         df = df.withColumn(
@@ -235,15 +269,22 @@ class DistributedPreprocessor:
         )
     
     def _create_time_index(self, df: DataFrame) -> DataFrame:
-        """Create day index from transaction date."""
+        """Create day index and weekday from transaction date."""
         # Get min date (single aggregation)
-        min_date = df.agg(F.min('transaction_date')).collect()[0][0]
+        min_date = df.agg(F.min(F.col('transaction_date'))).first()[0]
         
         # Create day index using datediff (pure Spark SQL)
         df = df.withColumn(
             'day_idx',
             F.datediff(F.col('transaction_date'), F.lit(min_date))
         )
+        
+        # Create weekday column (0=Monday, 6=Sunday)
+        # Spark's dayofweek returns 1=Sunday, 2=Monday, ..., 7=Saturday
+        # We convert to 0=Monday, 1=Tuesday, ..., 6=Sunday
+        # CRITICAL: Use F.pmod() not % operator - Spark's % follows Java semantics (can be negative)
+        # For Sunday: (1-2) % 7 = -1 (wrong), but F.pmod(1-2, 7) = 6 (correct)
+        df = df.withColumn('weekday', F.pmod(F.dayofweek(F.col('transaction_date')) - 2, 7))
         
         # Filter to configured range
         df = df.filter(
@@ -261,6 +302,10 @@ class DistributedPreprocessor:
         For 31 provinces × 500 cities × 100 MCCs × 30 days = 46.5M cells max
         (but most will be sparse/zero, so actual is much less)
         
+        CRITICAL: Computes BOTH capped and original amounts:
+        - total_amount (capped/winsorized): For DP noise calibration
+        - total_amount_original: For computing invariants that match public data
+        
         Output stays in Spark - no collect()!
         """
         agg_df = df.groupBy(
@@ -268,12 +313,14 @@ class DistributedPreprocessor:
             'province_name', 
             'acceptor_city',
             'mcc',
-            'day_idx'
+            'day_idx',
+            'weekday'
         ).agg(
             F.count('*').alias('transaction_count'),
-            F.countDistinct('card_number').alias('unique_cards'),
-            F.countDistinct('acceptor_id').alias('unique_acceptors'),
-            F.sum('amount_capped').alias('total_amount')
+            F.countDistinct(F.col('card_number')).alias('unique_cards'),
+            F.countDistinct(F.col('acceptor_id')).alias('unique_acceptors'),
+            F.sum(F.col('amount_capped')).alias('total_amount'),           # Capped (for DP sensitivity)
+            F.sum(F.col('amount')).alias('total_amount_original')          # Original (for invariants)
         )
         
         # Log stats without collecting
@@ -587,24 +634,37 @@ class CensusDASEngine(DistributedDPEngine):
         
         # Step 1: Compute MONTHLY invariants (EXACT - no noise)
         logger.info("\nStep 1: Computing monthly invariants (EXACT)...")
+        logger.info("  CRITICAL: Using ORIGINAL (unwinsorized) amounts for total_amount invariants")
         
         # National monthly (sum of all data)
+        # CRITICAL: For total_amount, use ORIGINAL amounts to match public data
         national_monthly = df.agg(
-            *[F.sum(q).alias(f'{q}_national_monthly') for q in queries]
-        ).collect()[0]
+            F.sum(F.col('transaction_count')).alias('transaction_count_national_monthly'),
+            F.sum(F.col('unique_cards')).alias('unique_cards_national_monthly'),
+            F.sum(F.col('unique_acceptors')).alias('unique_acceptors_national_monthly'),
+            F.sum(F.col('total_amount_original')).alias('total_amount_national_monthly')  # ORIGINAL, not winsorized
+        ).first()
         
-        logger.info("  National monthly invariants:")
+        logger.info("  National monthly invariants (from ORIGINAL amounts):")
         for q in queries:
             logger.info(f"    {q}: {national_monthly[f'{q}_national_monthly']}")
         
         # Province monthly (sum per province, all days)
+        # CRITICAL: For total_amount, use ORIGINAL amounts to match public data
         province_monthly_df = df.groupBy('province_code', 'province_name').agg(
-            *[F.sum(q).alias(f'{q}_province_monthly') for q in queries]
+            F.sum(F.col('transaction_count')).alias('transaction_count_province_monthly'),
+            F.sum(F.col('unique_cards')).alias('unique_cards_province_monthly'),
+            F.sum(F.col('unique_acceptors')).alias('unique_acceptors_province_monthly'),
+            F.sum(F.col('total_amount_original')).alias('total_amount_province_monthly')  # ORIGINAL, not winsorized
         )
         
         # Province daily (for consistency enforcement)
+        # CRITICAL: For total_amount, use ORIGINAL amounts
         province_daily_df = df.groupBy('province_code', 'province_name', 'day_idx').agg(
-            *[F.sum(q).alias(f'{q}_province_daily') for q in queries]
+            F.sum(F.col('transaction_count')).alias('transaction_count_province_daily'),
+            F.sum(F.col('unique_cards')).alias('unique_cards_province_daily'),
+            F.sum(F.col('unique_acceptors')).alias('unique_acceptors_province_daily'),
+            F.sum(F.col('total_amount_original')).alias('total_amount_province_daily')  # ORIGINAL, not winsorized
         )
         
         logger.info(f"  Province invariants computed for {province_monthly_df.count()} provinces")
@@ -636,10 +696,17 @@ class CensusDASEngine(DistributedDPEngine):
             df, province_monthly_df, national_monthly, queries
         )
         
+        # Cleanup: Drop temporary columns (total_amount_original, amount_capped)
+        logger.info("\nCleanup: Removing temporary fields...")
+        df = df.drop('total_amount_original', 'amount_capped')
+        logger.info("  Dropped: total_amount_original (used only for invariants)")
+        logger.info("  Dropped: amount_capped (used only for DP noise calibration)")
+        
         logger.info("\nHierarchical noise injection complete")
         logger.info("  ✓ Monthly national totals: EXACT (invariant)")
         logger.info("  ✓ Monthly province totals: EXACT (invariant)")
         logger.info("  ✓ Daily city values: NOISY (adjusted)")
+        logger.info("  ✓ Output contains only DP-protected values")
         
         return df
     
@@ -676,7 +743,7 @@ class CensusDASEngine(DistributedDPEngine):
                 
                 city_df = city_df.withColumn(
                     f'{query}_city_sum',
-                    F.sum(city_col).over(window)
+                    F.sum(F.col(city_col)).over(window)
                 )
                 
                 # Scale factor = province_total / city_sum
@@ -713,7 +780,7 @@ class CensusDASEngine(DistributedDPEngine):
                 
                 city_df = city_df.withColumn(
                     f'{query}_city_sum',
-                    F.sum(city_col).over(window)
+                    F.sum(F.col(city_col)).over(window)
                 )
                 
                 city_df = city_df.withColumn(
@@ -760,7 +827,7 @@ class CensusDASEngine(DistributedDPEngine):
             
             df = df.withColumn(
                 f'{query}_current_sum',
-                F.sum(protected_col).over(window)
+                F.sum(F.col(protected_col)).over(window)
             )
             
             # Scale to match monthly invariant
