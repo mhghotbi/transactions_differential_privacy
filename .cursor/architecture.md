@@ -17,31 +17,33 @@
          ▼
 ┌─────────────────┐
 │  Preprocessor   │
-│  (Aggregation)  │
+│  (Winsorize, K) │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
 │  Histogram      │
-│  (City×MCC×Day) │
+│  (Prov×City×MCC│
+│   ×Day×Weekday) │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│  Budget         │
-│  Allocation     │
+│  Context-Aware  │
+│  Bounds Calc    │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│  Top-Down       │
-│  DP Engine      │
+│  SDC Engine     │
+│  (Multiplicative│
+│   Jitter)       │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│  Post-Processing│
-│  (NNLS, Round)  │
+│  Ratio Preserve │
+│  (Invariants)   │
 └────────┬────────┘
          │
          ▼
@@ -59,122 +61,58 @@
 #### `config.py`
 - **Purpose**: Configuration management and validation
 - **Key Classes**: `Config`, `PrivacyConfig`, `DataConfig`, `SparkConfig`
-- **Responsibilities**:
-  - Load configuration from INI files
-  - Validate configuration parameters
-  - Provide type-safe access to settings
-
-#### `budget.py`
-- **Purpose**: Privacy budget allocation and composition
-- **Key Classes**: `Budget`, `BudgetAllocator`, `MonthlyBudgetManager`
-- **Responsibilities**:
-  - Allocate privacy budget across geographic levels and query types
-  - Track budget consumption
-  - Compute noise scale (σ) from budget allocation
-  - Handle sequential and parallel composition
-
-#### `primitives.py`
-- **Purpose**: Core DP mechanisms
-- **Key Classes**: `DiscreteGaussianMechanism`
-- **Responsibilities**:
-  - Implement discrete Gaussian noise mechanism
-  - Generate integer noise samples
-  - Maintain exact integer outputs
-
-#### `sensitivity.py`
-- **Purpose**: Sensitivity analysis for user-level DP
-- **Key Classes**: `GlobalSensitivityCalculator`, `UserLevelSensitivity`
-- **Responsibilities**:
-  - Compute global sensitivity accounting for multi-cell contributions
-  - Calculate D_max (max cells per card)
-  - Compute K bound (max transactions per card per cell)
-  - Handle stratified sensitivity by MCC groups
+- **SDC Settings**:
+  - `noise_level`: Relative noise level (default: 0.15 = 15%)
+  - `noise_seed`: Random seed for reproducibility
+  - `contribution_bound_method`: Method for computing K (transaction_weighted_percentile recommended)
+  - `mcc_cap_percentile`: Percentile for per-MCC winsorization (default: 99.0)
+  - `suppression_threshold`: Minimum count threshold for suppression
 
 #### `pipeline.py`
-- **Purpose**: Orchestrate entire DP workflow
+- **Purpose**: Orchestrate entire SDC workflow
 - **Key Classes**: `DPPipeline`, `PipelineResult`
 - **Responsibilities**:
-  - Coordinate data reading, processing, and writing
+  - Coordinate data reading, preprocessing, SDC application, and writing
   - Manage Spark session lifecycle
   - Handle errors and validation
   - Return execution results
+- **Note**: Class name is `DPPipeline` for historical reasons, but implements SDC
 
-#### `postprocessing.py`
-- **Purpose**: Post-processing to maintain consistency
-- **Key Classes**: `NNLSPostProcessor`
-- **Responsibilities**:
-  - Non-negative least squares optimization
-  - Maintain geographic consistency (city sums = province totals)
-  - Preserve privacy guarantees
+#### `bounded_contribution.py`
+- **Purpose**: Compute and apply bounded contribution (K)
+- **Key Classes**: `BoundedContributionCalculator`
+- **Methods**:
+  - `transaction_weighted_percentile`: Recommended - minimizes data loss
+  - `iqr`: Interquartile range method
+  - `percentile`: Simple percentile
+  - `fixed`: Fixed value
+- **Purpose**: Limits transactions per card per cell to prevent outliers
 
-#### `rounder.py`
-- **Purpose**: Controlled rounding to integers
-- **Key Classes**: `ControlledRounder`
-- **Responsibilities**:
-  - Round noisy values to integers
-  - Maintain exact totals
-
-#### `invariants.py`
-- **Purpose**: Maintain exact invariants
-- **Key Classes**: `InvariantManager`
-- **Responsibilities**:
-  - Enforce exact province and national totals
-  - Adjust city-level values to match province totals
-
-#### `suppression.py`
-- **Purpose**: Cell suppression for small counts
-- **Key Classes**: `SuppressionManager`
-- **Responsibilities**:
-  - Identify cells below suppression threshold
-  - Apply suppression (flag/null/value)
-  - Protect against reconstruction attacks
-
-#### `confidence.py`
-- **Purpose**: Confidence interval computation
-- **Key Classes**: `ConfidenceIntervalCalculator`
-- **Responsibilities**:
-  - Compute margins of error from noise variance
-  - Generate confidence intervals at specified levels
-  - Account for post-processing effects
-
-### Engine (`engine/`)
-
-#### `topdown.py`
-- **Purpose**: Top-down DP algorithm implementation
-- **Key Classes**: `TopDownEngine`
-- **Responsibilities**:
-  - Apply noise hierarchically (province → city)
-  - Coordinate with budget allocator
-  - Manage user-level DP parameters
-  - Handle stratified sensitivity
-
-### Reader (`reader/`)
-
-#### `spark_reader.py`
-- **Purpose**: Data reading with Spark
-- **Key Classes**: `SparkReader`
-- **Responsibilities**:
-  - Read Parquet files efficiently
-  - Handle schema validation
-  - Support partitioned data
-
-#### `preprocessor.py` / `preprocessor_distributed.py`
+#### `reader/preprocessor.py`
 - **Purpose**: Data preprocessing and aggregation
-- **Key Classes**: `Preprocessor`, `DistributedPreprocessor`
+- **Key Classes**: `Preprocessor`
 - **Responsibilities**:
-  - Aggregate transactions to histogram cells
-  - Compute user-level statistics (D_max, K)
-  - Handle data quality issues
+  - Winsorize transaction amounts (per-MCC caps)
+  - Apply bounded contribution (K)
+  - Aggregate to histogram cells: (province, city, mcc, day, weekday)
+  - Compute indices and metadata
 
-### Writer (`writer/`)
+#### `engine/topdown_spark.py` (or similar)
+- **Purpose**: SDC engine implementation
+- **Key Classes**: `TopDownSparkEngine` (or similar)
+- **Responsibilities**:
+  - Compute context-aware plausibility bounds per (MCC, City, Weekday)
+  - Apply multiplicative jitter: `M(c) = c × (1 + η)`
+  - Preserve province invariants (exact totals)
+  - Maintain ratio preservation (avg_amount, tx_per_card)
 
-#### `parquet_writer.py`
+#### `writer/parquet_writer.py`
 - **Purpose**: Write protected output
 - **Key Classes**: `ParquetWriter`
 - **Responsibilities**:
-  - Write partitioned Parquet files
-  - Include confidence intervals
-  - Apply suppression flags
+  - Write partitioned Parquet files (by province)
+  - Include suppression flags
+  - Apply output formatting
 
 ### Schema (`schema/`)
 
@@ -184,6 +122,7 @@
 - **Responsibilities**:
   - Manage province-city relationships
   - Validate geographic consistency
+  - Support invariant enforcement
 
 #### `histogram.py`
 - **Purpose**: Multi-dimensional histogram structure
@@ -191,6 +130,7 @@
 - **Responsibilities**:
   - Represent aggregated data structure
   - Support hierarchical queries
+  - Maintain cell-level statistics
 
 ## Data Flow
 
@@ -208,60 +148,67 @@
 ### Processing Steps
 
 1. **Read**: Load transactions from Parquet files
-2. **Preprocess**: Aggregate to `(city, mcc, day)` cells
-3. **Analyze**: Compute D_max, K, and sensitivity parameters
-4. **Allocate**: Split privacy budget across levels/queries
-5. **Noise**: Apply discrete Gaussian noise hierarchically
-6. **Post-process**: NNLS optimization for consistency
-7. **Round**: Controlled rounding to integers
-8. **Suppress**: Hide small cells
-9. **CI**: Compute confidence intervals
-10. **Write**: Output protected statistics
+2. **Preprocess**:
+   - Winsorize amounts per MCC (99th percentile caps)
+   - Apply bounded contribution (K) per card per cell
+   - Compute weekday indices
+3. **Aggregate**: Create histogram cells `(province, city, mcc, day, weekday)`
+4. **Compute Bounds**: Calculate plausibility bounds per (MCC, City, Weekday) context
+5. **Apply SDC**: Multiplicative jitter with context-aware clamping
+6. **Preserve Invariants**: Ensure province totals remain exact
+7. **Preserve Ratios**: Maintain plausible avg_amount and tx_per_card
+8. **Suppress**: Hide small cells below threshold
+9. **Write**: Output protected statistics
 
 ### Output Schema
 ```
+- province_code: Province code
 - province_name: Province name
 - acceptor_city: City name
 - mcc: Merchant Category Code
 - day_idx: Day index (0-29)
+- weekday: Weekday (0=Monday, 6=Sunday)
 - transaction_count: Protected count
-- transaction_count_moe_90: 90% Margin of Error
-- transaction_count_ci_lower_90: CI lower bound
-- transaction_count_ci_upper_90: CI upper bound
 - unique_cards: Protected unique card count
-- unique_acceptors: Protected unique acceptor count
 - total_amount: Protected total amount
+- avg_amount: Average transaction amount
+- tx_per_card: Transactions per card
 - is_suppressed: Suppression flag
 ```
 
-## Privacy Architecture
+## SDC Architecture
 
-### Privacy Framework: zCDP (zero-Concentrated DP)
-- **Privacy Unit**: Card (user-level DP)
-- **Mechanism**: Discrete Gaussian
-- **Composition**: Sequential (across days) and parallel (across queries)
-
-### Budget Allocation
+### Noise Mechanism: Multiplicative Jitter
 ```
-Total ρ = 0.25 per month
-├── Geographic Split
-│   ├── Province: 20%
-│   └── City: 80%
-└── Query Split (per geographic level)
-    ├── transaction_count: 34%
-    ├── unique_cards: 33%
-    └── total_amount: 33%
+M(c) = c × (1 + η),    where η ~ N(0, σ²)
+σ = noise_level × c    (relative noise, e.g., 15%)
 ```
 
-### Sensitivity Analysis
-- **Global Sensitivity**: √(D_max × K)
-  - D_max: Maximum distinct cells per card
-  - K: Maximum transactions per card per cell (bounded contribution)
-- **Stratified Sensitivity**: Different sensitivity by MCC group
+### Context-Aware Bounds
+- **Stratum**: (MCC, City, Weekday)
+- **Computation**: Data-driven from historical patterns
+- **Purpose**: Ensure noise produces plausible values
+- **Example**: Small city + Restaurant MCC + Weekday → different bounds than Large city + Gas MCC + Weekend
+
+### Province Invariants
+- **Province Totals**: Exact (no noise applied)
+- **Enforcement**: City-level values adjusted to sum to province totals
+- **Rationale**: Province totals are public data (known from other sources)
+
+### Ratio Preservation
+- **avg_amount**: `total_amount / transaction_count` stays within plausible range
+- **tx_per_card**: `transaction_count / unique_cards` stays within plausible range
+- **Method**: Adjust derived statistics after noise application
+
+### Bounded Contribution (K)
+- **Purpose**: Prevent outliers from dominating statistics
+- **Method**: Transaction-weighted percentile (recommended)
+- **Impact**: Limits each card to K transactions per cell
+- **Benefit**: Improves utility by reducing outlier influence
 
 ## Technology Stack
 
-- **Language**: Python 3.11+
+- **Language**: Python 3.8+
 - **Distributed Computing**: Apache Spark 3.5+
 - **Scientific Computing**: NumPy, SciPy
 - **Data Format**: Parquet (columnar storage)
@@ -271,7 +218,7 @@ Total ρ = 0.25 per month
 
 - **Horizontal Scaling**: Spark cluster with multiple executors
 - **Partitioning**: Data partitioned by province for parallel processing
-- **Broadcast Variables**: Small lookup tables (city-province mapping)
+- **Broadcast Variables**: Small lookup tables (city-province mapping, MCC caps)
 - **Memory Management**: Configurable Spark memory settings
 - **Shuffle Optimization**: Appropriate partition count for joins
 
@@ -281,4 +228,12 @@ Total ρ = 0.25 per month
 - **Logging**: Structured logging at appropriate levels
 - **Graceful Degradation**: Continue processing when possible
 - **Result Tracking**: Return detailed results with errors
+
+## Secure Enclave Context
+
+- **Primary Protection**: Physical isolation in secure enclave
+- **Secondary Protection**: SDC plausibility-based noise
+- **Deployment**: All processing occurs within secure enclave
+- **Data Access**: No raw data leaves secure enclave
+- **Output**: Only protected statistics are released
 
