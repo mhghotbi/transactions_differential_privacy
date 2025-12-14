@@ -69,7 +69,8 @@ class SparkHistogram:
         df: DataFrame,
         dimensions: Dict[str, HistogramDimension],
         city_codes: Optional[List[int]] = None,
-        min_date: Optional[date] = None
+        min_date: Optional[date] = None,
+        province_invariants: Optional[DataFrame] = None
     ):
         """
         Initialize Spark-native histogram.
@@ -80,12 +81,16 @@ class SparkHistogram:
             dimensions: Dimension metadata (province, city, mcc, day)
             city_codes: Optional mapping from city_idx to city_code
             min_date: Minimum transaction date (used to reconstruct transaction_date from day_idx)
+            province_invariants: Optional DataFrame with TRUE province invariants from original raw data.
+                               Columns: province_idx, invariant_count, invariant_amount
+                               CRITICAL: These must be computed BEFORE bounded contribution.
         """
         self._spark = spark
         self._df = df
         self.dimensions = dimensions
         self.city_codes = city_codes or []
         self.min_date = min_date
+        self.province_invariants = province_invariants  # TRUE province totals from original data
         
         # Compute shape from dimensions (metadata only)
         self.shape = (
@@ -132,17 +137,17 @@ class SparkHistogram:
             New SparkHistogram with filtered data
         """
         filtered_df = self._df.filter(F.col('mcc_idx').isin(mcc_indices))
-        return SparkHistogram(self._spark, filtered_df, self.dimensions, self.city_codes, self.min_date)
+        return SparkHistogram(self._spark, filtered_df, self.dimensions, self.city_codes, self.min_date, self.province_invariants)
     
     def filter_province(self, province_idx: int) -> 'SparkHistogram':
         """Filter to specific province (LAZY)."""
         filtered_df = self._df.filter(F.col('province_idx') == province_idx)
-        return SparkHistogram(self._spark, filtered_df, self.dimensions, self.city_codes, self.min_date)
+        return SparkHistogram(self._spark, filtered_df, self.dimensions, self.city_codes, self.min_date, self.province_invariants)
     
     def with_column(self, col_name: str, col_expr) -> 'SparkHistogram':
         """Add or replace a column (LAZY)."""
         new_df = self._df.withColumn(col_name, col_expr)
-        return SparkHistogram(self._spark, new_df, self.dimensions, self.city_codes, self.min_date)
+        return SparkHistogram(self._spark, new_df, self.dimensions, self.city_codes, self.min_date, self.province_invariants)
     
     def select(self, *cols) -> DataFrame:
         """Select columns (returns DataFrame for final operations)."""
@@ -167,7 +172,7 @@ class SparkHistogram:
     def drop_column(self, col_name: str) -> 'SparkHistogram':
         """Drop a column (e.g., total_amount_original after DP)."""
         new_df = self._df.drop(col_name)
-        return SparkHistogram(self._spark, new_df, self.dimensions, self.city_codes, self.min_date)
+        return SparkHistogram(self._spark, new_df, self.dimensions, self.city_codes, self.min_date, self.province_invariants)
     
     def count_cells(self) -> int:
         """
@@ -318,7 +323,7 @@ class SparkHistogram:
             'day': HistogramDimension('day', n_day, [str(i) for i in range(n_day)])
         }
         
-        return cls(spark, df, dimensions, city_codes, min_date)
+        return cls(spark, df, dimensions, city_codes, min_date, province_invariants=None)
 
 
 def create_empty_histogram(
@@ -353,5 +358,5 @@ def create_empty_histogram(
         'day': HistogramDimension('day', day_dim, [str(i) for i in range(day_dim)])
     }
     
-    return SparkHistogram(spark, empty_df, dimensions, min_date=None)
+    return SparkHistogram(spark, empty_df, dimensions, city_codes=None, min_date=None, province_invariants=None)
 

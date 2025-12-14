@@ -103,17 +103,22 @@ class TopDownSparkEngine:
         """
         Apply context-aware plausibility-based noise.
         
+        CRITICAL: Province-level totals for transaction_count and transaction_amount_sum
+        are maintained EXACTLY (0% error) as they are publicly published data.
+        Only MCC and daily breakdowns (which are NOT published) receive noise.
+        
         Algorithm:
-        1. Compute province invariants (count is exact)
+        1. Compute province invariants (count and amount are EXACT - no noise)
         2. Compute plausibility bounds per (MCC, City, Weekday) context
         3. Store original ratios per cell
         4. Apply independent multiplicative jitter to all three values (count, cards, amount)
         5. Clamp all values to plausibility bounds and validate/adjust ratios
-        6. Scale all three values to match province invariants
+        6. Scale all three values to match province invariants exactly (0% error)
         7. Re-validate ratios after scaling and adjust if needed
         8. Finalize values and ensure consistency
-        9. Controlled rounding
-        10. Final validation
+        9. Controlled rounding (maintains province invariants exactly)
+        10. Final validation (verifies 0% error in province totals)
+        11. Post-drop verification (ensures invariants remain exact after weekday removal)
         """
         logger.info("=" * 70)
         logger.info("CONTEXT-AWARE PLAUSIBILITY-BASED NOISE")
@@ -154,11 +159,26 @@ class TopDownSparkEngine:
         logger.info("PHASE 1: Computing Province Invariants")
         logger.info("=" * 70)
         
-        self._invariants = df.groupBy('province_idx').agg(
-            F.sum('transaction_count').alias('invariant_count'),
-            F.sum(self._amount_col).alias('invariant_amount'),  # Use original if available
-            F.sum('unique_cards').alias('original_cards_sum')
-        ).cache()
+        # Use TRUE province invariants if provided, otherwise compute from histogram
+        # CRITICAL: True invariants are computed from original raw data BEFORE bounded contribution
+        if histogram.province_invariants is not None:
+            logger.info("  Using TRUE province invariants from original raw data (before preprocessing)")
+            # Add original_cards_sum from histogram (needed for scaling)
+            cards_sum = df.groupBy('province_idx').agg(
+                F.sum('unique_cards').alias('original_cards_sum')
+            )
+            # Join with true invariants
+            self._invariants = histogram.province_invariants.join(
+                cards_sum, 'province_idx', 'inner'
+            ).cache()
+        else:
+            logger.warning("  Province invariants not provided - computing from histogram (may be incorrect!)")
+            logger.warning("  This means invariants are computed AFTER bounded contribution, which drops transactions!")
+            self._invariants = df.groupBy('province_idx').agg(
+                F.sum('transaction_count').alias('invariant_count'),
+                F.sum(self._amount_col).alias('invariant_amount'),  # Use original if available
+                F.sum('unique_cards').alias('original_cards_sum')
+            ).cache()
         
         inv_summary = self._invariants.agg(
             F.sum('invariant_count').alias('total_count'),
@@ -696,6 +716,11 @@ class TopDownSparkEngine:
         
         logger.info("  ✓ Controlled rounding complete")
         
+        # Enforce amount invariants exactly (like count invariants)
+        df_rounded = self._enforce_amount_invariants_exact(df_rounded)
+        
+        logger.info("  ✓ Amount invariants enforced exactly")
+        
         # ========================================
         # PHASE 10: Final Validation
         # ========================================
@@ -717,14 +742,15 @@ class TopDownSparkEngine:
         
         # Drop weekday column before returning - it's a processing dimension, not a structural dimension
         # The histogram structure is 4D (province, city, mcc, day), not 5D
-        # Aggregate by (province, city, mcc, day) in case there are any duplicates after dropping weekday
-        df_final = df_rounded.groupBy(
-            'province_idx', 'city_idx', 'mcc_idx', 'day_idx'
-        ).agg(
-            F.sum('transaction_count').cast('long').alias('transaction_count'),
-            F.sum('unique_cards').cast('long').alias('unique_cards'),
-            F.sum('total_amount').cast('long').alias('total_amount')
-        )
+        # Each (province, city, mcc, day) has exactly one weekday, so no aggregation needed
+        # Simply dropping weekday preserves province invariants exactly
+        df_final = df_rounded.drop('weekday')
+        
+        # Verify province invariants are still exact after dropping weekday
+        logger.info("\n" + "=" * 70)
+        logger.info("Post-Drop Invariant Verification")
+        logger.info("=" * 70)
+        self._verify_province_invariants_exact(df_final)
         
         return SparkHistogram(self.spark, df_final, histogram.dimensions, histogram.city_codes, histogram.min_date)
     
@@ -1038,6 +1064,165 @@ class TopDownSparkEngine:
         
         return df_rounded
     
+    def _enforce_amount_invariants_exact(self, df: DataFrame) -> DataFrame:
+        """
+        Enforce province amount invariants to be exact (0% error) using controlled rounding.
+        
+        After controlled rounding, amounts may not match province invariants exactly.
+        This method uses controlled rounding per province to distribute the difference
+        across cells, ensuring the sum matches exactly (similar to count invariants).
+        
+        Args:
+            df: DataFrame after controlled rounding (amounts are already integers)
+            
+        Returns:
+            DataFrame with amounts adjusted to match province invariants exactly
+        """
+        # Prepare for rounding - need province_idx, amounts, and invariant
+        df_for_rounding = df.select(
+            'province_idx', 'city_idx', 'mcc_idx', 'day_idx', 'weekday',
+            'transaction_count', 'unique_cards', 'total_amount'
+        )
+        
+        # Join with invariants to get target amounts
+        df_with_invariants = df_for_rounding.join(
+            F.broadcast(self._invariants.select('province_idx', 'invariant_amount')),
+            'province_idx',
+            'left'
+        )
+        
+        output_schema = StructType([
+            StructField('province_idx', IntegerType(), False),
+            StructField('city_idx', IntegerType(), False),
+            StructField('mcc_idx', IntegerType(), False),
+            StructField('day_idx', IntegerType(), False),
+            StructField('weekday', IntegerType(), False),
+            StructField('transaction_count', LongType(), False),
+            StructField('unique_cards', LongType(), False),
+            StructField('total_amount', LongType(), False)
+        ])
+        
+        def adjust_province_amounts(pdf):
+            """
+            Adjust amounts for one province to match invariant exactly.
+            
+            Uses controlled rounding: compute difference and distribute across cells.
+            """
+            import pandas as pd
+            import numpy as np
+            
+            if len(pdf) == 0:
+                return pd.DataFrame(columns=[
+                    'province_idx', 'city_idx', 'mcc_idx', 'day_idx', 'weekday',
+                    'transaction_count', 'unique_cards', 'total_amount'
+                ])
+            
+            target_amount = int(pdf['invariant_amount'].iloc[0])
+            current_amounts = pdf['total_amount'].values.copy().astype(np.int64)
+            current_sum = current_amounts.sum()
+            diff = target_amount - current_sum
+            
+            # If already exact, return as-is
+            if diff == 0:
+                return pdf[[
+                    'province_idx', 'city_idx', 'mcc_idx', 'day_idx', 'weekday',
+                    'transaction_count', 'unique_cards', 'total_amount'
+                ]].copy()
+            
+            # For controlled rounding, we need to distribute the difference
+            # Use a priority based on current amount (higher amounts get priority for increases,
+            # lower amounts get priority for decreases, but we want to minimize changes)
+            
+            if diff > 0:
+                # Need to add diff units total
+                # Strategy: add 1 to cells with highest amounts (preserves relative distribution)
+                # But we want to be fair, so use a random-like priority based on amount
+                # Actually, let's use a deterministic approach: prioritize cells with higher amounts
+                # but use fractional part of amount/transaction_count as tiebreaker
+                
+                # Compute priority: use amount itself as primary, count as secondary
+                # This ensures we adjust cells proportionally
+                priority = current_amounts.astype(np.float64)
+                # Add small random-like component based on cell index for tiebreaking
+                priority = priority + (np.arange(len(priority)) * 0.0001)
+                
+                # Sort by priority (descending) and add 1 to top diff cells
+                sorted_indices = np.argsort(-priority)
+                for i in range(min(diff, len(sorted_indices))):
+                    idx = sorted_indices[i]
+                    current_amounts[idx] += 1
+                    
+            elif diff < 0:
+                # Need to subtract abs(diff) units total
+                # Strategy: subtract 1 from cells with lowest amounts (but keep >= 0)
+                n_down = int(-diff)
+                
+                # Only consider cells with amount > 0
+                nonzero_mask = current_amounts > 0
+                if nonzero_mask.sum() > 0:
+                    nonzero_indices = np.where(nonzero_mask)[0]
+                    # Sort by amount (ascending) - subtract from smallest first
+                    priority = current_amounts[nonzero_indices].astype(np.float64)
+                    # Add small component for tiebreaking
+                    priority = priority - (np.arange(len(nonzero_indices)) * 0.0001)
+                    sorted_nz = nonzero_indices[np.argsort(priority)]
+                    
+                    adjusted = 0
+                    for idx in sorted_nz:
+                        if adjusted >= n_down:
+                            break
+                        if current_amounts[idx] > 0:
+                            current_amounts[idx] -= 1
+                            adjusted += 1
+                    
+                    # If we still need to adjust more, continue with remaining cells
+                    if adjusted < n_down:
+                        for idx in sorted_nz:
+                            if adjusted >= n_down:
+                                break
+                            if current_amounts[idx] > 0:
+                                current_amounts[idx] -= 1
+                                adjusted += 1
+            
+            # Ensure non-negativity
+            current_amounts = np.maximum(0, current_amounts)
+            
+            # Ensure consistency: if count=0, amount must be 0
+            counts = pdf['transaction_count'].values
+            zero_count_mask = counts == 0
+            current_amounts[zero_count_mask] = 0
+            
+            # Verify sum matches (should be exact now)
+            final_sum = current_amounts.sum()
+            if final_sum != target_amount:
+                # This should not happen, but if it does, force exact match on one cell
+                # (last resort - should be rare)
+                if final_sum < target_amount:
+                    # Add difference to largest cell
+                    max_idx = np.argmax(current_amounts)
+                    current_amounts[max_idx] += (target_amount - final_sum)
+                elif final_sum > target_amount:
+                    # Subtract difference from largest cell (but keep >= 0)
+                    max_idx = np.argmax(current_amounts)
+                    current_amounts[max_idx] = max(0, current_amounts[max_idx] - (final_sum - target_amount))
+            
+            return pd.DataFrame({
+                'province_idx': pdf['province_idx'].values.astype(np.int32),
+                'city_idx': pdf['city_idx'].values.astype(np.int32),
+                'mcc_idx': pdf['mcc_idx'].values.astype(np.int32),
+                'day_idx': pdf['day_idx'].values.astype(np.int32),
+                'weekday': pdf['weekday'].values.astype(np.int32),
+                'transaction_count': pdf['transaction_count'].values,
+                'unique_cards': pdf['unique_cards'].values,
+                'total_amount': current_amounts
+            })
+        
+        df_adjusted = df_with_invariants.groupBy('province_idx').applyInPandas(
+            adjust_province_amounts, schema=output_schema
+        )
+        
+        return df_adjusted
+    
     def _final_validation(self, df_rounded: DataFrame) -> None:
         """Perform final validation and log statistics."""
         
@@ -1060,17 +1245,47 @@ class TopDownSparkEngine:
         
         if count_mismatches > 0:
             logger.error(f"  ✗ COUNT invariant violated in {count_mismatches} provinces!")
+            # Show details
+            count_error_details = comparison.filter(F.col('count_diff') != 0).select(
+                'province_idx', 'invariant_count', 'actual_count', 'count_diff'
+            ).collect()
+            for row in count_error_details[:5]:  # Show first 5
+                logger.error(f"    Province {row['province_idx']}: "
+                            f"Expected={row['invariant_count']}, "
+                            f"Actual={row['actual_count']}, "
+                            f"Error={row['count_diff']}")
+            raise RuntimeError(
+                f"COUNT invariant violated in {count_mismatches} provinces! "
+                f"Province totals must be EXACT (0% error) as they are publicly published."
+            )
         else:
             logger.info("  ✓ COUNT invariant exact in all provinces")
         
-        # Amount error stats
-        amount_stats = comparison.agg(
-            F.max('amount_error_pct').alias('max_error'),
-            F.mean('amount_error_pct').alias('mean_error')
-        ).first()
+        # Check AMOUNT invariant (must be exact like count)
+        comparison = comparison.withColumn(
+            'amount_diff',
+            F.col('actual_amount') - F.col('invariant_amount')
+        )
         
-        if amount_stats and amount_stats['max_error'] is not None:
-            logger.info(f"  Amount error: max={amount_stats['max_error']:.2f}%, mean={amount_stats['mean_error']:.2f}%")
+        amount_mismatches = comparison.filter(F.col('amount_diff') != 0).count()
+        
+        if amount_mismatches > 0:
+            logger.error(f"  ✗ AMOUNT invariant violated in {amount_mismatches} provinces!")
+            # Show details
+            amount_error_details = comparison.filter(F.col('amount_diff') != 0).select(
+                'province_idx', 'invariant_amount', 'actual_amount', 'amount_diff'
+            ).collect()
+            for row in amount_error_details[:5]:  # Show first 5
+                logger.error(f"    Province {row['province_idx']}: "
+                            f"Expected={row['invariant_amount']}, "
+                            f"Actual={row['actual_amount']}, "
+                            f"Error={row['amount_diff']}")
+            raise RuntimeError(
+                f"AMOUNT invariant violated in {amount_mismatches} provinces! "
+                f"Province totals must be EXACT (0% error) as they are publicly published."
+            )
+        else:
+            logger.info("  ✓ AMOUNT invariant exact in all provinces")
         
         # Check consistency
         inconsistent = df_rounded.filter(
@@ -1155,3 +1370,59 @@ class TopDownSparkEngine:
                 logger.info(f"  Mean TX per card: {ratio_stats['mean_tx_per_card']:.2f}")
             if ratio_stats['mean_avg_amount'] is not None:
                 logger.info(f"  Mean avg amount: {ratio_stats['mean_avg_amount']:,.2f}")
+    
+    def _verify_province_invariants_exact(self, df: DataFrame) -> None:
+        """
+        Verify province invariants are EXACT (0% error).
+        
+        CRITICAL: Province-level totals for transaction_count and transaction_amount_sum
+        must be EXACTLY equal to the original province totals (0% error) because
+        they are publicly published data.
+        
+        Args:
+            df: DataFrame to verify (should have transaction_count and total_amount columns)
+            
+        Raises:
+            RuntimeError: If any province invariant is violated (non-zero error)
+        """
+        # Compute actual province totals
+        actual = df.groupBy('province_idx').agg(
+            F.sum('transaction_count').alias('actual_count'),
+            F.sum('total_amount').alias('actual_amount')
+        )
+        
+        # Join with expected invariants
+        comparison = self._invariants.join(actual, 'province_idx', 'inner')
+        comparison = comparison.withColumn(
+            'count_error', F.col('actual_count') - F.col('invariant_count')
+        ).withColumn(
+            'amount_error', F.col('actual_amount') - F.col('invariant_amount')
+        )
+        
+        # Check for any errors
+        errors = comparison.filter(
+            (F.col('count_error') != 0) | (F.col('amount_error') != 0)
+        )
+        
+        error_count = errors.count()
+        if error_count > 0:
+            logger.error(f"  ✗ Province invariants violated in {error_count} provinces!")
+            
+            # Show details
+            error_details = errors.select(
+                'province_idx', 'invariant_count', 'actual_count', 'count_error',
+                'invariant_amount', 'actual_amount', 'amount_error'
+            ).collect()
+            
+            for row in error_details[:5]:  # Show first 5
+                logger.error(f"    Province {row['province_idx']}: "
+                            f"Count error={row['count_error']}, "
+                            f"Amount error={row['amount_error']}")
+            
+            raise RuntimeError(
+                f"Province invariants violated in {error_count} provinces. "
+                f"Expected 0% error, but found differences. "
+                f"Province totals must be EXACT (0% error) as they are publicly published."
+            )
+        else:
+            logger.info("  ✓ Province invariants EXACT (0% error) - verification passed")

@@ -61,6 +61,7 @@ class TransactionPreprocessor:
         self._min_date: Optional[date] = None
         self._mcc_caps = None  # Dict[str, float]: mcc_code -> cap
         self._d_max: Optional[int] = None  # Max cells per card (for bounded contribution analysis)
+        self._province_invariants_df: Optional[DataFrame] = None  # TRUE province invariants from original data
     
     def process(self, df: DataFrame) -> TransactionHistogram:
         """
@@ -73,6 +74,11 @@ class TransactionPreprocessor:
             TransactionHistogram with aggregated data
         """
         logger.info("Starting preprocessing...")
+        
+        # Step 0A: Compute TRUE province invariants from ORIGINAL raw data
+        # CRITICAL: Must be done BEFORE bounded contribution drops transactions
+        province_invariants = self._compute_province_invariants(df)
+        self._province_invariants_df = province_invariants['province_df']
         
         # Step 0: Compute per-MCC winsorization caps
         # Each MCC is processed separately (parallel composition)
@@ -94,6 +100,46 @@ class TransactionPreprocessor:
         logger.info(histogram.summary())
         
         return histogram
+    
+    def _compute_province_invariants(self, df: DataFrame) -> Dict[str, any]:
+        """
+        Compute TRUE province invariants from original raw data.
+        
+        CRITICAL: Must be called BEFORE bounded contribution or any modifications.
+        These are the publicly published province totals that must be preserved exactly.
+        
+        Args:
+            df: Raw transaction DataFrame (before any preprocessing)
+            
+        Returns:
+            Dict with province_invariants DataFrame and summary stats
+        """
+        logger.info("Computing TRUE province invariants from original raw data...")
+        
+        # Group by province_code and compute totals from ORIGINAL data
+        # Note: province_code is already added by the reader before preprocessing
+        invariants_df = df.groupBy('province_code').agg(
+            F.count('*').cast('long').alias('invariant_count'),
+            F.sum('amount').cast('long').alias('invariant_amount')
+        )
+        
+        # Also compute national total for logging
+        totals = df.agg(
+            F.count('*').cast('long').alias('total_count'),
+            F.sum('amount').cast('long').alias('total_amount')
+        ).first()
+        
+        total_count = totals['total_count'] if totals else 0
+        total_amount = totals['total_amount'] if totals else 0
+        
+        logger.info(f"  True total count: {total_count:,}")
+        logger.info(f"  True total amount: {total_amount:,}")
+        
+        return {
+            'province_df': invariants_df,
+            'total_count': total_count,
+            'total_amount': total_amount
+        }
     
     def _compute_per_mcc_caps(self, df: DataFrame) -> DataFrame:
         """
@@ -449,6 +495,22 @@ class TransactionPreprocessor:
             'day': HistogramDimension('day', num_days, [str(i) for i in range(num_days)])
         }
         
+        # Prepare province invariants DataFrame (convert province_code to province_idx)
+        province_invariants_df = None
+        if self._province_invariants_df is not None:
+            # Convert province_code to province_idx (province_code IS the province_idx)
+            # The invariants were computed with province_code, which is the same as province_idx
+            province_invariants_df = self._province_invariants_df.withColumnRenamed(
+                'province_code', 'province_idx'
+            ).select(
+                'province_idx',
+                'invariant_count',
+                'invariant_amount'
+            )
+            logger.info("  Passing TRUE province invariants to histogram (from original raw data)")
+        else:
+            logger.warning("  No province invariants computed - histogram will compute from aggregated data (may be incorrect!)")
+        
         # Create SparkHistogram (data stays in Spark, NO collection to driver)
         logger.info("Creating SparkHistogram (100% Spark, data remains distributed)")
         histogram = SparkHistogram(
@@ -456,7 +518,8 @@ class TransactionPreprocessor:
             df=agg_df,
             dimensions=dimensions,
             city_codes=city_codes,
-            min_date=self._min_date
+            min_date=self._min_date,
+            province_invariants=province_invariants_df
         )
         
         return histogram
