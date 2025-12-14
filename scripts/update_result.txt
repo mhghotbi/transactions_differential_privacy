@@ -1,0 +1,9 @@
+﻿python : Python was not found but can be installed from the Microsoft Store: 
+ms-windows-store://pdp/?productid=9NJ46SX7X90P
+At line:1 char:1
++ python update_notebook.py 2>&1 | Out-File -Encoding utf8 update_resul ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Python was not ...id=9NJ46SX7X90P 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
