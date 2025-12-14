@@ -455,7 +455,8 @@ class TransactionPreprocessor:
             spark=self.spark,
             df=agg_df,
             dimensions=dimensions,
-            city_codes=city_codes
+            city_codes=city_codes,
+            min_date=self._min_date
         )
         
         return histogram

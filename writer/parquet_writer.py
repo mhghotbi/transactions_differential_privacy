@@ -248,7 +248,14 @@ class ParquetWriter:
         if transaction_date_col:
             df_comparison = df_comparison.withColumnRenamed('transaction_date_temp', 'transaction_date')
         else:
-            df_comparison = df_comparison.withColumn('transaction_date', F.col('day_idx').cast('string'))
+            # Reconstruct transaction_date from day_idx using min_date from original histogram
+            if isinstance(original_histogram, SparkHistogram) and original_histogram.min_date:
+                min_date_lit = F.lit(original_histogram.min_date)
+                df_comparison = df_comparison.withColumn('transaction_date', F.date_format(F.date_add(min_date_lit, F.col('day_idx')), 'yyyy-MM-dd'))
+            else:
+                # Fallback: if min_date is not available, use day_idx as string (legacy behavior)
+                logger.warning("min_date not available, using day_idx as transaction_date (legacy fallback)")
+                df_comparison = df_comparison.withColumn('transaction_date', F.col('day_idx').cast('string'))
         
         # Reorder columns for clarity
         ordered_cols = join_cols + ['transaction_date']
@@ -319,8 +326,15 @@ class ParquetWriter:
         else:
             df = df.withColumn('mcc', F.col('mcc_idx').cast('string'))
         
-        # Add transaction_date (format day_idx as string for now)
-        df = df.withColumn('transaction_date', F.col('day_idx').cast('string'))
+        # Reconstruct transaction_date from day_idx using min_date
+        if histogram.min_date:
+            # Convert min_date to Spark date literal and add day_idx days
+            min_date_lit = F.lit(histogram.min_date)
+            df = df.withColumn('transaction_date', F.date_format(F.date_add(min_date_lit, F.col('day_idx')), 'yyyy-MM-dd'))
+        else:
+            # Fallback: if min_date is not available, use day_idx as string (legacy behavior)
+            logger.warning("min_date not available in histogram, using day_idx as transaction_date (legacy fallback)")
+            df = df.withColumn('transaction_date', F.col('day_idx').cast('string'))
         
         # Select final columns in output schema order
         df = df.select(

@@ -43,7 +43,7 @@ class SparkTransactionReader:
         StructField("amount", DoubleType(), False),
         StructField("transaction_date", DateType(), False),
         StructField("card_number", StringType(), False),
-        StructField("acceptor_id", StringType(), False),
+        # StructField("acceptor_id", StringType(), False),
         StructField("acceptor_city", StringType(), False),
         StructField("mcc", StringType(), False),
     ])
@@ -176,7 +176,7 @@ class SparkTransactionReader:
         # Check required columns (internal names after column mapping)
         required_columns = [
             'amount', 'transaction_date',
-            'card_number', 'acceptor_id', 'acceptor_city', 'mcc'
+            'card_number', 'acceptor_city', 'mcc'#, 'acceptor_id'
         ]
         
         missing = set(required_columns) - set(df.columns)

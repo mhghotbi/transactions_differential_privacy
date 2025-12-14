@@ -129,6 +129,17 @@ class TopDownSparkEngine:
                 "Please ensure the preprocessor includes weekday in the groupBy aggregation."
             )
         
+        # CRITICAL: Check if total_amount_original is available (from preprocessor)
+        # SDC must work with real (original) amounts, not winsorized amounts
+        use_original = 'total_amount_original' in df.columns
+        
+        if use_original:
+            logger.info("  Using ORIGINAL (unwinsorized) amounts for invariants, bounds, ratios, and noise")
+            self._amount_col = 'total_amount_original'
+        else:
+            logger.warning("  total_amount_original not found, using winsorized total_amount (legacy behavior)")
+            self._amount_col = 'total_amount'
+        
         # OPTIMIZATION: Repartition by province ONCE to minimize shuffles
         num_provinces = df.select('province_idx').distinct().count()
         num_partitions = max(31, num_provinces * 2)
@@ -145,7 +156,7 @@ class TopDownSparkEngine:
         
         self._invariants = df.groupBy('province_idx').agg(
             F.sum('transaction_count').alias('invariant_count'),
-            F.sum('total_amount').alias('invariant_amount'),
+            F.sum(self._amount_col).alias('invariant_amount'),  # Use original if available
             F.sum('unique_cards').alias('original_cards_sum')
         ).cache()
         
@@ -166,7 +177,7 @@ class TopDownSparkEngine:
         logger.info("PHASE 2: Computing Data-Driven Plausibility Bounds")
         logger.info("=" * 70)
         
-        self._bounds_df = self._compute_plausibility_bounds(df)
+        self._bounds_df = self._compute_plausibility_bounds(df, self._amount_col)
         
         # ========================================
         # PHASE 3: Store Original Ratios Per Cell
@@ -178,7 +189,7 @@ class TopDownSparkEngine:
         df = df.withColumn(
             'original_avg_amount',
             F.when(F.col('transaction_count') > 0,
-                   F.col('total_amount') / F.col('transaction_count'))
+                   F.col(self._amount_col) / F.col('transaction_count'))  # Use original if available
              .otherwise(F.lit(0.0))
         ).withColumn(
             'original_tx_per_card',
@@ -275,6 +286,7 @@ class TopDownSparkEngine:
                    .drop('noise_factor_count_raw', 'noise_factor_cards_raw', 'noise_factor_amount_raw')
         
         # Apply noise to all three values independently
+        # CRITICAL: Apply noise to original amounts, not winsorized amounts
         df = df.withColumn(
             'noisy_count_raw',
             F.col('transaction_count').cast(DoubleType()) * F.col('noise_factor_count')
@@ -283,7 +295,7 @@ class TopDownSparkEngine:
             F.col('unique_cards').cast(DoubleType()) * F.col('noise_factor_cards')
         ).withColumn(
             'noisy_amount_raw',
-            F.col('total_amount').cast(DoubleType()) * F.col('noise_factor_amount')
+            F.col(self._amount_col).cast(DoubleType()) * F.col('noise_factor_amount')  # Use original if available
         )
         
         logger.info(f"  Noise level: ±{noise_level:.0%} (applied to all three values)")
@@ -714,11 +726,15 @@ class TopDownSparkEngine:
             F.sum('total_amount').cast('long').alias('total_amount')
         )
         
-        return SparkHistogram(self.spark, df_final, histogram.dimensions, histogram.city_codes)
+        return SparkHistogram(self.spark, df_final, histogram.dimensions, histogram.city_codes, histogram.min_date)
     
-    def _compute_plausibility_bounds(self, df: DataFrame) -> DataFrame:
+    def _compute_plausibility_bounds(self, df: DataFrame, amount_col: str = 'total_amount') -> DataFrame:
         """
         Compute plausibility bounds per (MCC, City, Weekday) context from data.
+        
+        Args:
+            df: DataFrame with histogram data
+            amount_col: Column name for amounts ('total_amount_original' for original, 'total_amount' for winsorized)
         
         Returns DataFrame with bounds columns for each context.
         """
@@ -728,12 +744,13 @@ class TopDownSparkEngine:
         logger.info(f"  Computing bounds per context (MCC, City, Weekday)")
         logger.info(f"  Lower percentile: p{int(lower_pct*100)}")
         logger.info(f"  Upper percentile: p{int(upper_pct*100)}")
+        logger.info(f"  Using {amount_col} for bounds computation")
         
         # Compute ratios for bounds calculation
         df_with_ratios = df.withColumn(
             'avg_amount',
             F.when(F.col('transaction_count') > 0,
-                   F.col('total_amount') / F.col('transaction_count'))
+                   F.col(amount_col) / F.col('transaction_count'))  # Use original if available
              .otherwise(F.lit(0.0))
         ).withColumn(
             'tx_per_card',
