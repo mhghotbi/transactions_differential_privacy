@@ -114,7 +114,7 @@ class TransactionPreprocessor:
         Returns:
             Dict with province_invariants DataFrame and summary stats
         """
-        logger.info("Computing TRUE province invariants from original raw data...")
+        # [VERBOSE] logger.info("Computing TRUE province invariants from original raw data...")
         
         # Group by province_code and compute totals from ORIGINAL data
         # Note: province_code is already added by the reader before preprocessing
@@ -123,17 +123,17 @@ class TransactionPreprocessor:
             F.sum('amount').cast('long').alias('invariant_amount')
         )
         
-        # Also compute national total for logging
-        totals = df.agg(
-            F.count('*').cast('long').alias('total_count'),
-            F.sum('amount').cast('long').alias('total_amount')
-        ).first()
-        
-        total_count = totals['total_count'] if totals else 0
-        total_amount = totals['total_amount'] if totals else 0
-        
-        logger.info(f"  True total count: {total_count:,}")
-        logger.info(f"  True total amount: {total_amount:,}")
+        # [VERBOSE] Also compute national total for logging
+        # totals = df.agg(
+        #     F.count('*').cast('long').alias('total_count'),
+        #     F.sum('amount').cast('long').alias('total_amount')
+        # ).first()
+        # 
+        # total_count = totals['total_count'] if totals else 0
+        # total_amount = totals['total_amount'] if totals else 0
+        # 
+        # logger.info(f"  True total count: {total_count:,}")
+        # logger.info(f"  True total amount: {total_amount:,}")
         
         return {
             'province_df': invariants_df,
@@ -149,7 +149,7 @@ class TransactionPreprocessor:
         This provides better utility than global winsorization across all MCCs.
         """
         logger.info("Computing per-MCC winsorization caps...")
-        logger.info(f"Percentile: {self.config.privacy.mcc_cap_percentile}")
+        # [VERBOSE] logger.info(f"Percentile: {self.config.privacy.mcc_cap_percentile}")
         
         # Compute cap per MCC using Spark
         mcc_caps = df.groupBy('mcc').agg(
@@ -160,9 +160,10 @@ class TransactionPreprocessor:
         self._mcc_caps = {row['mcc']: float(row['cap']) for row in mcc_caps}
         self.config.privacy.mcc_caps = self._mcc_caps
         
-        logger.info(f"Computed caps for {len(self._mcc_caps)} individual MCCs")
+        # [VERBOSE] logger.info(f"Computed caps for {len(self._mcc_caps)} individual MCCs")
         if self._mcc_caps:
-            logger.info(f"Cap range: [{min(self._mcc_caps.values()):,.0f}, {max(self._mcc_caps.values()):,.0f}]")
+            # [VERBOSE] logger.info(f"Cap range: [{min(self._mcc_caps.values()):,.0f}, {max(self._mcc_caps.values()):,.0f}]")
+            pass
         else:
             logger.warning("No MCC caps computed - empty or all-null MCC data")
         
@@ -176,7 +177,8 @@ class TransactionPreprocessor:
         Also computes D_max (max cells per card) for user-level sensitivity.
         """
         from core.bounded_contribution import BoundedContributionCalculator
-        from core.sensitivity import GlobalSensitivityCalculator
+        # [DP] GlobalSensitivityCalculator was only used for D_max computation, which is not used in SDC approach
+        # from core.sensitivity import GlobalSensitivityCalculator
         
         logger.info("Applying bounded contribution...")
         
@@ -220,32 +222,39 @@ class TransactionPreprocessor:
             order_col='transaction_date'
         )
         
-        # === Compute D_max (max cells per card for bounded contribution analysis) ===
-        logger.info("")
-        logger.info("Computing D_max (max cells per card)...")
-        sensitivity_calc = GlobalSensitivityCalculator(
-            spark=self.spark,
-            method="user_level"
-        )
-        d_max = sensitivity_calc.compute_max_cells_per_individual(
-            df_clipped,
-            individual_column='card_number',
-            cell_columns=['acceptor_city', 'mcc', 'day_idx_temp']
-        )
+        # === [DP] Compute D_max (max cells per card for bounded contribution analysis) ===
+        # NOTE: D_max is computed but NOT USED in SDC approach. It was needed for traditional DP
+        # sensitivity calculations, but SDC uses context-aware plausibility bounds instead.
+        # Commented out for performance (saves 5-10% preprocessing time on large datasets).
+        # logger.info("")
+        # logger.info("Computing D_max (max cells per card)...")
+        # sensitivity_calc = GlobalSensitivityCalculator(
+        #     spark=self.spark,
+        #     method="user_level"
+        # )
+        # d_max = sensitivity_calc.compute_max_cells_per_individual(
+        #     df_clipped,
+        #     individual_column='card_number',
+        #     cell_columns=['acceptor_city', 'mcc', 'day_idx_temp']
+        # )
+        # 
+        # # Store D_max in config for engine
+        # self._d_max = d_max
+        # self.config.privacy.computed_d_max = d_max
         
-        # Store D_max in config for engine
-        self._d_max = d_max
-        self.config.privacy.computed_d_max = d_max
+        # Set default D_max (not used in SDC, but kept for compatibility)
+        self._d_max = 1  # Default value - not used in SDC
+        self.config.privacy.computed_d_max = 1
         
-        logger.info(f"Bounded Contribution Parameters:")
-        logger.info(f"  K (per-cell bound): {k}")
-        logger.info(f"  D_max (max cells per card): {d_max}")
-        logger.info(f"  sqrt(D_max): {d_max**0.5:.4f}")
+        # [VERBOSE] logger.info(f"Bounded Contribution Parameters:")
+        logger.info(f"Bounded contribution: K={k} (keeps {self.config.privacy.contribution_bound_percentile}% of transactions)")
+        # logger.info(f"  D_max (max cells per card): {d_max}")
+        # logger.info(f"  sqrt(D_max): {d_max**0.5:.4f}")
         
         # Remove temporary day_idx column
         df_clipped = df_clipped.drop('day_idx_temp')
         
-        logger.info(result.summary())
+        # [VERBOSE] logger.info(result.summary())
         
         return df_clipped
     
@@ -347,9 +356,9 @@ class TransactionPreprocessor:
         ).first()
         
         pct_capped = 100 * total_stats.capped_count / total_stats.total_count if total_stats.total_count > 0 else 0
-        logger.info(f"Per-MCC winsorization: {total_stats.capped_count:,} / {total_stats.total_count:,} transactions capped ({pct_capped:.2f}%)")
-        if self._mcc_caps:
-            logger.info(f"Cap range: [{min(self._mcc_caps.values()):,.0f}, {max(self._mcc_caps.values()):,.0f}]")
+        # [VERBOSE] logger.info(f"Per-MCC winsorization: {total_stats.capped_count:,} / {total_stats.total_count:,} transactions capped ({pct_capped:.2f}%)")
+        # if self._mcc_caps:
+        #     logger.info(f"Cap range: [{min(self._mcc_caps.values()):,.0f}, {max(self._mcc_caps.values()):,.0f}]")
         
         return df
     
@@ -373,7 +382,7 @@ class TransactionPreprocessor:
                 max_date = datetime.strptime(max_date, '%Y-%m-%d').date()
         
         date_range = (max_date - self._min_date).days + 1
-        logger.info(f"Date range: {self._min_date} to {max_date} ({date_range} days)")
+        # [VERBOSE] logger.info(f"Date range: {self._min_date} to {max_date} ({date_range} days)")
         
         if date_range > self.config.data.num_days:
             logger.warning(f"Data spans {date_range} days, configured for {self.config.data.num_days}")
@@ -407,7 +416,7 @@ class TransactionPreprocessor:
         # Broadcast small MCC index lookup table (~300 MCCs) for efficient join
         df = df.join(F.broadcast(mcc_df), df.mcc == mcc_df.mcc_key, "left").drop("mcc_key")
         
-        logger.info(f"Unique MCCs: {len(self._mcc_to_idx)}")
+        # [VERBOSE] logger.info(f"Unique MCCs: {len(self._mcc_to_idx)}")
         
         # Create city index mapping using join (no UDF!)
         # Stream distinct city-province pairs (1500+ pairs) instead of collecting all at once
@@ -428,7 +437,7 @@ class TransactionPreprocessor:
         # Broadcast small city index lookup table (~1500 cities) for efficient join
         df = df.join(F.broadcast(city_df), df.acceptor_city == city_df.city_key, "left").drop("city_key")
         
-        logger.info(f"Unique cities: {len(self._city_to_idx)}")
+        # [VERBOSE] logger.info(f"Unique cities: {len(self._city_to_idx)}")
         
         return df
     
@@ -461,7 +470,7 @@ class TransactionPreprocessor:
         
         # Get count first (for logging) - use count() instead of collect()
         num_cells = agg_df.count()
-        logger.info(f"Aggregated to {num_cells:,} non-zero cells (Spark DataFrame, NO collect)")
+        # [VERBOSE] logger.info(f"Aggregated to {num_cells:,} non-zero cells (Spark DataFrame, NO collect)")
         
         # Create dimension metadata (small lists in driver, ~1 KB total)
         num_provinces = max(self.geography.province_codes) + 1
@@ -507,12 +516,13 @@ class TransactionPreprocessor:
                 'invariant_count',
                 'invariant_amount'
             )
-            logger.info("  Passing TRUE province invariants to histogram (from original raw data)")
+            # [VERBOSE] logger.info("  Passing TRUE province invariants to histogram (from original raw data)")
+            pass
         else:
             logger.warning("  No province invariants computed - histogram will compute from aggregated data (may be incorrect!)")
         
         # Create SparkHistogram (data stays in Spark, NO collection to driver)
-        logger.info("Creating SparkHistogram (100% Spark, data remains distributed)")
+        # [VERBOSE] logger.info("Creating SparkHistogram (100% Spark, data remains distributed)")
         histogram = SparkHistogram(
             spark=self.spark,
             df=agg_df,

@@ -11,7 +11,7 @@ This module coordinates the entire Statistical Disclosure Control workflow:
 APPROACH: Utility-first SDC for secure enclave deployment
 - Province counts are exact (invariant)
 - Multiplicative jitter preserves ratios naturally
-- Data-driven bounds per (MCC, City, Weekday) context
+- Data-driven bounds per (Province, MCC, Weekday) context
 - Controlled rounding with ratio preservation
 """
 
@@ -67,7 +67,7 @@ class DPPipeline:
     
     KEY FEATURES:
     - Province invariants: exact totals preserved (no noise at province level)
-    - Context-aware bounds: plausibility ranges per (MCC, City, Weekday)
+    - Context-aware bounds: plausibility ranges per (Province, MCC, Weekday)
     - Ratio preservation: avg_amount and tx_per_card stay within plausible ranges
     - Multiplicative jitter: preserves relationships naturally
     """
@@ -87,13 +87,13 @@ class DPPipeline:
         """Initialize Spark session."""
         from pyspark.sql import SparkSession
         
-        logger.info("Initializing Spark session...")
+        # [VERBOSE] logger.info("Initializing Spark session...")
         
-        # Log config values for debugging
-        logger.info(f"Config spark.master: {self.config.spark.master}")
-        logger.info(f"Config spark.app_name: {self.config.spark.app_name}")
-        logger.info(f"Config spark.executor_memory: {self.config.spark.executor_memory}")
-        logger.info(f"Config spark.driver_memory: {self.config.spark.driver_memory}")
+        # [VERBOSE] Log config values for debugging
+        # logger.info(f"Config spark.master: {self.config.spark.master}")
+        # logger.info(f"Config spark.app_name: {self.config.spark.app_name}")
+        # logger.info(f"Config spark.executor_memory: {self.config.spark.executor_memory}")
+        # logger.info(f"Config spark.driver_memory: {self.config.spark.driver_memory}")
         
         # Always check for existing session first - use it if available
         # Don't stop existing sessions - just use them (even if master is different)
@@ -102,25 +102,26 @@ class DPPipeline:
         
         if existing_session:
             current_master = existing_session.sparkContext.master
-            logger.info(f"✅ Found existing Spark session with master={current_master}")
-            logger.info(f"   Desired master={desired_master}")
+            logger.info(f"✅ Found existing Spark session (master={current_master})")
+            # [VERBOSE] logger.info(f"   Desired master={desired_master}")
             
             # Always reuse existing session - don't stop it
             # Master mismatch is not critical - we'll just use what's available
             if current_master != desired_master:
-                logger.warning(f"   Note: Master mismatch (desired={desired_master}, actual={current_master})")
-                logger.warning(f"   Using existing session anyway - master cannot be changed after creation")
+                # [VERBOSE] logger.warning(f"   Note: Master mismatch (desired={desired_master}, actual={current_master})")
+                # [VERBOSE] logger.warning(f"   Using existing session anyway - master cannot be changed after creation")
+                pass
             
             self._spark = existing_session
             self._spark_created_by_pipeline = False  # Reusing existing - don't stop it
             
-            # Verify and log session info
-            actual_master = self._spark.sparkContext.master
-            actual_parallelism = self._spark.sparkContext.defaultParallelism
-            logger.info(f"Using existing Spark session:")
-            logger.info(f"  Master: {actual_master}")
-            logger.info(f"  Default Parallelism: {actual_parallelism}")
-            logger.info(f"  Spark Version: {self._spark.version}")
+            # [VERBOSE] Verify and log session info
+            # actual_master = self._spark.sparkContext.master
+            # actual_parallelism = self._spark.sparkContext.defaultParallelism
+            # logger.info(f"Using existing Spark session:")
+            # logger.info(f"  Master: {actual_master}")
+            # logger.info(f"  Default Parallelism: {actual_parallelism}")
+            # logger.info(f"  Spark Version: {self._spark.version}")
             return self._spark  # Exit early - reuse existing session
         
         builder = SparkSession.builder.appName(self.config.spark.app_name)
@@ -128,7 +129,7 @@ class DPPipeline:
         # Set master FIRST (before getOrCreate) - this is critical!
         desired_master = self.config.spark.master or "local[*]"
         builder = builder.master(desired_master)
-        logger.info(f"Setting Spark master to: {desired_master}")
+        # [VERBOSE] logger.info(f"Setting Spark master to: {desired_master}")
         
         for key, value in self.config.spark.to_spark_conf().items():
             if key != "spark.app.name":  # Already set
@@ -150,7 +151,7 @@ class DPPipeline:
             shuffle_partitions = max(200, mem_gb * 50)
             builder = builder.config("spark.sql.shuffle.partitions", str(shuffle_partitions))
             builder = builder.config("spark.default.parallelism", str(shuffle_partitions))
-            logger.info(f"Set shuffle partitions to {shuffle_partitions} for large dataset processing")
+            # [VERBOSE] logger.info(f"Set shuffle partitions to {shuffle_partitions} for large dataset processing")
         
         # Memory management for large datasets
         builder = builder.config("spark.memory.fraction", "0.8")
@@ -165,7 +166,7 @@ class DPPipeline:
         try:
             temp_session = SparkSession.getActiveSession()
             if temp_session:
-                logger.info("Found Spark session created between checks, reusing it")
+                # [VERBOSE] logger.info("Found Spark session created between checks, reusing it")
                 self._spark = temp_session
                 self._spark_created_by_pipeline = False  # Don't stop it
                 return self._spark
@@ -180,7 +181,7 @@ class DPPipeline:
         except Exception as e:
             # If creation fails, check if session exists now (created by another thread)
             logger.warning(f"Failed to create Spark session: {e}")
-            logger.info("Checking if session exists now...")
+            # [VERBOSE] logger.info("Checking if session exists now...")
             temp_session = SparkSession.getActiveSession()
             if temp_session:
                 logger.info("✅ Found existing Spark session, using it")
@@ -191,37 +192,37 @@ class DPPipeline:
                 logger.error("❌ No Spark session available and cannot create one")
                 raise RuntimeError(f"Failed to initialize Spark session: {e}") from e
         
-        # Verify master was set correctly
-        actual_master = self._spark.sparkContext.master
-        actual_parallelism = self._spark.sparkContext.defaultParallelism
-        
-        logger.info(f"Spark session initialized: {self._spark.sparkContext.appName}")
-        logger.info(f"Spark master: {actual_master}")
-        logger.info(f"Spark default parallelism: {actual_parallelism}")
-        
-        # Warn if master doesn't match
-        if actual_master != desired_master:
-            logger.warning(f"WARNING: Spark master mismatch! Desired={desired_master}, Actual={actual_master}")
-            logger.warning("This may happen if Spark session was created elsewhere. Try stopping all Spark sessions.")
-        
-        # For local[N], verify parallelism matches N
-        if desired_master.startswith("local["):
-            try:
-                # Extract number from local[N] or local[*]
-                if desired_master == "local[*]":
-                    # Should use all cores
-                    import os
-                    expected_cores = os.cpu_count() or 2
-                else:
-                    # Extract N from local[N]
-                    n_str = desired_master[6:-1]  # Remove "local[" and "]"
-                    expected_cores = int(n_str) if n_str.isdigit() else 2
-                
-                if actual_parallelism != expected_cores:
-                    logger.warning(f"WARNING: Parallelism mismatch! Expected={expected_cores}, Actual={actual_parallelism}")
-                    logger.warning(f"Spark may not be using all requested cores. Check Spark configuration.")
-            except Exception as e:
-                logger.debug(f"Could not verify parallelism: {e}")
+        # [VERBOSE] Verify master was set correctly
+        # actual_master = self._spark.sparkContext.master
+        # actual_parallelism = self._spark.sparkContext.defaultParallelism
+        # 
+        # logger.info(f"Spark session initialized: {self._spark.sparkContext.appName}")
+        # logger.info(f"Spark master: {actual_master}")
+        # logger.info(f"Spark default parallelism: {actual_parallelism}")
+        # 
+        # # Warn if master doesn't match
+        # if actual_master != desired_master:
+        #     logger.warning(f"WARNING: Spark master mismatch! Desired={desired_master}, Actual={actual_master}")
+        #     logger.warning("This may happen if Spark session was created elsewhere. Try stopping all Spark sessions.")
+        # 
+        # # For local[N], verify parallelism matches N
+        # if desired_master.startswith("local["):
+        #     try:
+        #         # Extract number from local[N] or local[*]
+        #         if desired_master == "local[*]":
+        #             # Should use all cores
+        #             import os
+        #             expected_cores = os.cpu_count() or 2
+        #         else:
+        #             # Extract N from local[N]
+        #             n_str = desired_master[6:-1]  # Remove "local[" and "]"
+        #             expected_cores = int(n_str) if n_str.isdigit() else 2
+        #         
+        #         if actual_parallelism != expected_cores:
+        #             logger.warning(f"WARNING: Parallelism mismatch! Expected={expected_cores}, Actual={actual_parallelism}")
+        #             logger.warning(f"Spark may not be using all requested cores. Check Spark configuration.")
+        #     except Exception as e:
+        #         logger.debug(f"Could not verify parallelism: {e}")
         
         return self._spark
     
@@ -278,7 +279,7 @@ class DPPipeline:
                     if spark:
                         self._spark = spark
                         self._spark_created_by_pipeline = False
-                        logger.info("Recovered existing Spark session on retry")
+                        # [VERBOSE] logger.info("Recovered existing Spark session on retry")
                     else:
                         raise RuntimeError(
                             "Failed to initialize Spark session. "
@@ -366,7 +367,7 @@ class DPPipeline:
             )
             
             # Keep a copy of original histogram before DP (for comparison output)
-            logger.info("Creating copy of original histogram for comparison output...")
+            # [VERBOSE] logger.info("Creating copy of original histogram for comparison output...")
             original_histograms = histograms.copy() if hasattr(histograms, 'copy') else histograms
             
             protected_histograms = engine.run(histograms)
@@ -411,7 +412,8 @@ class DPPipeline:
                 except Exception as e:
                     logger.warning(f"Error stopping Spark session: {e}")
             elif self._spark is not None:
-                logger.info("Keeping existing Spark session (not created by pipeline)")
+                # [VERBOSE] logger.info("Keeping existing Spark session (not created by pipeline)")
+                pass
         
         return result.to_dict()
     
