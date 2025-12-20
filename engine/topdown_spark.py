@@ -739,12 +739,6 @@ class TopDownSparkEngine:
         
         self._final_validation(df_rounded)
         
-        # Cleanup
-        if self._invariants is not None:
-            self._invariants.unpersist()
-        if self._bounds_df is not None:
-            self._bounds_df.unpersist()
-        
         logger.info("\n" + "=" * 70)
         logger.info("Context-Aware Noise Processing Complete")
         logger.info("=" * 70)
@@ -761,7 +755,24 @@ class TopDownSparkEngine:
         logger.info("=" * 70)
         self._verify_province_invariants_exact(df_final)
         
-        return SparkHistogram(self.spark, df_final, histogram.dimensions, histogram.city_codes, histogram.min_date)
+        # CRITICAL: Preserve province_invariants in returned histogram for downstream use
+        # The invariants must be preserved so they can be verified against input data totals
+        final_histogram = SparkHistogram(
+            self.spark, 
+            df_final, 
+            histogram.dimensions, 
+            histogram.city_codes, 
+            histogram.min_date,
+            province_invariants=histogram.province_invariants  # Preserve invariants from input
+        )
+        
+        # Cleanup (after verification and histogram creation)
+        if self._invariants is not None:
+            self._invariants.unpersist()
+        if self._bounds_df is not None:
+            self._bounds_df.unpersist()
+        
+        return final_histogram
     
     def _compute_plausibility_bounds(self, df: DataFrame, amount_col: str = 'total_amount') -> DataFrame:
         """
@@ -1444,8 +1455,13 @@ class TopDownSparkEngine:
         Verify province invariants are EXACT (0% error).
         
         CRITICAL: Province-level totals for transaction_count and transaction_amount_sum
-        must be EXACTLY equal to the original province totals (0% error) because
-        they are publicly published data.
+        must be EXACTLY equal to the original province totals from the INPUT DATA FRAME (0% error)
+        because they are publicly published data.
+        
+        The invariants in self._invariants were computed from the original input data frame
+        BEFORE any preprocessing (bounded contribution, winsorization, etc.). This verification
+        ensures that after all processing (noise, scaling, rounding), the final output totals
+        match the input data frame totals exactly.
         
         Args:
             df: DataFrame to verify (should have transaction_count and total_amount columns)
@@ -1453,13 +1469,14 @@ class TopDownSparkEngine:
         Raises:
             RuntimeError: If any province invariant is violated (non-zero error)
         """
-        # Compute actual province totals
+        # Compute actual province totals from final output
         actual = df.groupBy('province_idx').agg(
             F.sum('transaction_count').alias('actual_count'),
             F.sum('total_amount').alias('actual_amount')
         )
         
-        # Join with expected invariants
+        # Join with expected invariants (computed from original input data frame)
+        # CRITICAL: self._invariants contains the EXACT totals from the input data frame
         comparison = self._invariants.join(actual, 'province_idx', 'inner')
         comparison = comparison.withColumn(
             'count_error', F.col('actual_count') - F.col('invariant_count')

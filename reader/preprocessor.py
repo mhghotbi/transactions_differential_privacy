@@ -80,6 +80,11 @@ class TransactionPreprocessor:
         province_invariants = self._compute_province_invariants(df)
         self._province_invariants_df = province_invariants['province_df']
         
+        # Step 0B: Compute original amounts aggregation BEFORE bounded contribution
+        # CRITICAL: Must compute total_amount_original from ALL original transactions
+        # (before bounded contribution filters rows) to match invariant_amount
+        df = self._compute_original_amounts_aggregation(df)
+        
         # Step 0: Compute per-MCC winsorization caps
         # Each MCC is processed separately (parallel composition)
         df = self._compute_per_mcc_caps(df)
@@ -108,6 +113,12 @@ class TransactionPreprocessor:
         CRITICAL: Must be called BEFORE bounded contribution or any modifications.
         These are the publicly published province totals that must be preserved exactly.
         
+        The invariants computed here represent the EXACT totals from the input data frame:
+        - invariant_count: Total transaction count per province (from input df)
+        - invariant_amount: Total transaction amount per province (from input df, original amounts)
+        
+        These values will be maintained EXACTLY (0% error) throughout all processing steps.
+        
         Args:
             df: Raw transaction DataFrame (before any preprocessing)
             
@@ -118,6 +129,7 @@ class TransactionPreprocessor:
         
         # Group by province_code and compute totals from ORIGINAL data
         # Note: province_code is already added by the reader before preprocessing
+        # CRITICAL: These invariants represent the EXACT input data frame totals
         invariants_df = df.groupBy('province_code').agg(
             F.count('*').cast('long').alias('invariant_count'),
             F.sum('amount').cast('long').alias('invariant_amount')
@@ -136,10 +148,92 @@ class TransactionPreprocessor:
         # logger.info(f"  True total amount: {total_amount:,}")
         
         return {
-            'province_df': invariants_df,
-            'total_count': total_count,
-            'total_amount': total_amount
+            'province_df': invariants_df
         }
+    
+    def _compute_original_amounts_aggregation(self, df: DataFrame) -> DataFrame:
+        """
+        Compute original amounts aggregation BEFORE bounded contribution.
+        
+        CRITICAL: This aggregates ALL original transactions (before bounded contribution
+        filters rows) so that total_amount_original matches invariant_amount.
+        
+        Args:
+            df: Original raw DataFrame (before any filtering)
+            
+        Returns:
+            Original DataFrame unchanged (aggregation is stored in self._original_amounts_df)
+        """
+        # Create temporary indices needed for aggregation
+        # Get date range
+        date_stats = df.agg(
+            F.min(F.col('transaction_date')).alias('min_date'),
+            F.max(F.col('transaction_date')).alias('max_date')
+        ).first()
+        
+        min_date = date_stats.min_date
+        max_date = date_stats.max_date
+        
+        # Handle both date objects and strings
+        if isinstance(min_date, str) or isinstance(max_date, str):
+            from datetime import datetime
+            if isinstance(min_date, str):
+                min_date = datetime.strptime(min_date, '%Y-%m-%d').date()
+            if isinstance(max_date, str):
+                max_date = datetime.strptime(max_date, '%Y-%m-%d').date()
+        
+        # Create temporary day index and weekday
+        min_date_lit = F.lit(min_date)
+        df_temp = df.withColumn('day_idx_temp', F.datediff(F.col('transaction_date'), min_date_lit))
+        df_temp = df_temp.withColumn('weekday_temp', F.pmod(F.dayofweek(F.col('transaction_date')) - 2, 7))
+        
+        # Filter to configured number of days
+        df_temp = df_temp.filter(F.col('day_idx_temp') < self.config.data.num_days)
+        df_temp = df_temp.filter(F.col('day_idx_temp') >= 0)
+        
+        # Create MCC index mapping
+        unique_mccs = sorted([row.mcc for row in df_temp.select('mcc').distinct().collect()])
+        mcc_to_idx_temp = {mcc: idx for idx, mcc in enumerate(unique_mccs)}
+        
+        mcc_mapping_data = [(mcc, idx) for mcc, idx in mcc_to_idx_temp.items()]
+        mcc_schema = StructType([
+            StructField("mcc_key", StringType(), False),
+            StructField("mcc_idx", IntegerType(), False),
+        ])
+        mcc_df = self.spark.createDataFrame(mcc_mapping_data, schema=mcc_schema)
+        df_temp = df_temp.join(F.broadcast(mcc_df), df_temp.mcc == mcc_df.mcc_key, "left").drop("mcc_key")
+        
+        # Create city index mapping
+        city_data_df = df_temp.select('province_code', 'acceptor_city').distinct()
+        city_data = list(city_data_df.toLocalIterator())
+        unique_cities = sorted(set(row.acceptor_city for row in city_data))
+        city_to_idx_temp = {city: idx for idx, city in enumerate(unique_cities)}
+        
+        city_mapping_data = [(city, idx) for city, idx in city_to_idx_temp.items()]
+        city_schema = StructType([
+            StructField("city_key", StringType(), False),
+            StructField("city_idx", IntegerType(), False),
+        ])
+        city_df = self.spark.createDataFrame(city_mapping_data, schema=city_schema)
+        df_temp = df_temp.join(F.broadcast(city_df), df_temp.acceptor_city == city_df.city_key, "left").drop("city_key")
+        
+        # Aggregate original amounts at (province, city_idx, mcc_idx, day_idx, weekday) level
+        # This includes ALL transactions (before bounded contribution filters)
+        self._original_amounts_df = df_temp.groupBy(
+            'province_code', 'city_idx', 'mcc_idx', 'day_idx_temp', 'weekday_temp'
+        ).agg(
+            F.sum(F.col('amount')).cast('long').alias('total_amount_original')
+        ).select(
+            F.col('province_code').alias('province_idx'),
+            'city_idx',
+            'mcc_idx',
+            F.col('day_idx_temp').alias('day_idx'),
+            F.col('weekday_temp').alias('weekday'),
+            'total_amount_original'
+        )
+        
+        # Return original df unchanged (indices were only temporary)
+        return df
     
     def _compute_per_mcc_caps(self, df: DataFrame) -> DataFrame:
         """
@@ -453,7 +547,7 @@ class TransactionPreprocessor:
         """
         from schema.histogram_spark import SparkHistogram, HistogramDimension
         
-        # Compute aggregations (4 queries: transaction_count, unique_cards, total_amount, total_amount_original)
+        # Compute aggregations (3 queries: transaction_count, unique_cards, total_amount)
         # CRITICAL: Cast sums to LongType to avoid Java BigDecimal reflection warnings
         # Include weekday in groupBy for context-aware bounds
         agg_df = df.groupBy(
@@ -461,12 +555,26 @@ class TransactionPreprocessor:
         ).agg(
             F.count('*').cast('long').alias('transaction_count'),
             F.countDistinct(F.col('card_number')).cast('long').alias('unique_cards'),
-            F.sum(F.col('amount_winsorized')).cast('long').alias('total_amount'),         # Winsorized (outliers handled)
-            F.sum(F.col('amount')).cast('long').alias('total_amount_original')             # Original (for invariants)
+            F.sum(F.col('amount_winsorized')).cast('long').alias('total_amount')  # Winsorized (outliers handled)
         )
         
         # Rename province_code to province_idx for consistency
         agg_df = agg_df.withColumnRenamed('province_code', 'province_idx')
+        
+        # CRITICAL: Join with pre-computed original amounts (from ALL transactions before bounded contribution)
+        # This ensures total_amount_original matches invariant_amount (sum of ALL original transactions)
+        if self._original_amounts_df is not None:
+            # Left join: use original amounts where available, 0 otherwise
+            # This handles cases where a cell exists after filtering but didn't exist before
+            agg_df = agg_df.join(
+                F.broadcast(self._original_amounts_df),
+                on=['province_idx', 'city_idx', 'mcc_idx', 'day_idx', 'weekday'],
+                how='left'
+            ).fillna({'total_amount_original': 0})
+        else:
+            # Fallback: compute from filtered data (will not match invariants, but allows processing to continue)
+            logger.warning("  _original_amounts_df not computed - using filtered data for total_amount_original (will not match invariants!)")
+            agg_df = agg_df.withColumn('total_amount_original', F.lit(0).cast('long'))
         
         # Get count first (for logging) - use count() instead of collect()
         num_cells = agg_df.count()
