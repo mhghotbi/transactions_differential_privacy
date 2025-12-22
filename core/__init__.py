@@ -5,7 +5,7 @@ Statistical Disclosure Control system for transaction data.
 
 Uses context-aware plausibility-based noise with:
 - Multiplicative jitter that preserves ratios naturally
-- Data-driven bounds per (MCC, City, Weekday) context
+- Data-driven bounds per (Province, MCC, Weekday) context
 - Province count invariants maintained exactly
 
 Supports:

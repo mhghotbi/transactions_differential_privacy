@@ -1,13 +1,14 @@
 """
 Plausibility Bounds Calculator for Context-Aware Noise.
 
-Computes data-driven plausibility bounds per (MCC, City, Weekday) context.
+Computes data-driven plausibility bounds per (Province, MCC, Weekday) context.
 These bounds ensure that noisy outputs remain realistic based on historical data patterns.
 
 Design Philosophy:
 - Let the data define what's plausible for each context
 - No manual/expert overrides needed
 - Bounds are computed from percentiles (default p5-p95)
+- Province-specific bounds align with province-specific scaling factors
 """
 
 import logging
@@ -37,7 +38,7 @@ class BoundsConfig:
 
 class PlausibilityBoundsCalculator:
     """
-    Compute plausibility bounds per (MCC, City, Weekday) from historical data.
+    Compute plausibility bounds per (Province, MCC, Weekday) from historical data.
     
     The bounds define realistic min/max ranges for:
     - transaction_count: How many transactions are plausible
@@ -45,6 +46,8 @@ class PlausibilityBoundsCalculator:
     - tx_per_card: How many transactions per unique card is plausible
     
     These bounds are used to clamp noisy values to realistic ranges.
+    Province-specific bounds ensure alignment with province-specific scaling factors
+    applied during invariant preservation.
     """
     
     def __init__(
@@ -68,10 +71,10 @@ class PlausibilityBoundsCalculator:
         self._bounds_df: Optional[DataFrame] = None
         self._global_bounds: Optional[Dict[str, Tuple[float, float]]] = None
         
-        logger.info(f"PlausibilityBoundsCalculator initialized:")
-        logger.info(f"  Lower percentile: p{int(lower_percentile * 100)}")
-        logger.info(f"  Upper percentile: p{int(upper_percentile * 100)}")
-        logger.info(f"  Min samples per context: {min_samples}")
+        # [VERBOSE] logger.info(f"PlausibilityBoundsCalculator initialized:")
+        # logger.info(f"  Lower percentile: p{int(lower_percentile * 100)}")
+        # logger.info(f"  Upper percentile: p{int(upper_percentile * 100)}")
+        # logger.info(f"  Min samples per context: {min_samples}")
     
     def compute_bounds(
         self,
@@ -84,7 +87,7 @@ class PlausibilityBoundsCalculator:
         Args:
             df: DataFrame with aggregated data (must have transaction_count, 
                 unique_cards, total_amount columns)
-            context_cols: Columns defining context (default: ['mcc_idx', 'city_idx', 'weekday'])
+            context_cols: Columns defining context (default: ['province_idx', 'mcc_idx', 'weekday'])
         
         Returns:
             DataFrame with bounds per context
@@ -93,12 +96,12 @@ class PlausibilityBoundsCalculator:
             raise RuntimeError("Spark not available")
         
         if context_cols is None:
-            context_cols = ['mcc_idx', 'city_idx', 'weekday']
+            context_cols = ['province_idx', 'mcc_idx', 'weekday']
         
-        logger.info("=" * 60)
-        logger.info("Computing Data-Driven Plausibility Bounds")
-        logger.info("=" * 60)
-        logger.info(f"Context columns: {context_cols}")
+        # [VERBOSE] logger.info("=" * 60)
+        # logger.info("Computing Data-Driven Plausibility Bounds")
+        # logger.info("=" * 60)
+        # logger.info(f"Context columns: {context_cols}")
         
         # First compute global bounds as fallback for sparse contexts
         self._compute_global_bounds(df)
@@ -171,29 +174,29 @@ class PlausibilityBoundsCalculator:
             F.sum(F.when(F.col('sample_count') < self.min_samples, 1).otherwise(0)).alias('sparse_contexts')
         ).first()
         
-        logger.info(f"Bounds computed for {bounds_stats['num_contexts']:,} unique contexts")
-        logger.info(f"Average samples per context: {bounds_stats['avg_samples_per_context']:.1f}")
-        logger.info(f"Sparse contexts (< {self.min_samples} samples): {bounds_stats['sparse_contexts']:,}")
+        logger.info(f"Bounds computed for {bounds_stats['num_contexts']:,} contexts")
+        # [VERBOSE] logger.info(f"Average samples per context: {bounds_stats['avg_samples_per_context']:.1f}")
+        # logger.info(f"Sparse contexts (< {self.min_samples} samples): {bounds_stats['sparse_contexts']:,}")
         
-        # Show sample bounds
-        logger.info("\nSample bounds (first 5 contexts):")
-        sample_bounds = self._bounds_df.select(
-            *context_cols, 'sample_count', 
-            'count_min', 'count_max',
-            'avg_amount_min', 'avg_amount_max'
-        ).limit(5).collect()
-        
-        for row in sample_bounds:
-            ctx = '_'.join(str(row[c]) for c in context_cols)
-            logger.info(f"  {ctx}: count=[{row['count_min']:.0f}, {row['count_max']:.0f}], "
-                       f"avg_amt=[{row['avg_amount_min']:.0f}, {row['avg_amount_max']:.0f}]")
+        # [VERBOSE] Show sample bounds
+        # logger.info("\nSample bounds (first 5 contexts):")
+        # sample_bounds = self._bounds_df.select(
+        #     *context_cols, 'sample_count', 
+        #     'count_min', 'count_max',
+        #     'avg_amount_min', 'avg_amount_max'
+        # ).limit(5).collect()
+        # 
+        # for row in sample_bounds:
+        #     ctx = '_'.join(str(row[c]) for c in context_cols)
+        #     logger.info(f"  {ctx}: count=[{row['count_min']:.0f}, {row['count_max']:.0f}], "
+        #                f"avg_amt=[{row['avg_amount_min']:.0f}, {row['avg_amount_max']:.0f}]")
         
         return self._bounds_df
     
     def _compute_global_bounds(self, df: 'DataFrame') -> None:
         """Compute global bounds as fallback for unknown contexts."""
         
-        logger.info("Computing global fallback bounds...")
+        # [VERBOSE] logger.info("Computing global fallback bounds...")
         
         # Add ratio columns
         df_with_ratios = df.withColumn(
@@ -223,9 +226,9 @@ class PlausibilityBoundsCalculator:
             'tx_per_card': (float(global_stats['tx_per_card_min']), float(global_stats['tx_per_card_max'])),
         }
         
-        logger.info(f"  Global count bounds: [{self._global_bounds['count'][0]:.0f}, {self._global_bounds['count'][1]:.0f}]")
-        logger.info(f"  Global avg_amount bounds: [{self._global_bounds['avg_amount'][0]:.0f}, {self._global_bounds['avg_amount'][1]:.0f}]")
-        logger.info(f"  Global tx_per_card bounds: [{self._global_bounds['tx_per_card'][0]:.1f}, {self._global_bounds['tx_per_card'][1]:.1f}]")
+        # [VERBOSE] logger.info(f"  Global count bounds: [{self._global_bounds['count'][0]:.0f}, {self._global_bounds['count'][1]:.0f}]")
+        # logger.info(f"  Global avg_amount bounds: [{self._global_bounds['avg_amount'][0]:.0f}, {self._global_bounds['avg_amount'][1]:.0f}]")
+        # logger.info(f"  Global tx_per_card bounds: [{self._global_bounds['tx_per_card'][0]:.1f}, {self._global_bounds['tx_per_card'][1]:.1f}]")
     
     def get_bounds_df(self) -> Optional['DataFrame']:
         """Get the computed bounds DataFrame."""
@@ -259,7 +262,7 @@ def compute_and_apply_bounds(
         DataFrame with bounds columns joined
     """
     if context_cols is None:
-        context_cols = ['mcc_idx', 'city_idx', 'weekday']
+        context_cols = ['province_idx', 'mcc_idx', 'weekday']
     
     # Select only the bounds columns we need
     bounds_cols = ['count_min', 'count_max', 'avg_amount_min', 'avg_amount_max',

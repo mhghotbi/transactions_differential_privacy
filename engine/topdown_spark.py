@@ -3,7 +3,7 @@ Context-Aware Plausibility-Based Noise Engine.
 
 STATISTICAL DISCLOSURE CONTROL implementation with:
 1. Multiplicative jitter that preserves ratios naturally
-2. Data-driven plausibility bounds per (MCC, City, Weekday) context
+2. Data-driven plausibility bounds per (Province, MCC, Weekday) context
 3. Proper random noise (not hash-based)
 4. Province invariants for count maintained exactly
 5. Derived amount and cards that preserve realistic relationships
@@ -38,6 +38,8 @@ class NoiseConfig:
     seed: int = 42  # For reproducibility
     bounds_lower_percentile: float = 0.05  # p5 for lower bound
     bounds_upper_percentile: float = 0.95  # p95 for upper bound
+    bounds_widening_factor: float = 2.0  # Expand bounds by this factor (2.0 = 2x wider)
+    sparse_bounds_widening_factor: float = 3.0  # Extra widening for sparse contexts (< min_samples)
 
 
 class TopDownSparkEngine:
@@ -51,9 +53,10 @@ class TopDownSparkEngine:
     - Province count invariants maintained exactly
     
     CONTEXT DEFINITION:
-    - Context = (MCC, City, Weekday)
+    - Context = (Province, MCC, Weekday)
     - Each context has its own plausibility bounds from historical data
     - Bounds are p5-p95 percentiles computed per context
+    - Province-specific bounds align with province-specific scaling factors
     
     NOISE APPLICATION:
     1. Compute plausibility bounds per context from data
@@ -79,25 +82,30 @@ class TopDownSparkEngine:
         # Noise configuration
         self.noise_config = NoiseConfig(
             noise_level=getattr(config.privacy, 'noise_level', 0.15),
-            seed=getattr(config.privacy, 'noise_seed', 42)
+            seed=getattr(config.privacy, 'noise_seed', 42),
+            bounds_lower_percentile=getattr(config.privacy, 'bounds_lower_percentile', 0.05),
+            bounds_upper_percentile=getattr(config.privacy, 'bounds_upper_percentile', 0.95),
+            bounds_widening_factor=getattr(config.privacy, 'bounds_widening_factor', 2.0),
+            sparse_bounds_widening_factor=getattr(config.privacy, 'sparse_bounds_widening_factor', 3.0)
         )
         
         # Statistics (small DataFrames, cached)
         self._invariants: Optional[DataFrame] = None
         self._bounds_df: Optional[DataFrame] = None
         
-        logger.info("=" * 60)
-        logger.info("Context-Aware Plausibility-Based Noise Engine")
-        logger.info("=" * 60)
-        logger.info(f"Noise level: {self.noise_config.noise_level:.1%}")
-        logger.info(f"Seed: {self.noise_config.seed}")
-        logger.info(f"Bounds: p{int(self.noise_config.bounds_lower_percentile*100)}-p{int(self.noise_config.bounds_upper_percentile*100)}")
-        logger.info(f"Strategy: Multiplicative jitter with data-driven bounds")
-        logger.info("=" * 60)
+        # [VERBOSE] logger.info("=" * 60)
+        # logger.info("Context-Aware Plausibility-Based Noise Engine")
+        # logger.info("=" * 60)
+        # logger.info(f"Noise level: {self.noise_config.noise_level:.1%}")
+        # logger.info(f"Seed: {self.noise_config.seed}")
+        # logger.info(f"Bounds: p{int(self.noise_config.bounds_lower_percentile*100)}-p{int(self.noise_config.bounds_upper_percentile*100)}")
+        # logger.info(f"Strategy: Multiplicative jitter with data-driven bounds")
+        # logger.info("=" * 60)
     
     def set_user_level_params(self, d_max: int, k_bound: int, winsorize_cap: float) -> None:
         """Set bounded contribution parameters (D_max, K, winsorize cap) from preprocessing."""
-        logger.info(f"Bounded contribution params: D_max={d_max}, K={k_bound}, Winsorize_cap={winsorize_cap:,.0f}")
+        # [DP] D_max is not used in SDC approach, but kept for compatibility
+        # [VERBOSE] logger.info(f"Bounded contribution params: D_max={d_max}, K={k_bound}, Winsorize_cap={winsorize_cap:,.0f}")
     
     def run(self, histogram: SparkHistogram) -> SparkHistogram:
         """
@@ -109,7 +117,7 @@ class TopDownSparkEngine:
         
         Algorithm:
         1. Compute province invariants (count and amount are EXACT - no noise)
-        2. Compute plausibility bounds per (MCC, City, Weekday) context
+        2. Compute plausibility bounds per (Province, MCC, Weekday) context
         3. Store original ratios per cell
         4. Apply independent multiplicative jitter to all three values (count, cards, amount)
         5. Clamp all values to plausibility bounds and validate/adjust ratios
@@ -139,7 +147,7 @@ class TopDownSparkEngine:
         use_original = 'total_amount_original' in df.columns
         
         if use_original:
-            logger.info("  Using ORIGINAL (unwinsorized) amounts for invariants, bounds, ratios, and noise")
+            # [VERBOSE] logger.info("  Using ORIGINAL (unwinsorized) amounts for invariants, bounds, ratios, and noise")
             self._amount_col = 'total_amount_original'
         else:
             logger.warning("  total_amount_original not found, using winsorized total_amount (legacy behavior)")
@@ -149,7 +157,7 @@ class TopDownSparkEngine:
         num_provinces = df.select('province_idx').distinct().count()
         num_partitions = max(31, num_provinces * 2)
         
-        logger.info(f"\nOptimization: Repartitioning to {num_partitions} partitions by province_idx")
+        # [VERBOSE] logger.info(f"\nOptimization: Repartitioning to {num_partitions} partitions by province_idx")
         df = df.repartition(num_partitions, 'province_idx')
         
         # ========================================
@@ -162,7 +170,8 @@ class TopDownSparkEngine:
         # Use TRUE province invariants if provided, otherwise compute from histogram
         # CRITICAL: True invariants are computed from original raw data BEFORE bounded contribution
         if histogram.province_invariants is not None:
-            logger.info("  Using TRUE province invariants from original raw data (before preprocessing)")
+            # [VERBOSE] logger.info("  Using TRUE province invariants from original raw data (before preprocessing)")
+            pass
             # Add original_cards_sum from histogram (needed for scaling)
             cards_sum = df.groupBy('province_idx').agg(
                 F.sum('unique_cards').alias('original_cards_sum')
@@ -186,9 +195,9 @@ class TopDownSparkEngine:
             F.count('*').alias('num_provinces')
         ).first()
         
-        logger.info(f"  Total count: {inv_summary['total_count']:,}")
-        logger.info(f"  Total amount: {inv_summary['total_amount']:,}")
-        logger.info(f"  Provinces: {inv_summary['num_provinces']}")
+        # [VERBOSE] logger.info(f"  Total count: {inv_summary['total_count']:,}")
+        # logger.info(f"  Total amount: {inv_summary['total_amount']:,}")
+        # logger.info(f"  Provinces: {inv_summary['num_provinces']}")
         
         # ========================================
         # PHASE 2: Compute Data-Driven Plausibility Bounds
@@ -218,7 +227,7 @@ class TopDownSparkEngine:
              .otherwise(F.lit(1.0))
         )
         
-        logger.info("  ✓ Original ratios stored per cell")
+        # [VERBOSE] logger.info("  ✓ Original ratios stored per cell")
         
         # ========================================
         # PHASE 4: Apply Multiplicative Jitter with Proper Randomness
@@ -318,12 +327,12 @@ class TopDownSparkEngine:
             F.col(self._amount_col).cast(DoubleType()) * F.col('noise_factor_amount')  # Use original if available
         )
         
-        logger.info(f"  Noise level: ±{noise_level:.0%} (applied to all three values)")
-        logger.info(f"  Seed: {seed} (count), {seed+1} (cards), {seed+2} (amount)")
-        logger.info(f"  Noise factor range: [{1-noise_level:.2f}, {1+noise_level:.2f}]")
-        if min_deviation > 0:
-            logger.info(f"  Minimum noise deviation: ±{min_deviation:.1%} (prevents zero noise)")
-        logger.info("  ✓ Independent random noise applied to count, cards, and amount")
+        # [VERBOSE] logger.info(f"  Noise level: ±{noise_level:.0%} (applied to all three values)")
+        # logger.info(f"  Seed: {seed} (count), {seed+1} (cards), {seed+2} (amount)")
+        # logger.info(f"  Noise factor range: [{1-noise_level:.2f}, {1+noise_level:.2f}]")
+        # if min_deviation > 0:
+        #     logger.info(f"  Minimum noise deviation: ±{min_deviation:.1%} (prevents zero noise)")
+        # logger.info("  ✓ Independent random noise applied to count, cards, and amount")
         
         # Drop intermediate noise columns
         df = df.drop('noise_uniform_count', 'noise_uniform_cards', 'noise_uniform_amount',
@@ -336,10 +345,10 @@ class TopDownSparkEngine:
         logger.info("PHASE 5: Clamping to Bounds & Validating Ratios")
         logger.info("=" * 70)
         
-        # Join with bounds (context = mcc_idx, city_idx, weekday)
+        # Join with bounds (context = province_idx, mcc_idx, weekday)
         df = df.join(
             F.broadcast(self._bounds_df),
-            ['mcc_idx', 'city_idx', 'weekday'],
+            ['province_idx', 'mcc_idx', 'weekday'],
             'left'
         )
         
@@ -392,8 +401,8 @@ class TopDownSparkEngine:
         
         total_clamped = clamping_stats['count_clamped_low'] + clamping_stats['count_clamped_high']
         pct_clamped = 100 * total_clamped / clamping_stats['total_cells'] if clamping_stats['total_cells'] > 0 else 0
-        logger.info(f"  Count clamped: {total_clamped:,} cells ({pct_clamped:.2f}%)")
-        logger.info("  ✓ Values clamped to bounds")
+        # [VERBOSE] logger.info(f"  Count clamped: {total_clamped:,} cells ({pct_clamped:.2f}%)")
+        # logger.info("  ✓ Values clamped to bounds")
         
         # Now compute actual ratios and validate/adjust if needed
         df = df.withColumn(
@@ -470,10 +479,10 @@ class TopDownSparkEngine:
         if ratio_stats['total'] > 0:
             avg_amt_pct = 100 * (ratio_stats['avg_amount_adjusted'] or 0) / ratio_stats['total']
             tx_card_pct = 100 * (ratio_stats['tx_per_card_adjusted'] or 0) / ratio_stats['total']
-            logger.info(f"  Avg amount adjusted: {ratio_stats['avg_amount_adjusted'] or 0:,} cells ({avg_amt_pct:.2f}%)")
-            logger.info(f"  TX per card adjusted: {ratio_stats['tx_per_card_adjusted'] or 0:,} cells ({tx_card_pct:.2f}%)")
+            # [VERBOSE] logger.info(f"  Avg amount adjusted: {ratio_stats['avg_amount_adjusted'] or 0:,} cells ({avg_amt_pct:.2f}%)")
+            # logger.info(f"  TX per card adjusted: {ratio_stats['tx_per_card_adjusted'] or 0:,} cells ({tx_card_pct:.2f}%)")
         
-        logger.info("  ✓ Ratios validated and adjusted to stay within bounds")
+        # [VERBOSE] logger.info("  ✓ Ratios validated and adjusted to stay within bounds")
         
         # Rename to final noisy values
         df = df.withColumn('noisy_count', F.col('noisy_count_clamped')) \
@@ -526,7 +535,7 @@ class TopDownSparkEngine:
                .withColumn('scaled_cards', F.col('noisy_cards') * F.col('scale_factor_cards')) \
                .withColumn('scaled_amount', F.col('noisy_amount') * F.col('scale_factor_amount'))
         
-        logger.info("  ✓ All three values scaled to match province invariants")
+        # [VERBOSE] logger.info("  ✓ All three values scaled to match province invariants")
         
         # After scaling, re-validate ratios and adjust if needed (ratios may change after scaling)
         df = df.withColumn(
@@ -601,10 +610,10 @@ class TopDownSparkEngine:
         if post_scale_stats['total'] > 0:
             avg_amt_pct = 100 * (post_scale_stats['post_scale_avg_amount_adjusted'] or 0) / post_scale_stats['total']
             tx_card_pct = 100 * (post_scale_stats['post_scale_tx_per_card_adjusted'] or 0) / post_scale_stats['total']
-            logger.info(f"  Post-scaling avg amount adjusted: {post_scale_stats['post_scale_avg_amount_adjusted'] or 0:,} cells ({avg_amt_pct:.2f}%)")
-            logger.info(f"  Post-scaling TX per card adjusted: {post_scale_stats['post_scale_tx_per_card_adjusted'] or 0:,} cells ({tx_card_pct:.2f}%)")
+            # [VERBOSE] logger.info(f"  Post-scaling avg amount adjusted: {post_scale_stats['post_scale_avg_amount_adjusted'] or 0:,} cells ({avg_amt_pct:.2f}%)")
+            # logger.info(f"  Post-scaling TX per card adjusted: {post_scale_stats['post_scale_tx_per_card_adjusted'] or 0:,} cells ({tx_card_pct:.2f}%)")
         
-        logger.info("  ✓ Ratios re-validated after scaling")
+        # [VERBOSE] logger.info("  ✓ Ratios re-validated after scaling")
         
         # Rename to final scaled values
         df = df.withColumn('scaled_count', F.col('scaled_count_final')) \
@@ -662,11 +671,11 @@ class TopDownSparkEngine:
             F.count('*').alias('total_cells')
         ).first()
         
-        logger.info(f"  Final total count: {final_stats['total_count']:,.0f}")
-        logger.info(f"  Final total cards: {final_stats['total_cards']:,.0f}")
-        logger.info(f"  Final total amount: {final_stats['total_amount']:,.0f}")
-        logger.info(f"  Total cells: {final_stats['total_cells']:,}")
-        logger.info("  ✓ Values finalized and consistency ensured")
+        # [VERBOSE] logger.info(f"  Final total count: {final_stats['total_count']:,.0f}")
+        # logger.info(f"  Final total cards: {final_stats['total_cards']:,.0f}")
+        # logger.info(f"  Final total amount: {final_stats['total_amount']:,.0f}")
+        # logger.info(f"  Total cells: {final_stats['total_cells']:,}")
+        # logger.info("  ✓ Values finalized and consistency ensured")
         
         # ========================================
         # PHASE 8: Final Validation
@@ -699,7 +708,7 @@ class TopDownSparkEngine:
                  .otherwise(F.col('final_amount'))
             )
         
-        logger.info("  ✓ Final validation complete")
+        # [VERBOSE] logger.info("  ✓ Final validation complete")
         
         # Drop intermediate columns (keep only final_*, invariant, and bounds)
         df = df.drop('scaled_count', 'scaled_cards', 'scaled_amount',
@@ -714,12 +723,12 @@ class TopDownSparkEngine:
         
         df_rounded = self._controlled_rounding(df)
         
-        logger.info("  ✓ Controlled rounding complete")
+        # [VERBOSE] logger.info("  ✓ Controlled rounding complete")
         
         # Enforce amount invariants exactly (like count invariants)
         df_rounded = self._enforce_amount_invariants_exact(df_rounded)
         
-        logger.info("  ✓ Amount invariants enforced exactly")
+        # [VERBOSE] logger.info("  ✓ Amount invariants enforced exactly")
         
         # ========================================
         # PHASE 10: Final Validation
@@ -729,12 +738,6 @@ class TopDownSparkEngine:
         logger.info("=" * 70)
         
         self._final_validation(df_rounded)
-        
-        # Cleanup
-        if self._invariants is not None:
-            self._invariants.unpersist()
-        if self._bounds_df is not None:
-            self._bounds_df.unpersist()
         
         logger.info("\n" + "=" * 70)
         logger.info("Context-Aware Noise Processing Complete")
@@ -752,7 +755,24 @@ class TopDownSparkEngine:
         logger.info("=" * 70)
         self._verify_province_invariants_exact(df_final)
         
-        return SparkHistogram(self.spark, df_final, histogram.dimensions, histogram.city_codes, histogram.min_date)
+        # CRITICAL: Preserve province_invariants in returned histogram for downstream use
+        # The invariants must be preserved so they can be verified against input data totals
+        final_histogram = SparkHistogram(
+            self.spark, 
+            df_final, 
+            histogram.dimensions, 
+            histogram.city_codes, 
+            histogram.min_date,
+            province_invariants=histogram.province_invariants  # Preserve invariants from input
+        )
+        
+        # Cleanup (after verification and histogram creation)
+        if self._invariants is not None:
+            self._invariants.unpersist()
+        if self._bounds_df is not None:
+            self._bounds_df.unpersist()
+        
+        return final_histogram
     
     def _compute_plausibility_bounds(self, df: DataFrame, amount_col: str = 'total_amount') -> DataFrame:
         """
@@ -767,10 +787,11 @@ class TopDownSparkEngine:
         lower_pct = self.noise_config.bounds_lower_percentile
         upper_pct = self.noise_config.bounds_upper_percentile
         
-        logger.info(f"  Computing bounds per context (MCC, City, Weekday)")
-        logger.info(f"  Lower percentile: p{int(lower_pct*100)}")
-        logger.info(f"  Upper percentile: p{int(upper_pct*100)}")
-        logger.info(f"  Using {amount_col} for bounds computation")
+        # [VERBOSE] logger.info(f"  Computing bounds per context (Province, MCC, Weekday)")
+        # logger.info(f"  Lower percentile: p{int(lower_pct*100)}")
+        # logger.info(f"  Upper percentile: p{int(upper_pct*100)}")
+        # logger.info(f"  Bounds widening factor: {self.noise_config.bounds_widening_factor}x (normal), {self.noise_config.sparse_bounds_widening_factor}x (sparse)")
+        # logger.info(f"  Using {amount_col} for bounds computation")
         
         # Compute ratios for bounds calculation
         df_with_ratios = df.withColumn(
@@ -786,7 +807,7 @@ class TopDownSparkEngine:
         )
         
         # Group by context and compute percentile bounds
-        bounds_df = df_with_ratios.groupBy('mcc_idx', 'city_idx', 'weekday').agg(
+        bounds_df = df_with_ratios.groupBy('province_idx', 'mcc_idx', 'weekday').agg(
             F.count('*').alias('sample_count'),
             
             # Count bounds
@@ -817,6 +838,63 @@ class TopDownSparkEngine:
              .otherwise(F.col('count_max'))
         )
         
+        # Widen bounds by multiplying the range, keeping center fixed
+        # Simple approach: range_new = range_old * factor, then adjust min/max around center
+        widening_factor = self.noise_config.bounds_widening_factor
+        sparse_widening = self.noise_config.sparse_bounds_widening_factor
+        
+        # Compute ranges and centers
+        bounds_df = bounds_df.withColumn(
+            'count_range', F.col('count_max') - F.col('count_min')
+        ).withColumn(
+            'avg_amount_range', F.col('avg_amount_max') - F.col('avg_amount_min')
+        ).withColumn(
+            'tx_per_card_range', F.col('tx_per_card_max') - F.col('tx_per_card_min')
+        ).withColumn(
+            'count_center', (F.col('count_min') + F.col('count_max')) / 2.0
+        ).withColumn(
+            'avg_amount_center', (F.col('avg_amount_min') + F.col('avg_amount_max')) / 2.0
+        ).withColumn(
+            'tx_per_card_center', (F.col('tx_per_card_min') + F.col('tx_per_card_max')) / 2.0
+        )
+        
+        # Determine widening factor per context (more for sparse)
+        bounds_df = bounds_df.withColumn(
+            'effective_widening',
+            F.when(F.col('sample_count') < min_samples, sparse_widening)
+             .otherwise(widening_factor)
+        )
+        
+        # Multiply range by factor, then adjust min/max around center
+        # new_range = old_range * factor
+        # new_min = center - new_range/2
+        # new_max = center + new_range/2
+        bounds_df = bounds_df.withColumn(
+            'count_min',
+            F.col('count_center') - (F.col('count_range') * F.col('effective_widening')) / 2.0
+        ).withColumn(
+            'count_max',
+            F.col('count_center') + (F.col('count_range') * F.col('effective_widening')) / 2.0
+        ).withColumn(
+            'avg_amount_min',
+            F.col('avg_amount_center') - (F.col('avg_amount_range') * F.col('effective_widening')) / 2.0
+        ).withColumn(
+            'avg_amount_max',
+            F.col('avg_amount_center') + (F.col('avg_amount_range') * F.col('effective_widening')) / 2.0
+        ).withColumn(
+            'tx_per_card_min',
+            F.col('tx_per_card_center') - (F.col('tx_per_card_range') * F.col('effective_widening')) / 2.0
+        ).withColumn(
+            'tx_per_card_max',
+            F.col('tx_per_card_center') + (F.col('tx_per_card_range') * F.col('effective_widening')) / 2.0
+        )
+        
+        # Drop intermediate columns
+        bounds_df = bounds_df.drop(
+            'count_range', 'avg_amount_range', 'tx_per_card_range',
+            'count_center', 'avg_amount_center', 'tx_per_card_center', 'effective_widening'
+        )
+        
         # Ensure minimum bounds make sense
         bounds_df = bounds_df.withColumn(
             'count_min', F.greatest(F.lit(1.0), F.col('count_min'))
@@ -836,10 +914,10 @@ class TopDownSparkEngine:
             F.sum(F.when(F.col('sample_count') < min_samples, 1).otherwise(0)).alias('sparse_contexts')
         ).first()
         
-        logger.info(f"  Unique contexts: {bounds_stats['num_contexts']:,}")
-        logger.info(f"  Avg samples/context: {bounds_stats['avg_samples']:.1f}")
-        logger.info(f"  Sparse contexts (< {min_samples} samples): {bounds_stats['sparse_contexts']:,}")
-        logger.info("  ✓ Plausibility bounds computed")
+        logger.info(f"  Computed bounds for {bounds_stats['num_contexts']:,} contexts")
+        # [VERBOSE] logger.info(f"  Avg samples/context: {bounds_stats['avg_samples']:.1f}")
+        # logger.info(f"  Sparse contexts (< {min_samples} samples): {bounds_stats['sparse_contexts']:,}")
+        # logger.info("  ✓ Plausibility bounds computed")
         
         return bounds_df
     
@@ -1301,16 +1379,16 @@ class TopDownSparkEngine:
             logger.info("  ✓ All cells logically consistent")
         
         # Check ratio bounds - join with bounds and verify ratios are within [min, max]
-        logger.info("\n  Ratio Bounds Validation:")
+        # [VERBOSE] logger.info("\n  Ratio Bounds Validation:")
         
         # Join rounded data with bounds
         df_with_bounds = df_rounded.join(
             F.broadcast(self._bounds_df.select(
-                'mcc_idx', 'city_idx', 'weekday',
+                'province_idx', 'mcc_idx', 'weekday',
                 'avg_amount_min', 'avg_amount_max',
                 'tx_per_card_min', 'tx_per_card_max'
             )),
-            ['mcc_idx', 'city_idx', 'weekday'],
+            ['province_idx', 'mcc_idx', 'weekday'],
             'left'
         )
         
@@ -1365,19 +1443,25 @@ class TopDownSparkEngine:
         ).first()
         
         if ratio_stats and ratio_stats['active_cells'] > 0:
-            logger.info(f"\n  Summary - Active cells: {ratio_stats['active_cells']:,}")
-            if ratio_stats['mean_tx_per_card'] is not None:
-                logger.info(f"  Mean TX per card: {ratio_stats['mean_tx_per_card']:.2f}")
-            if ratio_stats['mean_avg_amount'] is not None:
-                logger.info(f"  Mean avg amount: {ratio_stats['mean_avg_amount']:,.2f}")
+            # [VERBOSE] logger.info(f"\n  Summary - Active cells: {ratio_stats['active_cells']:,}")
+            # if ratio_stats['mean_tx_per_card'] is not None:
+            #     logger.info(f"  Mean TX per card: {ratio_stats['mean_tx_per_card']:.2f}")
+            # if ratio_stats['mean_avg_amount'] is not None:
+            #     logger.info(f"  Mean avg amount: {ratio_stats['mean_avg_amount']:,.2f}")
+            pass
     
     def _verify_province_invariants_exact(self, df: DataFrame) -> None:
         """
         Verify province invariants are EXACT (0% error).
         
         CRITICAL: Province-level totals for transaction_count and transaction_amount_sum
-        must be EXACTLY equal to the original province totals (0% error) because
-        they are publicly published data.
+        must be EXACTLY equal to the original province totals from the INPUT DATA FRAME (0% error)
+        because they are publicly published data.
+        
+        The invariants in self._invariants were computed from the original input data frame
+        BEFORE any preprocessing (bounded contribution, winsorization, etc.). This verification
+        ensures that after all processing (noise, scaling, rounding), the final output totals
+        match the input data frame totals exactly.
         
         Args:
             df: DataFrame to verify (should have transaction_count and total_amount columns)
@@ -1385,13 +1469,14 @@ class TopDownSparkEngine:
         Raises:
             RuntimeError: If any province invariant is violated (non-zero error)
         """
-        # Compute actual province totals
+        # Compute actual province totals from final output
         actual = df.groupBy('province_idx').agg(
             F.sum('transaction_count').alias('actual_count'),
             F.sum('total_amount').alias('actual_amount')
         )
         
-        # Join with expected invariants
+        # Join with expected invariants (computed from original input data frame)
+        # CRITICAL: self._invariants contains the EXACT totals from the input data frame
         comparison = self._invariants.join(actual, 'province_idx', 'inner')
         comparison = comparison.withColumn(
             'count_error', F.col('actual_count') - F.col('invariant_count')

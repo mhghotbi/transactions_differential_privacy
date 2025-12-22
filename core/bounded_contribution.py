@@ -162,11 +162,11 @@ class BoundedContributionCalculator:
         # IMPORTANT: K is ALWAYS computed globally (across ALL MCC groups)
         # This ensures transaction_weighted_percentile keeps exactly p% of ALL transactions
         # The compute_per_group flag only affects noise application, not K computation
-        logger.info("  Computing cell counts globally (groupBy card, city, mcc, day)...")
+        # [VERBOSE] logger.info("  Computing cell counts globally (groupBy card, city, mcc, day)...")
         cell_counts = df.groupBy(card_col, city_col, mcc_col, day_col).agg(
             F.count('*').alias('tx_count')
         )
-        logger.info("  ✓ Cell counts computed")
+        # [VERBOSE] logger.info("  ✓ Cell counts computed")
         
         if self.method == 'fixed':
             self._computed_k = self.fixed_k
@@ -197,12 +197,12 @@ class BoundedContributionCalculator:
             f'p{int(self.percentile)}': float(stats['pct']),
         }
         
-        logger.info(f"  Statistics: {self._stats}")
+        # [VERBOSE] logger.info(f"  Statistics: {self._stats}")
         
         if self.method == 'transaction_weighted_percentile':
             # Transaction-weighted percentile: Find K such that p% of TRANSACTIONS are kept
             # MEMORY-EFFICIENT: Aggregate by tx_count first to avoid window over millions of rows
-            logger.info(f"  Using transaction-weighted percentile method (target: keep {self.percentile}% of transactions)")
+            # [VERBOSE] logger.info(f"  Using transaction-weighted percentile method (target: keep {self.percentile}% of transactions)")
             
             # Step 1: Aggregate - count how many cells have each tx_count value
             # This reduces millions of cells to ~hundreds/thousands of distinct values
@@ -246,13 +246,13 @@ class BoundedContributionCalculator:
             self._stats['actual_retention_pct'] = float(actual_retention)
             self._stats['estimated_data_loss_pct'] = 100.0 - float(actual_retention)
             
-            logger.info(f"  Total transactions: {total_txns:,}")
-            logger.info(f"  Total cells: {total_cells:,}")
-            logger.info(f"  Distinct tx_count values: {len(freq_data):,}")
-            logger.info(f"  Target retention: {self.percentile}%")
-            logger.info(f"  Computed K = {self._computed_k}")
-            logger.info(f"  Estimated retention: {actual_retention:.2f}% of transactions")
-            logger.info(f"  Estimated data loss: {100-actual_retention:.2f}%")
+            # [VERBOSE] logger.info(f"  Total transactions: {total_txns:,}")
+            # logger.info(f"  Total cells: {total_cells:,}")
+            # logger.info(f"  Distinct tx_count values: {len(freq_data):,}")
+            # logger.info(f"  Target retention: {self.percentile}%")
+            logger.info(f"  Computed K = {self._computed_k} (keeps {actual_retention:.2f}% of transactions)")
+            # logger.info(f"  Estimated retention: {actual_retention:.2f}% of transactions")
+            # logger.info(f"  Estimated data loss: {100-actual_retention:.2f}%")
             
         elif self.method == 'iqr':
             q1 = self._stats['q1']
@@ -262,7 +262,7 @@ class BoundedContributionCalculator:
             self._computed_k = max(1, int(math.ceil(upper_bound)))
             self._stats['iqr'] = iqr
             self._stats['upper_bound'] = upper_bound
-            logger.info(f"  IQR = {iqr:.2f}, Upper bound = {upper_bound:.2f}")
+            # [VERBOSE] logger.info(f"  IQR = {iqr:.2f}, Upper bound = {upper_bound:.2f}")
             
         elif self.method == 'percentile':
             # Cell-based percentile (old method - can lose many transactions)
@@ -276,7 +276,7 @@ class BoundedContributionCalculator:
         else:
             raise ValueError(f"Unknown method: {self.method}")
         
-        logger.info(f"  Computed K = {self._computed_k}")
+        # [VERBOSE] logger.info(f"  Computed K = {self._computed_k}")
         return self._computed_k
     
     def _compute_k_per_group(
@@ -303,14 +303,14 @@ class BoundedContributionCalculator:
         Returns:
             Maximum K across all MCCs
         """
-        logger.info(f"  Computing K per individual MCC for memory efficiency")
+        # [VERBOSE] logger.info(f"  Computing K per individual MCC for memory efficiency")
         
         # Get list of distinct MCCs
         mccs = df.select(mcc_col).distinct().rdd.flatMap(lambda x: x).collect()
         mccs = sorted([str(m) for m in mccs if m is not None])
         num_mccs = len(mccs)
         
-        logger.info(f"  Found {num_mccs} distinct MCC codes for K computation")
+        # [VERBOSE] logger.info(f"  Found {num_mccs} distinct MCC codes for K computation")
         
         # Handle edge case: no MCCs in data
         if num_mccs == 0:
@@ -328,20 +328,20 @@ class BoundedContributionCalculator:
             logger.info(f"  Global K (default): {self._computed_k}")
             return self._computed_k
         
-        logger.info(f"  Will compute K for each MCC, then take maximum")
+        # [VERBOSE] logger.info(f"  Will compute K for each MCC, then take maximum")
         
         k_values = []
         mcc_stats = []
         
         for i, mcc_code in enumerate(mccs, 1):
-            logger.info(f"  [{i}/{num_mccs}] Processing MCC {mcc_code}...")
+            # [VERBOSE] logger.info(f"  [{i}/{num_mccs}] Processing MCC {mcc_code}...")
             
             # Filter to this MCC only
             df_mcc = df.filter(F.col(mcc_col) == mcc_code)
             
-            # Count records in this MCC
-            mcc_count = df_mcc.count()
-            logger.info(f"    Records in MCC: {mcc_count:,}")
+            # [VERBOSE] Count records in this MCC
+            # mcc_count = df_mcc.count()
+            # logger.info(f"    Records in MCC: {mcc_count:,}")
             
             # Compute cell counts for this MCC
             cell_counts = df_mcc.groupBy(card_col, city_col, mcc_col, day_col).agg(
@@ -421,7 +421,7 @@ class BoundedContributionCalculator:
             
             k_values.append(k_mcc)
             mcc_stats.append(stats_mcc)
-            logger.info(f"    K for MCC {mcc_code}: {k_mcc}")
+            # [VERBOSE] logger.info(f"    K for MCC {mcc_code}: {k_mcc}")
         
         # Take maximum K across all MCCs
         self._computed_k = max(k_values)
@@ -437,9 +437,9 @@ class BoundedContributionCalculator:
             'mcc_stats': mcc_stats
         }
         
-        logger.info(f"  Per-MCC K values: {k_values}")
+        # [VERBOSE] logger.info(f"  Per-MCC K values: {k_values}")
         logger.info(f"  Global K (maximum): {self._computed_k}")
-        logger.info(f"  K range: [{min(k_values)}, {max(k_values)}]")
+        # logger.info(f"  K range: [{min(k_values)}, {max(k_values)}]")
         
         return self._computed_k
     
@@ -540,7 +540,7 @@ class BoundedContributionCalculator:
                 raise ValueError("K not computed. Call compute_k_from_spark first or provide k.")
             k = self._computed_k
         
-        logger.info(f"Clipping contributions to K = {k}")
+        # [VERBOSE] logger.info(f"Clipping contributions to K = {k}")
         
         # CRITICAL: The window function and clipping operations below are ESSENTIAL for DP correctness
         # They MUST run - no skipping or optimization that affects the actual clipping logic.
@@ -549,10 +549,10 @@ class BoundedContributionCalculator:
         # Count before clipping (for statistics/logging only - does NOT affect DP correctness)
         # On 4.5B rows, this can take 10+ minutes but is only for reporting
         if skip_counts:
-            logger.info("  Skipping record counts (skip_counts=True for performance)")
+            # [VERBOSE] logger.info("  Skipping record counts (skip_counts=True for performance)")
             records_before = -1  # Sentinel value indicating count was skipped
         else:
-            logger.info("  Counting records before clipping (for statistics only - may take time on large datasets)...")
+            # [VERBOSE] logger.info("  Counting records before clipping (for statistics only - may take time on large datasets)...")
             records_before = df.count()
         
         # CRITICAL DP OPERATION: Window function with row_number()
@@ -562,7 +562,7 @@ class BoundedContributionCalculator:
         # 
         # Performance note: This requires sorting within partitions, which is expensive.
         # Consider checkpointing before this operation for fault tolerance on very large datasets.
-        logger.info("  Applying window function with row_number() (CRITICAL for DP correctness)...")
+        # [VERBOSE] logger.info("  Applying window function with row_number() (CRITICAL for DP correctness)...")
         window = Window.partitionBy(card_col, city_col, mcc_col, day_col).orderBy(order_col)
         
         df_with_rownum = df.withColumn('_row_num', F.row_number().over(window))
@@ -576,9 +576,9 @@ class BoundedContributionCalculator:
         if skip_counts:
             records_after = -1  # Sentinel value indicating count was skipped
             records_clipped = -1
-            logger.info("  Skipped record counts for performance (skip_counts=True)")
+            # [VERBOSE] logger.info("  Skipped record counts for performance (skip_counts=True)")
         else:
-            logger.info("  Counting records after clipping (for statistics only - may take time on large datasets)...")
+            # [VERBOSE] logger.info("  Counting records after clipping (for statistics only - may take time on large datasets)...")
             records_after = df_clipped.count()
             records_clipped = records_before - records_after
         
@@ -591,14 +591,14 @@ class BoundedContributionCalculator:
             records_clipped=records_clipped
         )
         
-        # Log statistics (these counts are for monitoring only, not used in DP computation)
-        if not skip_counts:
-            logger.info(f"  Records before clipping: {records_before:,}")
-            logger.info(f"  Records after clipping:  {records_after:,}")
-            if records_before > 0:
-                logger.info(f"  Records clipped: {records_clipped:,} ({records_clipped/records_before*100:.2f}%)")
-            else:
-                logger.info(f"  Records clipped: {records_clipped:,}")
+        # [VERBOSE] Log statistics (these counts are for monitoring only, not used in DP computation)
+        # if not skip_counts:
+        #     logger.info(f"  Records before clipping: {records_before:,}")
+        #     logger.info(f"  Records after clipping:  {records_after:,}")
+        #     if records_before > 0:
+        #         logger.info(f"  Records clipped: {records_clipped:,} ({records_clipped/records_before*100:.2f}%)")
+        #     else:
+        #         logger.info(f"  Records clipped: {records_clipped:,}")
         
         return df_clipped, result
     
